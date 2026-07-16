@@ -229,6 +229,7 @@ def make_nav(current_user: Optional[User] = None) -> str:
                 links.append(f"<a class='nav-link' href='/business/{current_user.business_id}/config'>Config</a>")
                 links.append(f"<a class='nav-link' href='/business/{current_user.business_id}/plans'>Plans</a>")
     else:
+        links.append("<a class='nav-link' href='/signup'>Sign Up</a>")
         links.append("<a class='nav-link' href='/login'>Login</a>")
     nav_links_html = f"<div class='nav-links'>{''.join(links)}</div>"
     if current_user:
@@ -554,8 +555,8 @@ def verify_paystack_signature(request: Request, payload: bytes) -> bool:
 def create_plan_seed_data(db) -> None:
     if db.query(Plan).count() == 0:
         plans = [
-            Plan(name="Starter", price_ngn=1500, branch_access=0, description="Single-location plan with menu and order management."),
-            Plan(name="Growth", price_ngn=3500, branch_access=1, description="Full branch access, advanced menus, and premium workflows."),
+            Plan(name="Starter", price_ngn=7500, branch_access=0, description="Single-location plan with menu and order management. WhatsApp messaging costs included."),
+            Plan(name="Growth", price_ngn=20000, branch_access=1, description="Full branch access, advanced menus, and premium workflows. WhatsApp messaging costs included."),
         ]
         db.add_all(plans)
         db.commit()
@@ -1077,6 +1078,77 @@ def login_submit(response: Response, email: str = Form(...), password: str = For
     return RedirectResponse(url="/login", status_code=303)
 
 
+SIGNUP_ERRORS = {
+    "email_taken": "That email is already registered. Try logging in instead.",
+    "number_taken": "That WhatsApp number is already registered to another business on Collxct.",
+}
+
+
+@app.get("/signup", response_class=HTMLResponse)
+def signup_page(request: Request) -> HTMLResponse:
+    error_code = request.query_params.get("error")
+    error_html = f"<div class='status-pill' style='background:rgba(255,94,122,.12);border-color:rgba(255,94,122,.3);color:var(--danger)'>{escape(SIGNUP_ERRORS[error_code])}</div>" if error_code in SIGNUP_ERRORS else ""
+    body = f"""
+    <div class="auth-shell">
+      <div class="auth-hero">
+        <div class="eyebrow">Collxct Bot</div>
+        <h2>Bring your business onto WhatsApp</h2>
+        <p>Create your account, connect your business's WhatsApp number, and start taking orders through chat. Every plan includes WhatsApp messaging costs.</p>
+      </div>
+      <div class="card auth-form">
+        <h2>Create your business</h2>
+        {error_html}
+        <form method="post" action="/signup">
+          <div class="form-row">
+            <input name="business_name" placeholder="Business name" required />
+            <input name="whatsapp_number" placeholder="Your business WhatsApp number (e.g. +2348012345678)" required />
+            <input name="owner_notify_number" placeholder="Notification number (optional)" />
+            <input name="email" type="email" placeholder="Your email" required />
+            <input name="password" type="password" placeholder="Password" required />
+          </div>
+          <p class="form-hint">This number must be connected to your own Twilio WhatsApp sender for order messages to route to your business correctly.</p>
+          <div class="form-actions">
+            <button type="submit">Create my business</button>
+          </div>
+        </form>
+      </div>
+    </div>
+    """
+    return render_page("Sign Up", body, nav_html=make_nav(get_current_user(request)))
+
+
+@app.post("/signup")
+def signup_submit(
+    business_name: str = Form(...),
+    whatsapp_number: str = Form(...),
+    owner_notify_number: str = Form(default=""),
+    email: str = Form(...),
+    password: str = Form(...),
+) -> RedirectResponse:
+    db = SessionLocal()
+    try:
+        if get_user_by_email(db, email):
+            return RedirectResponse(url="/signup?error=email_taken", status_code=303)
+        if db.query(Business).filter(Business.whatsapp_number == whatsapp_number).first():
+            return RedirectResponse(url="/signup?error=number_taken", status_code=303)
+
+        business = Business(name=business_name, whatsapp_number=whatsapp_number, owner_notify_number=owner_notify_number or None)
+        db.add(business)
+        db.commit()
+        db.refresh(business)
+
+        user = User(email=email, password_hash=hash_password(password), role="business_owner", business_id=business.id)
+        db.add(user)
+        db.commit()
+
+        token = create_auth_token(email)
+        redirect = RedirectResponse(url=f"/business/{business.id}/plans", status_code=303)
+        redirect.set_cookie(key="auth_token", value=token, httponly=True)
+        return redirect
+    finally:
+        db.close()
+
+
 @app.get("/register", response_class=HTMLResponse)
 def register_page(request: Request) -> HTMLResponse:
     current_user = get_current_user(request)
@@ -1337,6 +1409,8 @@ def create_business(
         return RedirectResponse(url="/login", status_code=303)
     db = SessionLocal()
     try:
+        if db.query(Business).filter(Business.whatsapp_number == whatsapp_number).first():
+            return RedirectResponse(url="/admin/businesses", status_code=303)
         business = Business(name=name, whatsapp_number=whatsapp_number, owner_notify_number=owner_notify_number or None)
         db.add(business)
         db.commit()
