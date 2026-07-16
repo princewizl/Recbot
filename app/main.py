@@ -2,6 +2,7 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import os
 from datetime import datetime, timedelta
 from html import escape
@@ -15,6 +16,9 @@ from sqlalchemy import Column, DateTime, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import declarative_base, sessionmaker
 from twilio.request_validator import RequestValidator
 from twilio.rest import Client as TwilioClient
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("recbot")
 
 BASE_DIR = os.path.dirname(os.path.dirname(__file__))
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
@@ -85,6 +89,7 @@ class Conversation(Base):
     category_id = Column(Integer, nullable=True)
     stage = Column(String(50), nullable=False, default="new")
     cart_json = Column(Text, default="[]")
+    customer_name = Column(String(255), nullable=True)
     address = Column(Text, nullable=True)
     updated_at = Column(DateTime, default=datetime.utcnow)
 
@@ -95,6 +100,7 @@ class Order(Base):
     business_id = Column(Integer, nullable=False)
     branch_id = Column(Integer, nullable=True)
     customer_phone = Column(String(50), nullable=False)
+    customer_name = Column(String(255), nullable=True)
     items_json = Column(Text, nullable=False)
     total = Column(Integer, nullable=False)
     delivery_fee = Column(Integer, nullable=False, default=0)
@@ -195,7 +201,7 @@ def ensure_schema() -> None:
                 "CREATE TABLE conversations_new ("
                 "id INTEGER PRIMARY KEY, phone_number VARCHAR(50) NOT NULL, business_id INTEGER NOT NULL, "
                 "branch_id INTEGER, category_id INTEGER, stage VARCHAR(50) NOT NULL DEFAULT 'new', "
-                "cart_json TEXT DEFAULT '[]', address TEXT, updated_at DATETIME)"
+                "cart_json TEXT DEFAULT '[]', customer_name VARCHAR(255), address TEXT, updated_at DATETIME)"
             ))
             conn.execute(text(
                 "INSERT INTO conversations_new (id, phone_number, business_id, branch_id, category_id, stage, cart_json, address, updated_at) "
@@ -204,6 +210,11 @@ def ensure_schema() -> None:
             conn.execute(text("DROP TABLE conversations"))
             conn.execute(text("ALTER TABLE conversations_new RENAME TO conversations"))
             conn.execute(text("CREATE UNIQUE INDEX ix_conversations_phone_business ON conversations(phone_number, business_id)"))
+
+        if not has_column("conversations", "customer_name"):
+            conn.execute(text("ALTER TABLE conversations ADD COLUMN customer_name VARCHAR(255)"))
+        if not has_column("orders", "customer_name"):
+            conn.execute(text("ALTER TABLE orders ADD COLUMN customer_name VARCHAR(255)"))
 
 
 ensure_schema()
@@ -727,11 +738,12 @@ seed_data()
 CONV_NEW = "new"
 CONV_CATEGORY = "await_category"
 CONV_ITEM = "await_item"
+CONV_NAME = "await_name"
 CONV_ADDRESS = "await_address"
 CONV_AWAITING_PAYMENT = "awaiting_payment"
 RESET_WORDS = {"hi", "hello", "hey", "start", "menu", "restart"}
 STALE_CONVERSATION_AFTER = timedelta(hours=24)
-STALE_RESET_STAGES = {CONV_CATEGORY, CONV_ITEM, CONV_ADDRESS}
+STALE_RESET_STAGES = {CONV_CATEGORY, CONV_ITEM, CONV_NAME, CONV_ADDRESS}
 
 
 def normalize_whatsapp_number(value: Optional[str]) -> str:
@@ -745,14 +757,20 @@ def send_whatsapp_message(to_number: str, body: str, from_number: Optional[str] 
     auth_token = os.getenv("TWILIO_AUTH_TOKEN")
     from_number = from_number or os.getenv("TWILIO_WHATSAPP_NUMBER")
     if not account_sid or not auth_token or not from_number:
+        logger.warning(
+            "send_whatsapp_message skipped: missing credentials (account_sid=%s auth_token=%s from_number=%s)",
+            bool(account_sid), bool(auth_token), bool(from_number),
+        )
         return False
     to = to_number if to_number.startswith("whatsapp:") else f"whatsapp:{to_number}"
     from_ = from_number if from_number.startswith("whatsapp:") else f"whatsapp:{from_number}"
     try:
         client = TwilioClient(account_sid, auth_token)
-        client.messages.create(from_=from_, to=to, body=body)
+        message = client.messages.create(from_=from_, to=to, body=body)
+        logger.info("send_whatsapp_message sent (sid=%s to=%s from=%s)", message.sid, to, from_)
         return True
-    except Exception:
+    except Exception as exc:
+        logger.error("send_whatsapp_message failed (to=%s from=%s): %s", to, from_, exc)
         return False
 
 
@@ -858,7 +876,7 @@ def format_item_menu(items: List[MenuItem], category_name: str) -> str:
     return (
         f"*{category_name}* menu:\n\n" + "\n".join(lines) + "\n\n"
         "Reply with a number to add an item to your cart, 'cart' to view your cart, "
-        "or 'checkout' when you're ready to order."
+        "'back' to see other categories, or 'checkout' when you're ready to order."
     )
 
 
@@ -918,6 +936,7 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
 
     if normalized in RESET_WORDS or not conversation.stage:
         conversation.cart_json = "[]"
+        conversation.customer_name = None
         conversation.address = None
         reply = build_greeting_reply(db, business, conversation)
         db.commit()
@@ -950,9 +969,9 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
             cart = load_cart(conversation.cart_json)
             if not cart:
                 return "Your cart is empty. Please add at least one item before checking out."
-            conversation.stage = CONV_ADDRESS
+            conversation.stage = CONV_NAME
             db.commit()
-            return "Great! Please reply with your delivery address. 📍"
+            return "Great! What name should we put on this order?"
         if normalized in {"back", "categories"}:
             reply = build_greeting_reply(db, business, conversation)
             db.commit()
@@ -974,6 +993,15 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
         db.commit()
         return f"✅ Added *{item.name}* to your cart. Reply with another number to add more, 'cart' to view your cart, or 'checkout' to place your order."
 
+    if conversation.stage == CONV_NAME:
+        name = message.strip()
+        if not name:
+            return "Please share your name so the business knows who's ordering."
+        conversation.customer_name = name
+        conversation.stage = CONV_ADDRESS
+        db.commit()
+        return f"Thanks, {name}! Please reply with your delivery address. 📍"
+
     if conversation.stage == CONV_ADDRESS:
         address = message.strip()
         if not address:
@@ -984,6 +1012,7 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
             business_id=business.id,
             branch_id=conversation.branch_id,
             customer_phone=conversation.phone_number,
+            customer_name=conversation.customer_name,
             items_json=conversation.cart_json or "[]",
             total=subtotal,
             delivery_fee=0,
@@ -996,8 +1025,9 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
         conversation.category_id = None
         conversation.stage = CONV_AWAITING_PAYMENT
         db.commit()
+        name_prefix = f"Thanks, {conversation.customer_name}! " if conversation.customer_name else "Thanks! "
         return (
-            f"Thanks! Here's your order:\n{format_cart_lines(cart)}\n\n*Subtotal:* N{subtotal}\n*Delivery to:* {address}\n\n"
+            f"{name_prefix}Here's your order:\n{format_cart_lines(cart)}\n\n*Subtotal:* N{subtotal}\n*Delivery to:* {address}\n\n"
             f"We're confirming your delivery fee now and will send your full total and payment details shortly.{COLLXCT_FOOTER}"
         )
 
@@ -1871,15 +1901,16 @@ def format_age(dt: Optional[datetime]) -> str:
 
 def render_order_row(order: Order, show_business_name: bool = False, business_name: str = "") -> str:
     business_cell = f"<td>{escape(business_name)}</td>" if show_business_name else ""
-    is_pending = order.status not in {"paid", "cancelled"}
+    is_pending = order.status not in {"delivered", "cancelled"}
     is_stale = is_pending and order.created_at and (datetime.utcnow() - order.created_at) > timedelta(hours=2)
     age_style = "color:var(--danger);font-weight:700;" if is_stale else "color:var(--muted);"
     age_cell = f"<td style='{age_style}'>{format_age(order.created_at)}</td>"
     status_pill_style = "background:rgba(255,94,122,.12);border-color:rgba(255,94,122,.3);color:var(--danger);" if is_stale else ""
     status_label = ORDER_STATUS_LABELS.get(order.status, order.status)
     status_cell = f"<span class='status-pill' style='{status_pill_style}'>{escape(status_label)}</span>"
+    customer_cell = escape(order.customer_name) if order.customer_name else escape(order.customer_phone)
     return (
-        f"<tr>{business_cell}<td><a href='/orders/{order.id}'>#{order.id}</a></td><td>{escape(order.customer_phone)}</td><td>{escape(order.address)}</td>"
+        f"<tr>{business_cell}<td><a href='/orders/{order.id}'>#{order.id}</a></td><td>{customer_cell}</td><td>{escape(order.address)}</td>"
         f"<td>₦{order.total}</td>{age_cell}<td>{status_cell}</td></tr>"
     )
 
@@ -1951,6 +1982,58 @@ def mark_order_paid(request: Request, order_id: int) -> RedirectResponse:
     return RedirectResponse(url=f"/business/{business_id}/dashboard", status_code=303)
 
 
+@app.post("/orders/{order_id}/dispatch")
+def dispatch_order(request: Request, order_id: int) -> RedirectResponse:
+    current_user = get_current_user(request)
+    db = SessionLocal()
+    try:
+        order = db.query(Order).filter(Order.id == order_id).one_or_none()
+        if not order:
+            return RedirectResponse(url="/admin/orders", status_code=303)
+        if not current_user or (current_user.role != "admin" and current_user.business_id != order.business_id):
+            return RedirectResponse(url="/login", status_code=303)
+        order.status = "out_for_delivery"
+        db.commit()
+        business = get_business(db, order.business_id)
+        send_whatsapp_message(
+            order.customer_phone,
+            f"🚴 Your order *#{order.id}* is on its way!",
+            from_number=business.whatsapp_number if business else None,
+        )
+        business_id = order.business_id
+    finally:
+        db.close()
+    if current_user.role == "admin":
+        return RedirectResponse(url="/admin/orders", status_code=303)
+    return RedirectResponse(url=f"/business/{business_id}/dashboard", status_code=303)
+
+
+@app.post("/orders/{order_id}/mark-delivered")
+def mark_order_delivered(request: Request, order_id: int) -> RedirectResponse:
+    current_user = get_current_user(request)
+    db = SessionLocal()
+    try:
+        order = db.query(Order).filter(Order.id == order_id).one_or_none()
+        if not order:
+            return RedirectResponse(url="/admin/orders", status_code=303)
+        if not current_user or (current_user.role != "admin" and current_user.business_id != order.business_id):
+            return RedirectResponse(url="/login", status_code=303)
+        order.status = "delivered"
+        db.commit()
+        business = get_business(db, order.business_id)
+        send_whatsapp_message(
+            order.customer_phone,
+            f"✅ Order *#{order.id}* delivered. Thanks for ordering from *{business.name if business else 'us'}*!{COLLXCT_FOOTER}",
+            from_number=business.whatsapp_number if business else None,
+        )
+        business_id = order.business_id
+    finally:
+        db.close()
+    if current_user.role == "admin":
+        return RedirectResponse(url="/admin/orders", status_code=303)
+    return RedirectResponse(url=f"/business/{business_id}/dashboard", status_code=303)
+
+
 @app.get("/orders/{order_id}/receipt")
 def get_order_receipt(request: Request, order_id: int):
     current_user = get_current_user(request)
@@ -1973,7 +2056,9 @@ ORDER_STATUS_LABELS = {
     "awaiting_delivery_fee": "Awaiting delivery fee",
     "awaiting_payment": "Awaiting customer payment",
     "payment_claimed": "Payment claimed — needs review",
-    "paid": "Paid",
+    "paid": "Paid — ready to dispatch",
+    "out_for_delivery": "Out for delivery",
+    "delivered": "Delivered",
     "cancelled": "Cancelled",
 }
 
@@ -2044,12 +2129,44 @@ def order_detail(request: Request, order_id: int) -> HTMLResponse:
           </div>
         </dialog>
         """
+    elif order.status == "paid":
+        action_button = "<button type='button' class='btn primary' onclick=\"document.getElementById('dispatch-modal').showModal()\">Mark out for delivery</button>"
+        action_modal = f"""
+        <dialog id="dispatch-modal" class="modal">
+          <div class="modal-body">
+            <h3>Send order #{order.id} out for delivery?</h3>
+            <p class="form-hint">This lets the customer know their order is on its way.</p>
+            <form method="post" action="/orders/{order.id}/dispatch">
+              <div class="modal-actions">
+                <button type="submit" class="btn primary">Yes, it's on its way</button>
+                <button type="button" class="btn secondary" onclick="document.getElementById('dispatch-modal').close()">Cancel</button>
+              </div>
+            </form>
+          </div>
+        </dialog>
+        """
+    elif order.status == "out_for_delivery":
+        action_button = "<button type='button' class='btn primary' onclick=\"document.getElementById('delivered-modal').showModal()\">Mark delivered</button>"
+        action_modal = f"""
+        <dialog id="delivered-modal" class="modal">
+          <div class="modal-body">
+            <h3>Mark order #{order.id} as delivered?</h3>
+            <p class="form-hint">This completes the order and thanks the customer.</p>
+            <form method="post" action="/orders/{order.id}/mark-delivered">
+              <div class="modal-actions">
+                <button type="submit" class="btn primary">Yes, it's delivered</button>
+                <button type="button" class="btn secondary" onclick="document.getElementById('delivered-modal').close()">Cancel</button>
+              </div>
+            </form>
+          </div>
+        </dialog>
+        """
 
     body = f"""
     <div class="hero-panel">
       <div>
         <div class="eyebrow">Order #{order.id}</div>
-        <h1>{escape(business.name) if business else 'Unknown business'}</h1>
+        <h1>{escape(order.customer_name) if order.customer_name else escape(business.name) if business else 'Unknown business'}</h1>
         <p>{escape(order.customer_phone)} &middot; placed {format_age(order.created_at)}</p>
       </div>
       <div class="actions">
@@ -2065,6 +2182,8 @@ def order_detail(request: Request, order_id: int) -> HTMLResponse:
       <div class="card">
         <h3>Summary</h3>
         <div class="kv-list">
+          <div class="kv-row"><span class="kv-label">Business</span><span class="kv-value">{escape(business.name) if business else 'Unknown'}</span></div>
+          <div class="kv-row"><span class="kv-label">Customer</span><span class="kv-value">{escape(order.customer_name) if order.customer_name else '—'}</span></div>
           <div class="kv-row"><span class="kv-label">Subtotal</span><span class="kv-value">N{subtotal}</span></div>
           <div class="kv-row"><span class="kv-label">Delivery fee</span><span class="kv-value">N{order.delivery_fee}</span></div>
           <div class="kv-row"><span class="kv-label">Total</span><span class="kv-value">N{order.total}</span></div>
