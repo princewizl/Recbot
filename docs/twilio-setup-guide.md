@@ -42,6 +42,18 @@ One Twilio account/subaccount maps to exactly one WhatsApp Business Account (WAB
 3. On the Collxct admin side, create the business with that exact number in `whatsapp_number` (matching the format Twilio sends, e.g. `+234...`).
 4. Set the business's bank details in config so the payment flow works.
 
+## Troubleshooting: proactive messages not arriving
+
+Replies inside the webhook (TwiML) and proactive sends (delivery-fee push, mark-paid, dispatch, delivered — all via `send_whatsapp_message()`) are two different mechanisms. Signature verification working and replies arriving doesn't guarantee proactive sends will — those go through the Twilio REST API and need `TWILIO_ACCOUNT_SID` and `TWILIO_AUTH_TOKEN` (not just the auth token) plus a valid sender number.
+
+If a customer/business doesn't get a message after setting a delivery fee, marking paid, dispatching, or marking delivered, check the log immediately after:
+```bash
+docker compose logs recbot --tail=20 | grep send_whatsapp_message
+```
+- `skipped: missing credentials (account_sid=False ...)` — one of `TWILIO_ACCOUNT_SID`/`TWILIO_AUTH_TOKEN` isn't set in `.env`. `TWILIO_AUTH_TOKEN` alone being present is enough for signature verification and TwiML replies to work, which is why this can go unnoticed until a proactive send is attempted.
+- `failed (to=... from=...): <error>` — credentials are present but Twilio itself rejected the send; the error message names why (bad number format, sandbox restrictions on a number that hasn't joined, etc.)
+- No line at all — the code path that calls `send_whatsapp_message()` didn't run; check the request actually reached the route (e.g. `docker compose logs nginx`).
+
 **Meta Business Verification**: per-number ownership OTP is all you need for your first two senders. Adding a **third or later** number requires your Meta Business Portfolio (Collxct's, not each client's) to have completed full Meta Business Verification first — a one-time step for the platform, not something each client business has to individually go through. Budget time for this before onboarding your third business; it typically needs similar documentation to what Paystack's KYC already asked for (Certificate of Incorporation, etc.).
 
 ## Suggested production setup
