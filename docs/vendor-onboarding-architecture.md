@@ -19,11 +19,13 @@ This repository currently contains a single FastAPI-based WhatsApp ordering MVP,
 - Signed-cookie session auth (`/login`, `/logout`) with role-based navigation, and an admin CRM covering business creation/configuration, categories, branches, menu items, orders, conversations, business-owner accounts, and subscription plans/payments via Paystack
 - A conversation data model and admin views for reviewing conversation state (category selection, branch/location, cart, address, order confirmation), but see below for what's missing on the messaging side
 
-### What is not implemented yet
-- The actual inbound WhatsApp webhook: there is currently **no `/webhook` and no `/health` route** in `app/main.py`. The conversation-flow logic and models exist, but nothing wires an incoming message to them — this needs to be rebuilt or reconnected.
-- Twilio or Meta WhatsApp API integration for real outbound messaging
+### Update: webhook and Twilio are now implemented
+As of the Docker/Twilio deployment work, `/webhook` and `/health` exist and are wired to the full conversation flow (category → item → cart → address → confirm), supporting both a simple JSON contract and Twilio's form-encoded WhatsApp webhook (with signature verification). See `docs/twilio-setup-guide.md` and `docs/deployment-guide.md`. Business routing already works multi-tenant via the `to` WhatsApp number matching `Business.whatsapp_number`, falling back to the first business when absent (see `resolve_webhook_business` in `app/main.py`).
+
+### What is still not implemented
 - A dedicated `Vendor` entity distinct from `Business` — today a business owner is just a `User` row with `role='business_owner'` and a `business_id` foreign key, not a separate vendor table
-- A full multi-tenant onboarding workflow beyond the current admin-driven business/owner creation
+- **Self-service business registration.** Every path that creates a `Business` or a `business_owner` `User` is admin-only today: `/register` (creates the owner login) explicitly checks `current_user.role != "admin"`, and business creation only happens through the admin CRM. There is no public "sign up your business" form.
+- **Known bug found while auditing this:** `POST /admin/businesses` (the route that actually creates a `Business` row) has **no authentication check at all** — unlike every other admin route in the file. Right now, anyone who can reach that endpoint can create a business, unauthenticated. Worth fixing before relying on admin-gating as a security boundary.
 - A production-grade PostgreSQL deployment setup
 
 ## Proposed architecture for future expansion
