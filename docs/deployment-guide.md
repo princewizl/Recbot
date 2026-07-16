@@ -18,14 +18,43 @@ Zero edits to Collxct's `docker-compose.yml` or `nginx.conf`. The only shared-in
 
 ## 0. Before you start
 
-⚠️ Unrelated but worth knowing: your local `C:\Users\Olufemi` has a `git init` at the **home directory** level (not scoped to any project), with `origin` already pointed at `github.com/princewizl/kiosk_app.git` and zero commits. A stray `git push` from there would try to push your entire home folder. I haven't touched it — fix it when convenient (delete that `.git`, `git init` fresh inside a real project folder). This guide uses `rsync`, not git, for the same reason — Recbot doesn't have its own scoped repo yet either. Once you set one up, you can switch to the same deploy-key + `git pull` pattern Collxct already uses.
+⚠️ Unrelated but worth knowing: your local `C:\Users\Olufemi` has a `git init` at the **home directory** level (not scoped to any project), with `origin` already pointed at `github.com/princewizl/kiosk_app.git` and zero commits. A stray `git push` from there would try to push your entire home folder. I haven't touched it — fix it when convenient (delete that `.git`, `git init` fresh inside a real project folder).
 
-## 1. Copy the code to the server
+Recbot now has its own properly-scoped repo at `github.com/princewizl/Recbot`, so this guide uses the same deploy-key + `git clone`/`git pull` pattern Collxct already uses, instead of `rsync`.
+
+## 1. Set up a deploy key and clone the repo
+
+This lets the server pull from the (private, presumably) `Recbot` repo without a password, the same way it already does for Collxct.
 
 ```bash
-rsync -avz --exclude='.venv' --exclude='.venv-1' --exclude='__pycache__' \
-  --exclude='.pytest_cache' --exclude='bot.db' --exclude='.env' \
-  "C:/Users/Olufemi/Documents/PROJECTS/Recbot/" root@<server-ip>:/opt/recbot/
+ssh root@<server-ip>
+
+# Generate a dedicated key pair for this repo (no passphrase)
+ssh-keygen -t ed25519 -C "recbot-server-deploy" -f ~/.ssh/recbot_deploy -N ""
+
+# Print the public key — copy this entire output
+cat ~/.ssh/recbot_deploy.pub
+
+# Tell SSH to use this key for this specific repo's clone URL.
+# github.com is likely already in ~/.ssh/config for the collxct deploy key —
+# if so, SSH will use whichever Host block matches first, so give this one
+# a distinct alias instead of reusing "Host github.com":
+cat >> ~/.ssh/config << 'EOF'
+Host github.com-recbot
+  HostName github.com
+  IdentityFile ~/.ssh/recbot_deploy
+  StrictHostKeyChecking no
+EOF
+```
+
+Go to **github.com/princewizl/Recbot → Settings → Deploy keys → Add deploy key**. Paste the public key, name it "Contabo server", leave "Allow write access" unchecked (read-only is enough — same as the Collxct key).
+
+```bash
+mkdir -p /opt/recbot
+cd /opt/recbot
+git clone git@github.com-recbot:princewizl/Recbot.git .
+
+ls -la   # confirm files are there
 ```
 
 ## 2. Configure environment
@@ -119,17 +148,19 @@ Should return `{"status":"ok"}` with a valid cert this time (no `-k` needed). Al
 ## Redeploying after code changes
 
 ```bash
-# from your machine
-rsync -avz --exclude='.venv' --exclude='.venv-1' --exclude='__pycache__' \
-  --exclude='.pytest_cache' --exclude='bot.db' --exclude='.env' \
-  "C:/Users/Olufemi/Documents/PROJECTS/Recbot/" root@<server-ip>:/opt/recbot/
+# on your machine — push as usual
+git push origin main
 
 # on the server
+ssh root@<server-ip>
 cd /opt/recbot
+git pull origin main
 docker compose up -d --build
 ```
 
-If only `nginx/recbot.conf` changed (not the app code), the app container doesn't need rebuilding — just `docker compose restart nginx` to pick up the new config (bind-mounted files don't auto-reload).
+If only `nginx/recbot.conf` changed (not the app code), the app container doesn't need rebuilding — `docker compose restart nginx` picks up the new config (bind-mounted files don't auto-reload on their own).
+
+`.env` isn't in the repo (gitignored), so `git pull` never touches it — no risk of `git pull` clobbering server-side secrets.
 
 The SQLite database lives in the `recbot_data` named volume, not in the container, so rebuilds and restarts never lose order/conversation data.
 
