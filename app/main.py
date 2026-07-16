@@ -11,7 +11,7 @@ import httpx
 from fastapi import FastAPI, Form, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import Column, DateTime, Integer, String, Text, create_engine, text
+from sqlalchemy import Column, DateTime, Integer, String, Text, UniqueConstraint, create_engine, text
 from sqlalchemy.orm import declarative_base, sessionmaker
 from twilio.request_validator import RequestValidator
 from twilio.rest import Client as TwilioClient
@@ -77,8 +77,9 @@ class MenuItem(Base):
 
 class Conversation(Base):
     __tablename__ = "conversations"
+    __table_args__ = (UniqueConstraint("phone_number", "business_id", name="ix_conversations_phone_business"),)
     id = Column(Integer, primary_key=True, index=True)
-    phone_number = Column(String(50), unique=True, nullable=False)
+    phone_number = Column(String(50), nullable=False)
     business_id = Column(Integer, nullable=False)
     branch_id = Column(Integer, nullable=True)
     category_id = Column(Integer, nullable=True)
@@ -148,6 +149,10 @@ def ensure_schema() -> None:
             rows = conn.execute(text(f"PRAGMA table_info({table_name})")).fetchall()
             return any(row[1] == column_name for row in rows)
 
+        def has_index(table_name: str, index_name: str) -> bool:
+            rows = conn.execute(text(f"PRAGMA index_list({table_name})")).fetchall()
+            return any(row[1] == index_name for row in rows)
+
         if not has_column("orders", "branch_id"):
             conn.execute(text("ALTER TABLE orders ADD COLUMN branch_id INTEGER"))
         if not has_column("conversations", "branch_id"):
@@ -184,6 +189,21 @@ def ensure_schema() -> None:
             conn.execute(text("ALTER TABLE orders ADD COLUMN payment_proof_text TEXT"))
         if not has_column("orders", "payment_receipt_path"):
             conn.execute(text("ALTER TABLE orders ADD COLUMN payment_receipt_path VARCHAR(255)"))
+
+        if not has_index("conversations", "ix_conversations_phone_business"):
+            conn.execute(text(
+                "CREATE TABLE conversations_new ("
+                "id INTEGER PRIMARY KEY, phone_number VARCHAR(50) NOT NULL, business_id INTEGER NOT NULL, "
+                "branch_id INTEGER, category_id INTEGER, stage VARCHAR(50) NOT NULL DEFAULT 'new', "
+                "cart_json TEXT DEFAULT '[]', address TEXT, updated_at DATETIME)"
+            ))
+            conn.execute(text(
+                "INSERT INTO conversations_new (id, phone_number, business_id, branch_id, category_id, stage, cart_json, address, updated_at) "
+                "SELECT id, phone_number, business_id, branch_id, category_id, stage, cart_json, address, updated_at FROM conversations"
+            ))
+            conn.execute(text("DROP TABLE conversations"))
+            conn.execute(text("ALTER TABLE conversations_new RENAME TO conversations"))
+            conn.execute(text("CREATE UNIQUE INDEX ix_conversations_phone_business ON conversations(phone_number, business_id)"))
 
 
 ensure_schema()
@@ -696,6 +716,8 @@ CONV_ITEM = "await_item"
 CONV_ADDRESS = "await_address"
 CONV_AWAITING_PAYMENT = "awaiting_payment"
 RESET_WORDS = {"hi", "hello", "hey", "start", "menu", "restart"}
+STALE_CONVERSATION_AFTER = timedelta(hours=24)
+STALE_RESET_STAGES = {CONV_CATEGORY, CONV_ITEM, CONV_ADDRESS}
 
 
 def normalize_whatsapp_number(value: Optional[str]) -> str:
@@ -704,10 +726,10 @@ def normalize_whatsapp_number(value: Optional[str]) -> str:
     return value.replace("whatsapp:", "").strip()
 
 
-def send_whatsapp_message(to_number: str, body: str) -> bool:
+def send_whatsapp_message(to_number: str, body: str, from_number: Optional[str] = None) -> bool:
     account_sid = os.getenv("TWILIO_ACCOUNT_SID")
     auth_token = os.getenv("TWILIO_AUTH_TOKEN")
-    from_number = os.getenv("TWILIO_WHATSAPP_NUMBER")
+    from_number = from_number or os.getenv("TWILIO_WHATSAPP_NUMBER")
     if not account_sid or not auth_token or not from_number:
         return False
     to = to_number if to_number.startswith("whatsapp:") else f"whatsapp:{to_number}"
@@ -768,19 +790,16 @@ def resolve_webhook_business(db, to_number: str) -> Optional[Business]:
 
 
 def get_or_create_conversation(db, phone_number: str, business_id: int) -> Conversation:
-    conversation = db.query(Conversation).filter(Conversation.phone_number == phone_number).one_or_none()
+    conversation = (
+        db.query(Conversation)
+        .filter(Conversation.phone_number == phone_number, Conversation.business_id == business_id)
+        .one_or_none()
+    )
     if conversation is None:
         conversation = Conversation(phone_number=phone_number, business_id=business_id, stage=CONV_NEW, cart_json="[]")
         db.add(conversation)
         db.commit()
         db.refresh(conversation)
-    elif conversation.business_id != business_id:
-        conversation.business_id = business_id
-        conversation.stage = CONV_NEW
-        conversation.cart_json = "[]"
-        conversation.category_id = None
-        conversation.address = None
-        db.commit()
     return conversation
 
 
@@ -863,6 +882,18 @@ def build_greeting_reply(db, business: Business, conversation: Conversation) -> 
 
 def handle_webhook_message(db, business: Business, conversation: Conversation, message: str, media_url: str = "") -> str:
     normalized = message.strip().lower()
+
+    if (
+        conversation.stage in STALE_RESET_STAGES
+        and conversation.updated_at
+        and datetime.utcnow() - conversation.updated_at > STALE_CONVERSATION_AFTER
+    ):
+        conversation.stage = CONV_NEW
+        conversation.cart_json = "[]"
+        conversation.category_id = None
+
+    conversation.updated_at = datetime.utcnow()
+    db.commit()
 
     if normalized in RESET_WORDS or not conversation.stage:
         conversation.cart_json = "[]"
@@ -991,6 +1022,7 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
                 send_whatsapp_message(
                     business.owner_notify_number,
                     f"New payment claim for order #{order.id}: N{order.total} from {order.customer_phone}. Check your bank alert and mark it paid on the dashboard.",
+                    from_number=business.whatsapp_number,
                 )
             return "Thanks! We've let the business know — they'll confirm your payment shortly."
         return "We've already received your payment info for this order. The business will confirm shortly."
@@ -1556,7 +1588,7 @@ def business_detail(request: Request, business_id: int) -> HTMLResponse:
         <div class="section-head">
           <h3>Orders</h3>
         </div>
-        <div class="table-wrap"><table><tr><th>Order</th><th>Customer</th><th>Address</th><th>Total</th><th>Status</th></tr>{orders_rows}</table></div>
+        <div class="table-wrap"><table><tr><th>Order</th><th>Customer</th><th>Address</th><th>Total</th><th>Age</th><th>Status</th></tr>{orders_rows}</table></div>
       </div>
     </div>
     """
@@ -1802,8 +1834,26 @@ def update_menu_item(
     return RedirectResponse(url=f"/admin/businesses/{business_id}", status_code=303)
 
 
+def format_age(dt: Optional[datetime]) -> str:
+    if not dt:
+        return ""
+    minutes = int((datetime.utcnow() - dt).total_seconds() // 60)
+    if minutes < 1:
+        return "just now"
+    if minutes < 60:
+        return f"{minutes}m ago"
+    hours = minutes // 60
+    if hours < 24:
+        return f"{hours}h ago"
+    return f"{hours // 24}d ago"
+
+
 def render_order_row(order: Order, show_business_name: bool = False, business_name: str = "") -> str:
     business_cell = f"<td>{escape(business_name)}</td>" if show_business_name else ""
+    is_pending = order.status not in {"paid", "cancelled"}
+    is_stale = is_pending and order.created_at and (datetime.utcnow() - order.created_at) > timedelta(hours=2)
+    age_style = "color:var(--danger);font-weight:700;" if is_stale else "color:var(--muted);"
+    age_cell = f"<td style='{age_style}'>{format_age(order.created_at)}</td>"
     if order.status == "awaiting_delivery_fee":
         action_cell = (
             f"<form method='post' action='/orders/{order.id}/delivery-fee' style='margin:0;display:flex;gap:6px;align-items:center;'>"
@@ -1838,7 +1888,7 @@ def render_order_row(order: Order, show_business_name: bool = False, business_na
         action_cell = escape(order.status)
     return (
         f"<tr>{business_cell}<td>#{order.id}</td><td>{escape(order.customer_phone)}</td><td>{escape(order.address)}</td>"
-        f"<td>₦{order.total}</td><td>{action_cell}</td></tr>"
+        f"<td>₦{order.total}</td>{age_cell}<td>{action_cell}</td></tr>"
     )
 
 
@@ -1873,6 +1923,7 @@ def set_order_delivery_fee(request: Request, order_id: int, delivery_fee: int = 
             f"Your order #{order.id} total is N{order.total} (including N{delivery_fee} delivery).\n\n"
             f"Please pay to:\n{bank_info}\n\n"
             "Once you've paid, reply here with confirmation or a photo of your receipt.",
+            from_number=business.whatsapp_number if business else None,
         )
         business_id = order.business_id
     finally:
@@ -1929,7 +1980,7 @@ def admin_orders(request: Request) -> HTMLResponse:
         rows = "".join(render_order_row(order, show_business_name=True, business_name=business_names.get(order.business_id, "")) for order in orders)
     finally:
         db.close()
-    body = f"<div class=\"card\"><div class=\"table-wrap\"><table><tr><th>Business</th><th>Order</th><th>Customer</th><th>Address</th><th>Total</th><th>Status</th></tr>{rows}</table></div></div>"
+    body = f"<div class=\"card\"><div class=\"table-wrap\"><table><tr><th>Business</th><th>Order</th><th>Customer</th><th>Address</th><th>Total</th><th>Age</th><th>Status</th></tr>{rows}</table></div></div>"
     return render_page("Orders", body, nav_html=make_nav(get_current_user(request)))
 
 
