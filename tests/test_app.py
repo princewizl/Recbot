@@ -33,6 +33,8 @@ def test_category_selection_flow(tmp_path, monkeypatch):
 def test_admin_dashboard_and_business_creation(tmp_path, monkeypatch):
     db_path = tmp_path / "test_bot.db"
     monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
+    monkeypatch.setenv("ADMIN_EMAIL", "admin@example.com")
+    monkeypatch.setenv("ADMIN_PASSWORD", "test-admin-password")
 
     import app.main as main
     importlib.reload(main)
@@ -41,6 +43,13 @@ def test_admin_dashboard_and_business_creation(tmp_path, monkeypatch):
     response = client.get("/admin/")
     assert response.status_code == 200
     assert "Admin Dashboard" in response.text
+
+    login_response = client.post(
+        "/login",
+        data={"email": "admin@example.com", "password": "test-admin-password"},
+        follow_redirects=False,
+    )
+    assert login_response.status_code == 303
 
     response = client.post(
         "/admin/businesses",
@@ -57,10 +66,19 @@ def test_admin_dashboard_and_business_creation(tmp_path, monkeypatch):
 def test_menu_item_descriptions_show_in_admin_and_conversations(tmp_path, monkeypatch):
     db_path = tmp_path / "test_bot.db"
     monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
+    monkeypatch.setenv("ADMIN_EMAIL", "admin@example.com")
+    monkeypatch.setenv("ADMIN_PASSWORD", "test-admin-password")
 
     import app.main as main
     importlib.reload(main)
     client = TestClient(main.app)
+
+    login_response = client.post(
+        "/login",
+        data={"email": "admin@example.com", "password": "test-admin-password"},
+        follow_redirects=False,
+    )
+    assert login_response.status_code == 303
 
     create_business = client.post(
         "/admin/businesses",

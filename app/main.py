@@ -1327,10 +1327,14 @@ def admin_businesses(request: Request) -> HTMLResponse:
 
 @app.post("/admin/businesses")
 def create_business(
+    request: Request,
     name: str = Form(...),
     whatsapp_number: str = Form(...),
     owner_notify_number: str = Form(default=""),
 ) -> RedirectResponse:
+    current_user = get_current_user(request)
+    if not current_user or current_user.role != "admin":
+        return RedirectResponse(url="/login", status_code=303)
     db = SessionLocal()
     try:
         business = Business(name=name, whatsapp_number=whatsapp_number, owner_notify_number=owner_notify_number or None)
@@ -1344,6 +1348,9 @@ def create_business(
 
 @app.get("/admin/businesses/{business_id}", response_class=HTMLResponse)
 def business_detail(request: Request, business_id: int) -> HTMLResponse:
+    current_user = get_current_user(request)
+    if not current_user or (current_user.role != "admin" and current_user.business_id != business_id):
+        return RedirectResponse(url="/login", status_code=303)
     db = SessionLocal()
     try:
         context = get_business_context(business_id)
@@ -1541,11 +1548,15 @@ async def paystack_webhook(request: Request) -> Response:
 
 @app.post("/admin/businesses/{business_id}")
 def update_business(
+    request: Request,
     business_id: int,
     name: str = Form(...),
     whatsapp_number: str = Form(...),
     owner_notify_number: str = Form(default=""),
 ) -> RedirectResponse:
+    current_user = get_current_user(request)
+    if not current_user or (current_user.role != "admin" and current_user.business_id != business_id):
+        return RedirectResponse(url="/login", status_code=303)
     db = SessionLocal()
     try:
         business = get_business(db, business_id)
@@ -1560,7 +1571,10 @@ def update_business(
 
 
 @app.post("/admin/businesses/{business_id}/categories")
-def create_category(business_id: int, name: str = Form(...)) -> RedirectResponse:
+def create_category(request: Request, business_id: int, name: str = Form(...)) -> RedirectResponse:
+    current_user = get_current_user(request)
+    if not current_user or (current_user.role != "admin" and current_user.business_id != business_id):
+        return RedirectResponse(url="/login", status_code=303)
     db = SessionLocal()
     try:
         db.add(Category(business_id=business_id, name=name))
@@ -1571,7 +1585,10 @@ def create_category(business_id: int, name: str = Form(...)) -> RedirectResponse
 
 
 @app.post("/admin/businesses/{business_id}/branches")
-def create_branch(business_id: int, name: str = Form(...), address: str = Form(default="")) -> RedirectResponse:
+def create_branch(request: Request, business_id: int, name: str = Form(...), address: str = Form(default="")) -> RedirectResponse:
+    current_user = get_current_user(request)
+    if not current_user or (current_user.role != "admin" and current_user.business_id != business_id):
+        return RedirectResponse(url="/login", status_code=303)
     db = SessionLocal()
     try:
         db.add(Branch(business_id=business_id, name=name, address=address or None))
@@ -1583,6 +1600,7 @@ def create_branch(business_id: int, name: str = Form(...), address: str = Form(d
 
 @app.post("/admin/businesses/{business_id}/items")
 def create_menu_item(
+    request: Request,
     business_id: int,
     name: str = Form(...),
     description: Optional[str] = Form(default=None),
@@ -1592,6 +1610,9 @@ def create_menu_item(
     is_active: Optional[str] = Form(default=None),
     is_out_of_stock: Optional[str] = Form(default=None),
 ) -> RedirectResponse:
+    current_user = get_current_user(request)
+    if not current_user or (current_user.role != "admin" and current_user.business_id != business_id):
+        return RedirectResponse(url="/login", status_code=303)
     db = SessionLocal()
     try:
         db.add(
@@ -1614,6 +1635,9 @@ def create_menu_item(
 
 @app.get("/admin/businesses/{business_id}/items/{item_id}", response_class=HTMLResponse)
 def edit_menu_item_page(request: Request, business_id: int, item_id: int) -> HTMLResponse:
+    current_user = get_current_user(request)
+    if not current_user or (current_user.role != "admin" and current_user.business_id != business_id):
+        return RedirectResponse(url="/login", status_code=303)
     db = SessionLocal()
     try:
         business = get_business(db, business_id)
@@ -1660,6 +1684,7 @@ def edit_menu_item_page(request: Request, business_id: int, item_id: int) -> HTM
 
 @app.post("/admin/businesses/{business_id}/items/{item_id}")
 def update_menu_item(
+    request: Request,
     business_id: int,
     item_id: int,
     name: str = Form(...),
@@ -1670,6 +1695,9 @@ def update_menu_item(
     is_active: Optional[str] = Form(default=None),
     is_out_of_stock: Optional[str] = Form(default=None),
 ) -> RedirectResponse:
+    current_user = get_current_user(request)
+    if not current_user or (current_user.role != "admin" and current_user.business_id != business_id):
+        return RedirectResponse(url="/login", status_code=303)
     db = SessionLocal()
     try:
         item = db.query(MenuItem).filter(MenuItem.id == item_id, MenuItem.business_id == business_id).one_or_none()
