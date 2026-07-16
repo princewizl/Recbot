@@ -5,6 +5,7 @@ __pycache__/
 .pytest_cache/
 bot.db
 *.db
+receipts/
 .env
 .env.*
 !.env.example

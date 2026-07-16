@@ -9,7 +9,7 @@ from typing import Dict, List, Optional
 
 import httpx
 from fastapi import FastAPI, Form, Request, Response
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import Column, DateTime, Integer, String, Text, create_engine, text
 from sqlalchemy.orm import declarative_base, sessionmaker
@@ -19,6 +19,12 @@ from twilio.rest import Client as TwilioClient
 BASE_DIR = os.path.dirname(os.path.dirname(__file__))
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite:///{os.path.join(BASE_DIR, 'bot.db')}")
+
+if DATABASE_URL.startswith("sqlite:///"):
+    RECEIPTS_DIR = os.path.join(os.path.dirname(DATABASE_URL[len("sqlite:///"):]) or ".", "receipts")
+else:
+    RECEIPTS_DIR = os.path.join(BASE_DIR, "receipts")
+os.makedirs(RECEIPTS_DIR, exist_ok=True)
 
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
@@ -35,6 +41,9 @@ class Business(Base):
     plan_status = Column(String(50), nullable=False, default="trial")
     plan_expiry = Column(DateTime, nullable=True)
     auto_renew = Column(Integer, nullable=False, default=0)
+    bank_name = Column(String(255), nullable=True)
+    bank_account_number = Column(String(50), nullable=True)
+    bank_account_name = Column(String(255), nullable=True)
 
 
 class Category(Base):
@@ -87,8 +96,11 @@ class Order(Base):
     customer_phone = Column(String(50), nullable=False)
     items_json = Column(Text, nullable=False)
     total = Column(Integer, nullable=False)
+    delivery_fee = Column(Integer, nullable=False, default=0)
     address = Column(Text, nullable=False)
     status = Column(String(50), nullable=False, default="new")
+    payment_proof_text = Column(Text, nullable=True)
+    payment_receipt_path = Column(String(255), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
@@ -160,6 +172,18 @@ def ensure_schema() -> None:
             conn.execute(text("ALTER TABLE menu_items ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1"))
         if not has_column("menu_items", "is_out_of_stock"):
             conn.execute(text("ALTER TABLE menu_items ADD COLUMN is_out_of_stock INTEGER NOT NULL DEFAULT 0"))
+        if not has_column("businesses", "bank_name"):
+            conn.execute(text("ALTER TABLE businesses ADD COLUMN bank_name VARCHAR(255)"))
+        if not has_column("businesses", "bank_account_number"):
+            conn.execute(text("ALTER TABLE businesses ADD COLUMN bank_account_number VARCHAR(50)"))
+        if not has_column("businesses", "bank_account_name"):
+            conn.execute(text("ALTER TABLE businesses ADD COLUMN bank_account_name VARCHAR(255)"))
+        if not has_column("orders", "delivery_fee"):
+            conn.execute(text("ALTER TABLE orders ADD COLUMN delivery_fee INTEGER NOT NULL DEFAULT 0"))
+        if not has_column("orders", "payment_proof_text"):
+            conn.execute(text("ALTER TABLE orders ADD COLUMN payment_proof_text TEXT"))
+        if not has_column("orders", "payment_receipt_path"):
+            conn.execute(text("ALTER TABLE orders ADD COLUMN payment_receipt_path VARCHAR(255)"))
 
 
 ensure_schema()
@@ -670,7 +694,7 @@ CONV_NEW = "new"
 CONV_CATEGORY = "await_category"
 CONV_ITEM = "await_item"
 CONV_ADDRESS = "await_address"
-CONV_CONFIRM = "await_confirm"
+CONV_AWAITING_PAYMENT = "awaiting_payment"
 RESET_WORDS = {"hi", "hello", "hey", "start", "menu", "restart"}
 
 
@@ -694,6 +718,27 @@ def send_whatsapp_message(to_number: str, body: str) -> bool:
         return True
     except Exception:
         return False
+
+
+RECEIPT_EXTENSIONS = {"image/jpeg": "jpg", "image/png": "png", "application/pdf": "pdf"}
+
+
+def save_payment_receipt(order_id: int, media_url: str) -> Optional[str]:
+    account_sid = os.getenv("TWILIO_ACCOUNT_SID")
+    auth_token = os.getenv("TWILIO_AUTH_TOKEN")
+    if not account_sid or not auth_token:
+        return None
+    try:
+        response = httpx.get(media_url, auth=(account_sid, auth_token), timeout=30.0)
+        response.raise_for_status()
+        content_type = response.headers.get("content-type", "").split(";")[0].strip()
+        extension = RECEIPT_EXTENSIONS.get(content_type, "bin")
+        filename = f"order_{order_id}_{int(datetime.utcnow().timestamp())}.{extension}"
+        with open(os.path.join(RECEIPTS_DIR, filename), "wb") as receipt_file:
+            receipt_file.write(response.content)
+        return filename
+    except Exception:
+        return None
 
 
 def verify_twilio_signature(request: Request, form_params: Dict[str, str]) -> bool:
@@ -816,7 +861,7 @@ def build_greeting_reply(db, business: Business, conversation: Conversation) -> 
     return f"Hi! Welcome to {business.name}. " + format_category_menu(categories)
 
 
-def handle_webhook_message(db, business: Business, conversation: Conversation, message: str) -> str:
+def handle_webhook_message(db, business: Business, conversation: Conversation, message: str, media_url: str = "") -> str:
     normalized = message.strip().lower()
 
     if normalized in RESET_WORDS or not conversation.stage:
@@ -881,44 +926,74 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
         address = message.strip()
         if not address:
             return "Please share a delivery address so we can complete your order."
-        conversation.address = address
-        conversation.stage = CONV_CONFIRM
-        db.commit()
         cart = load_cart(conversation.cart_json)
+        subtotal = cart_total(cart)
+        order = Order(
+            business_id=business.id,
+            branch_id=conversation.branch_id,
+            customer_phone=conversation.phone_number,
+            items_json=conversation.cart_json or "[]",
+            total=subtotal,
+            delivery_fee=0,
+            address=address,
+            status="awaiting_delivery_fee",
+        )
+        db.add(order)
+        conversation.cart_json = "[]"
+        conversation.address = address
+        conversation.category_id = None
+        conversation.stage = CONV_AWAITING_PAYMENT
+        db.commit()
         return (
-            f"Here's your order summary:\n{format_cart_lines(cart)}\n\nTotal: N{cart_total(cart)}\nDelivery to: {address}\n\n"
-            "Reply 'yes' to confirm your order or 'cancel' to start over."
+            f"Thanks! Here's your order:\n{format_cart_lines(cart)}\nSubtotal: N{subtotal}\nDelivery to: {address}\n\n"
+            "We're confirming your delivery fee now and will send your full total and payment details shortly."
         )
 
-    if conversation.stage == CONV_CONFIRM:
-        if normalized in {"yes", "confirm", "y"}:
-            cart = load_cart(conversation.cart_json)
-            total = cart_total(cart)
-            order = Order(
-                business_id=business.id,
-                branch_id=conversation.branch_id,
-                customer_phone=conversation.phone_number,
-                items_json=conversation.cart_json or "[]",
-                total=total,
-                address=conversation.address or "",
-                status="new",
-            )
-            db.add(order)
-            conversation.cart_json = "[]"
-            conversation.address = None
-            conversation.category_id = None
-            conversation.stage = CONV_NEW
+    if conversation.stage == CONV_AWAITING_PAYMENT:
+        order = (
+            db.query(Order)
+            .filter(Order.customer_phone == conversation.phone_number, Order.business_id == business.id)
+            .order_by(Order.id.desc())
+            .first()
+        )
+        if not order:
+            reply = build_greeting_reply(db, business, conversation)
             db.commit()
-            db.refresh(order)
-            return f"Thank you! Your order #{order.id} has been placed for N{total}. We'll notify you once it's confirmed."
-        if normalized in {"cancel", "no"}:
-            conversation.cart_json = "[]"
-            conversation.address = None
-            conversation.category_id = None
+            return reply
+        if order.status == "awaiting_delivery_fee":
+            if normalized == "cancel":
+                order.status = "cancelled"
+                conversation.stage = CONV_NEW
+                conversation.address = None
+                db.commit()
+                return "Your order has been cancelled. Reply 'hi' anytime to start a new order."
+            return "We're still confirming your delivery fee — hang tight, we'll send your total and payment details shortly."
+        if order.status == "awaiting_payment":
+            if normalized == "cancel":
+                order.status = "cancelled"
+                conversation.stage = CONV_NEW
+                conversation.address = None
+                db.commit()
+                return "Your order has been cancelled. Reply 'hi' anytime to start a new order."
+            if not media_url and not message.strip():
+                return "Please reply with confirmation that you've made the transfer — a text message or a photo of your receipt works."
+            if media_url:
+                receipt_filename = save_payment_receipt(order.id, media_url)
+                if receipt_filename:
+                    order.payment_receipt_path = receipt_filename
+            if message.strip():
+                order.payment_proof_text = message.strip()
+            order.status = "payment_claimed"
             conversation.stage = CONV_NEW
+            conversation.address = None
             db.commit()
-            return "Your order has been cancelled. Reply 'hi' anytime to start a new order."
-        return "Please reply 'yes' to confirm your order or 'cancel' to cancel it."
+            if business.owner_notify_number:
+                send_whatsapp_message(
+                    business.owner_notify_number,
+                    f"New payment claim for order #{order.id}: N{order.total} from {order.customer_phone}. Check your bank alert and mark it paid on the dashboard.",
+                )
+            return "Thanks! We've let the business know — they'll confirm your payment shortly."
+        return "We've already received your payment info for this order. The business will confirm shortly."
 
     reply = build_greeting_reply(db, business, conversation)
     db.commit()
@@ -935,6 +1010,7 @@ async def webhook(request: Request) -> Response:
     content_type = request.headers.get("content-type", "")
     is_twilio = "application/x-www-form-urlencoded" in content_type or "multipart/form-data" in content_type
 
+    media_url = ""
     if is_twilio:
         form = await request.form()
         form_params = {key: str(value) for key, value in form.multi_items()}
@@ -943,6 +1019,8 @@ async def webhook(request: Request) -> Response:
         from_number = normalize_whatsapp_number(str(form.get("From", "")))
         message = str(form.get("Body", ""))
         to_number = normalize_whatsapp_number(str(form.get("To", "")))
+        if int(form.get("NumMedia", "0") or 0) > 0:
+            media_url = str(form.get("MediaUrl0", ""))
     else:
         payload = await request.json()
         from_number = normalize_whatsapp_number(str(payload.get("from", "")))
@@ -959,7 +1037,7 @@ async def webhook(request: Request) -> Response:
                 reply = "Sorry, this service isn't available right now."
             else:
                 conversation = get_or_create_conversation(db, from_number, business.id)
-                reply = handle_webhook_message(db, business, conversation, message)
+                reply = handle_webhook_message(db, business, conversation, message, media_url)
         finally:
             db.close()
 
@@ -1371,9 +1449,7 @@ def business_detail(request: Request, business_id: int) -> HTMLResponse:
     items_rows = "".join(
         f"<tr><td>{escape(item.name)}</td><td>{escape(item.description or '')}</td><td>₦{item.price}</td><td>{'Yes' if item.is_active == 1 else 'No'}</td><td>{'Yes' if item.is_out_of_stock == 1 else 'No'}</td><td><a href='/admin/businesses/{business.id}/items/{item.id}'>Edit</a></td></tr>" for item in context["items"]
     )
-    orders_rows = "".join(
-        f"<tr><td>{escape(order.customer_phone)}</td><td>₦{order.total}</td><td>{escape(order.status)}</td><td>{escape(order.address)}</td></tr>" for order in context["orders"]
-    )
+    orders_rows = "".join(render_order_row(order) for order in context["orders"])
     plan_options = "".join(
         f"<option value='{plan.id}'>{escape(plan.name)} - ₦{plan.price_ngn}</option>" for plan in plans
     )
@@ -1401,7 +1477,10 @@ def business_detail(request: Request, business_id: int) -> HTMLResponse:
           <div class="form-row">
             <input name="name" value="{escape(business.name)}" required />
             <input name="whatsapp_number" value="{escape(business.whatsapp_number)}" required />
-            <input name="owner_notify_number" value="{escape(business.owner_notify_number or '')}" />
+            <input name="owner_notify_number" value="{escape(business.owner_notify_number or '')}" placeholder="Owner notify number (for order alerts)" />
+            <input name="bank_name" value="{escape(business.bank_name or '')}" placeholder="Bank name (for customer payments)" />
+            <input name="bank_account_number" value="{escape(business.bank_account_number or '')}" placeholder="Bank account number" />
+            <input name="bank_account_name" value="{escape(business.bank_account_name or '')}" placeholder="Account holder name" />
           </div>
           <div class="form-actions">
             <button type="submit">Save</button>
@@ -1477,7 +1556,7 @@ def business_detail(request: Request, business_id: int) -> HTMLResponse:
         <div class="section-head">
           <h3>Orders</h3>
         </div>
-        <div class="table-wrap"><table><tr><th>Customer</th><th>Total</th><th>Status</th><th>Address</th></tr>{orders_rows}</table></div>
+        <div class="table-wrap"><table><tr><th>Order</th><th>Customer</th><th>Address</th><th>Total</th><th>Status</th></tr>{orders_rows}</table></div>
       </div>
     </div>
     """
@@ -1555,6 +1634,9 @@ def update_business(
     name: str = Form(...),
     whatsapp_number: str = Form(...),
     owner_notify_number: str = Form(default=""),
+    bank_name: str = Form(default=""),
+    bank_account_number: str = Form(default=""),
+    bank_account_name: str = Form(default=""),
 ) -> RedirectResponse:
     current_user = get_current_user(request)
     if not current_user or (current_user.role != "admin" and current_user.business_id != business_id):
@@ -1566,6 +1648,9 @@ def update_business(
             business.name = name
             business.whatsapp_number = whatsapp_number
             business.owner_notify_number = owner_notify_number or None
+            business.bank_name = bank_name or None
+            business.bank_account_number = bank_account_number or None
+            business.bank_account_name = bank_account_name or None
             db.commit()
     finally:
         db.close()
@@ -1717,18 +1802,134 @@ def update_menu_item(
     return RedirectResponse(url=f"/admin/businesses/{business_id}", status_code=303)
 
 
+def render_order_row(order: Order, show_business_name: bool = False, business_name: str = "") -> str:
+    business_cell = f"<td>{escape(business_name)}</td>" if show_business_name else ""
+    if order.status == "awaiting_delivery_fee":
+        action_cell = (
+            f"<form method='post' action='/orders/{order.id}/delivery-fee' style='margin:0;display:flex;gap:6px;align-items:center;'>"
+            f"<input name='delivery_fee' type='number' min='0' placeholder='Delivery fee' required style='margin:0;max-width:140px;' />"
+            f"<button type='submit' style='margin:0;'>Send total</button>"
+            f"</form>"
+        )
+    elif order.status == "awaiting_payment":
+        action_cell = "<span class='pill'>Awaiting customer payment</span>"
+    elif order.status == "payment_claimed":
+        proof_bits = []
+        if order.payment_proof_text:
+            proof_bits.append(escape(order.payment_proof_text))
+        if order.payment_receipt_path:
+            proof_bits.append(f"<a href='/orders/{order.id}/receipt' target='_blank'>View receipt</a>")
+        proof_html = " &middot; ".join(proof_bits) if proof_bits else "<span class='form-hint'>No proof attached</span>"
+        action_cell = (
+            f"<div class='stack' style='gap:6px;'>"
+            f"<span class='pill'>Payment claimed</span>"
+            f"<span class='form-hint'>{proof_html}</span>"
+            f"<form method='post' action='/orders/{order.id}/mark-paid' style='margin:0;'>"
+            f"<button type='submit'>Mark paid</button>"
+            f"</form>"
+            f"</div>"
+        )
+    elif order.status == "paid":
+        receipt_link = f"<br/><a href='/orders/{order.id}/receipt' target='_blank'>View receipt</a>" if order.payment_receipt_path else ""
+        action_cell = f"<span class='status-pill'>Paid</span>{receipt_link}"
+    elif order.status == "cancelled":
+        action_cell = "<span class='pill'>Cancelled</span>"
+    else:
+        action_cell = escape(order.status)
+    return (
+        f"<tr>{business_cell}<td>#{order.id}</td><td>{escape(order.customer_phone)}</td><td>{escape(order.address)}</td>"
+        f"<td>₦{order.total}</td><td>{action_cell}</td></tr>"
+    )
+
+
+@app.post("/orders/{order_id}/delivery-fee")
+def set_order_delivery_fee(request: Request, order_id: int, delivery_fee: int = Form(...)) -> RedirectResponse:
+    current_user = get_current_user(request)
+    db = SessionLocal()
+    try:
+        order = db.query(Order).filter(Order.id == order_id).one_or_none()
+        if not order:
+            return RedirectResponse(url="/admin/orders", status_code=303)
+        if not current_user or (current_user.role != "admin" and current_user.business_id != order.business_id):
+            return RedirectResponse(url="/login", status_code=303)
+        business = get_business(db, order.business_id)
+        items_subtotal = cart_total(load_cart(order.items_json))
+        order.delivery_fee = delivery_fee
+        order.total = items_subtotal + delivery_fee
+        order.status = "awaiting_payment"
+        db.commit()
+
+        bank_lines = []
+        if business and business.bank_name:
+            bank_lines.append(f"Bank: {business.bank_name}")
+        if business and business.bank_account_number:
+            bank_lines.append(f"Account number: {business.bank_account_number}")
+        if business and business.bank_account_name:
+            bank_lines.append(f"Account name: {business.bank_account_name}")
+        bank_info = "\n".join(bank_lines) if bank_lines else "Please contact us for payment details."
+
+        send_whatsapp_message(
+            order.customer_phone,
+            f"Your order #{order.id} total is N{order.total} (including N{delivery_fee} delivery).\n\n"
+            f"Please pay to:\n{bank_info}\n\n"
+            "Once you've paid, reply here with confirmation or a photo of your receipt.",
+        )
+        business_id = order.business_id
+    finally:
+        db.close()
+    if current_user.role == "admin":
+        return RedirectResponse(url="/admin/orders", status_code=303)
+    return RedirectResponse(url=f"/business/{business_id}/dashboard", status_code=303)
+
+
+@app.post("/orders/{order_id}/mark-paid")
+def mark_order_paid(request: Request, order_id: int) -> RedirectResponse:
+    current_user = get_current_user(request)
+    db = SessionLocal()
+    try:
+        order = db.query(Order).filter(Order.id == order_id).one_or_none()
+        if not order:
+            return RedirectResponse(url="/admin/orders", status_code=303)
+        if not current_user or (current_user.role != "admin" and current_user.business_id != order.business_id):
+            return RedirectResponse(url="/login", status_code=303)
+        order.status = "paid"
+        db.commit()
+        business_id = order.business_id
+    finally:
+        db.close()
+    if current_user.role == "admin":
+        return RedirectResponse(url="/admin/orders", status_code=303)
+    return RedirectResponse(url=f"/business/{business_id}/dashboard", status_code=303)
+
+
+@app.get("/orders/{order_id}/receipt")
+def get_order_receipt(request: Request, order_id: int):
+    current_user = get_current_user(request)
+    db = SessionLocal()
+    try:
+        order = db.query(Order).filter(Order.id == order_id).one_or_none()
+        if not order or not order.payment_receipt_path:
+            return RedirectResponse(url="/login", status_code=303)
+        if not current_user or (current_user.role != "admin" and current_user.business_id != order.business_id):
+            return RedirectResponse(url="/login", status_code=303)
+        file_path = os.path.join(RECEIPTS_DIR, order.payment_receipt_path)
+    finally:
+        db.close()
+    if not os.path.exists(file_path):
+        return RedirectResponse(url="/login", status_code=303)
+    return FileResponse(file_path)
+
+
 @app.get("/admin/orders", response_class=HTMLResponse)
 def admin_orders(request: Request) -> HTMLResponse:
     db = SessionLocal()
     try:
         orders = db.query(Order).order_by(Order.created_at.desc()).all()
-        rows = "".join(
-            f"<tr><td>{escape(order.customer_phone)}</td><td>{escape(order.address)}</td><td>₦{order.total}</td><td>{escape(order.status)}</td></tr>"
-            for order in orders
-        )
+        business_names = {b.id: b.name for b in db.query(Business).all()}
+        rows = "".join(render_order_row(order, show_business_name=True, business_name=business_names.get(order.business_id, "")) for order in orders)
     finally:
         db.close()
-    body = f"<div class=\"card\"><div class=\"table-wrap\"><table><tr><th>Customer</th><th>Address</th><th>Total</th><th>Status</th></tr>{rows}</table></div></div>"
+    body = f"<div class=\"card\"><div class=\"table-wrap\"><table><tr><th>Business</th><th>Order</th><th>Customer</th><th>Address</th><th>Total</th><th>Status</th></tr>{rows}</table></div></div>"
     return render_page("Orders", body, nav_html=make_nav(get_current_user(request)))
 
 
