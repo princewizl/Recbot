@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.venv/Scripts/python.exe -m py_compile app/main.py)",
+      "Bash(.venv/Scripts/python.exe -m pytest -q)",
+      "Bash(powershell -Command \"Get-Process python -ErrorAction SilentlyContinue | Select-Object Id,ProcessName,StartTime\")"
+    ]
+  }
+}
