@@ -454,6 +454,20 @@ def render_page(title: str, body: str, nav_html: Optional[str] = None) -> HTMLRe
                     .plan-card .price {{ font-size:1.7rem; font-weight:800; letter-spacing:-.03em; color:var(--text); }}
                     .plan-card p {{ color:var(--muted); margin:0; font-size:.88rem; }}
                     .plan-card label {{ margin-top:6px; }}
+                    dialog.modal {{ border:1px solid var(--border-strong); border-radius:var(--radius-lg); padding:0; background:var(--surface); color:var(--text); box-shadow:var(--shadow-md); width:min(420px, 90vw); }}
+                    dialog.modal::backdrop {{ background:rgba(2,4,10,.68); backdrop-filter:blur(2px); }}
+                    dialog.modal .modal-body {{ padding:24px; }}
+                    dialog.modal h3 {{ margin-top:0; }}
+                    dialog.modal .modal-actions {{ display:flex; gap:10px; margin-top:18px; }}
+                    dialog.modal .modal-actions button {{ margin-right:0; }}
+                    .detail-grid {{ display:grid; grid-template-columns:1.4fr 1fr; gap:16px; align-items:start; }}
+                    .kv-list {{ display:flex; flex-direction:column; gap:10px; }}
+                    .kv-list .kv-row {{ display:flex; justify-content:space-between; gap:12px; padding:10px 0; border-bottom:1px solid var(--border); }}
+                    .kv-list .kv-row:last-child {{ border-bottom:none; }}
+                    .kv-list .kv-label {{ color:var(--muted); font-size:.85rem; }}
+                    .kv-list .kv-value {{ font-weight:600; text-align:right; }}
+                    .receipt-preview {{ max-width:100%; border-radius:var(--radius-md); border:1px solid var(--border); margin-top:10px; }}
+                    @media (max-width:780px) {{ .detail-grid {{ grid-template-columns:1fr; }} }}
                     .rb-mascot {{ position:fixed; right:20px; bottom:20px; z-index:9999; display:flex; flex-direction:column; align-items:flex-end; gap:10px; }}
                     .rb-bubble {{ max-width:240px; padding:12px 14px; border-radius:16px 16px 4px 16px; background:var(--surface); border:1px solid var(--border-strong); color:var(--text); font-size:.85rem; line-height:1.4; box-shadow:var(--shadow-md); }}
                     .rb-toggle {{ width:130px; height:130px; padding:0; border:none; background:transparent; cursor:pointer; display:flex; align-items:center; justify-content:center; transition:transform .2s ease; filter:drop-shadow(0 18px 30px rgba(0,0,0,.4)); }}
@@ -827,15 +841,22 @@ def parse_choice(text: str) -> Optional[int]:
     return int(text) if text.isdigit() else None
 
 
+COLLXCT_FOOTER = "\n\n_Powered by Collxct_"
+
+
 def format_category_menu(categories: List[Category]) -> str:
-    lines = [f"{i}) {category.name}" for i, category in enumerate(categories, start=1)]
-    return "Please choose a category by replying with a number:\n" + "\n".join(lines)
+    lines = [f"*{i}.* {category.name}" for i, category in enumerate(categories, start=1)]
+    return "Please choose a category by replying with a number:\n\n" + "\n".join(lines)
 
 
 def format_item_menu(items: List[MenuItem], category_name: str) -> str:
-    lines = [f"{i}) {item.name} - N{item.price}" for i, item in enumerate(items, start=1)]
+    lines = []
+    for i, item in enumerate(items, start=1):
+        lines.append(f"*{i}.* {item.name} — N{item.price}")
+        if item.description:
+            lines.append(f"_{item.description}_")
     return (
-        f"{category_name} menu:\n" + "\n".join(lines) + "\n\n"
+        f"*{category_name}* menu:\n\n" + "\n".join(lines) + "\n\n"
         "Reply with a number to add an item to your cart, 'cart' to view your cart, "
         "or 'checkout' when you're ready to order."
     )
@@ -866,7 +887,7 @@ def format_cart_lines(cart: List[Dict[str, object]]) -> str:
     for entry in cart:
         qty = entry.get("qty", 1)
         price = entry.get("price", 0)
-        lines.append(f"{qty} x {entry.get('name', 'Item')} - N{int(price) * int(qty)}")
+        lines.append(f"{qty} x {entry.get('name', 'Item')} — N{int(price) * int(qty)}")
     return "\n".join(lines)
 
 
@@ -875,9 +896,9 @@ def build_greeting_reply(db, business: Business, conversation: Conversation) -> 
     conversation.category_id = None
     if not categories:
         conversation.stage = CONV_NEW
-        return f"Hi! Thanks for reaching out to {business.name}. We don't have any items available right now, please check back soon."
+        return f"Hi! Thanks for reaching out to *{business.name}*. We don't have any items available right now, please check back soon.{COLLXCT_FOOTER}"
     conversation.stage = CONV_CATEGORY
-    return f"Hi! Welcome to {business.name}. " + format_category_menu(categories)
+    return f"Hi! 👋 Welcome to *{business.name}*.\n\n" + format_category_menu(categories) + COLLXCT_FOOTER
 
 
 def handle_webhook_message(db, business: Business, conversation: Conversation, message: str, media_url: str = "") -> str:
@@ -924,14 +945,14 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
             cart = load_cart(conversation.cart_json)
             if not cart:
                 return "Your cart is empty. Reply with a number to add an item."
-            return f"Your cart:\n{format_cart_lines(cart)}\n\nTotal: N{cart_total(cart)}\n\nReply 'checkout' to place your order or add another item number."
+            return f"*Your cart:*\n{format_cart_lines(cart)}\n\n*Total:* N{cart_total(cart)}\n\nReply 'checkout' to place your order or add another item number."
         if normalized in {"checkout", "done"}:
             cart = load_cart(conversation.cart_json)
             if not cart:
                 return "Your cart is empty. Please add at least one item before checking out."
             conversation.stage = CONV_ADDRESS
             db.commit()
-            return "Great! Please reply with your delivery address."
+            return "Great! Please reply with your delivery address. 📍"
         if normalized in {"back", "categories"}:
             reply = build_greeting_reply(db, business, conversation)
             db.commit()
@@ -951,7 +972,7 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
             cart.append({"item_id": item.id, "name": item.name, "description": item.description or "", "price": item.price, "qty": 1})
         conversation.cart_json = json.dumps(cart)
         db.commit()
-        return f"Added {item.name} to your cart. Reply with another number to add more, 'cart' to view your cart, or 'checkout' to place your order."
+        return f"✅ Added *{item.name}* to your cart. Reply with another number to add more, 'cart' to view your cart, or 'checkout' to place your order."
 
     if conversation.stage == CONV_ADDRESS:
         address = message.strip()
@@ -976,8 +997,8 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
         conversation.stage = CONV_AWAITING_PAYMENT
         db.commit()
         return (
-            f"Thanks! Here's your order:\n{format_cart_lines(cart)}\nSubtotal: N{subtotal}\nDelivery to: {address}\n\n"
-            "We're confirming your delivery fee now and will send your full total and payment details shortly."
+            f"Thanks! Here's your order:\n{format_cart_lines(cart)}\n\n*Subtotal:* N{subtotal}\n*Delivery to:* {address}\n\n"
+            f"We're confirming your delivery fee now and will send your full total and payment details shortly.{COLLXCT_FOOTER}"
         )
 
     if conversation.stage == CONV_AWAITING_PAYMENT:
@@ -1021,10 +1042,10 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
             if business.owner_notify_number:
                 send_whatsapp_message(
                     business.owner_notify_number,
-                    f"New payment claim for order #{order.id}: N{order.total} from {order.customer_phone}. Check your bank alert and mark it paid on the dashboard.",
+                    f"💰 New payment claim for order *#{order.id}*: N{order.total} from {order.customer_phone}. Check your bank alert and mark it paid on the dashboard.",
                     from_number=business.whatsapp_number,
                 )
-            return "Thanks! We've let the business know — they'll confirm your payment shortly."
+            return f"Thanks! We've let *{business.name}* know — they'll confirm your payment shortly. ✅"
         return "We've already received your payment info for this order. The business will confirm shortly."
 
     reply = build_greeting_reply(db, business, conversation)
@@ -1854,41 +1875,12 @@ def render_order_row(order: Order, show_business_name: bool = False, business_na
     is_stale = is_pending and order.created_at and (datetime.utcnow() - order.created_at) > timedelta(hours=2)
     age_style = "color:var(--danger);font-weight:700;" if is_stale else "color:var(--muted);"
     age_cell = f"<td style='{age_style}'>{format_age(order.created_at)}</td>"
-    if order.status == "awaiting_delivery_fee":
-        action_cell = (
-            f"<form method='post' action='/orders/{order.id}/delivery-fee' style='margin:0;display:flex;gap:6px;align-items:center;'>"
-            f"<input name='delivery_fee' type='number' min='0' placeholder='Delivery fee' required style='margin:0;max-width:140px;' />"
-            f"<button type='submit' style='margin:0;'>Send total</button>"
-            f"</form>"
-        )
-    elif order.status == "awaiting_payment":
-        action_cell = "<span class='pill'>Awaiting customer payment</span>"
-    elif order.status == "payment_claimed":
-        proof_bits = []
-        if order.payment_proof_text:
-            proof_bits.append(escape(order.payment_proof_text))
-        if order.payment_receipt_path:
-            proof_bits.append(f"<a href='/orders/{order.id}/receipt' target='_blank'>View receipt</a>")
-        proof_html = " &middot; ".join(proof_bits) if proof_bits else "<span class='form-hint'>No proof attached</span>"
-        action_cell = (
-            f"<div class='stack' style='gap:6px;'>"
-            f"<span class='pill'>Payment claimed</span>"
-            f"<span class='form-hint'>{proof_html}</span>"
-            f"<form method='post' action='/orders/{order.id}/mark-paid' style='margin:0;'>"
-            f"<button type='submit'>Mark paid</button>"
-            f"</form>"
-            f"</div>"
-        )
-    elif order.status == "paid":
-        receipt_link = f"<br/><a href='/orders/{order.id}/receipt' target='_blank'>View receipt</a>" if order.payment_receipt_path else ""
-        action_cell = f"<span class='status-pill'>Paid</span>{receipt_link}"
-    elif order.status == "cancelled":
-        action_cell = "<span class='pill'>Cancelled</span>"
-    else:
-        action_cell = escape(order.status)
+    status_pill_style = "background:rgba(255,94,122,.12);border-color:rgba(255,94,122,.3);color:var(--danger);" if is_stale else ""
+    status_label = ORDER_STATUS_LABELS.get(order.status, order.status)
+    status_cell = f"<span class='status-pill' style='{status_pill_style}'>{escape(status_label)}</span>"
     return (
-        f"<tr>{business_cell}<td>#{order.id}</td><td>{escape(order.customer_phone)}</td><td>{escape(order.address)}</td>"
-        f"<td>₦{order.total}</td>{age_cell}<td>{action_cell}</td></tr>"
+        f"<tr>{business_cell}<td><a href='/orders/{order.id}'>#{order.id}</a></td><td>{escape(order.customer_phone)}</td><td>{escape(order.address)}</td>"
+        f"<td>₦{order.total}</td>{age_cell}<td>{status_cell}</td></tr>"
     )
 
 
@@ -1920,9 +1912,9 @@ def set_order_delivery_fee(request: Request, order_id: int, delivery_fee: int = 
 
         send_whatsapp_message(
             order.customer_phone,
-            f"Your order #{order.id} total is N{order.total} (including N{delivery_fee} delivery).\n\n"
-            f"Please pay to:\n{bank_info}\n\n"
-            "Once you've paid, reply here with confirmation or a photo of your receipt.",
+            f"Your order *#{order.id}* total is *N{order.total}* (including N{delivery_fee} delivery).\n\n"
+            f"*Please pay to:*\n{bank_info}\n\n"
+            f"Once you've paid, reply here with confirmation or a photo of your receipt.{COLLXCT_FOOTER}",
             from_number=business.whatsapp_number if business else None,
         )
         business_id = order.business_id
@@ -1945,6 +1937,12 @@ def mark_order_paid(request: Request, order_id: int) -> RedirectResponse:
             return RedirectResponse(url="/login", status_code=303)
         order.status = "paid"
         db.commit()
+        business = get_business(db, order.business_id)
+        send_whatsapp_message(
+            order.customer_phone,
+            f"🎉 Payment confirmed for order *#{order.id}*! *{business.name if business else 'The business'}* is preparing your order now.{COLLXCT_FOOTER}",
+            from_number=business.whatsapp_number if business else None,
+        )
         business_id = order.business_id
     finally:
         db.close()
@@ -1971,8 +1969,123 @@ def get_order_receipt(request: Request, order_id: int):
     return FileResponse(file_path)
 
 
+ORDER_STATUS_LABELS = {
+    "awaiting_delivery_fee": "Awaiting delivery fee",
+    "awaiting_payment": "Awaiting customer payment",
+    "payment_claimed": "Payment claimed — needs review",
+    "paid": "Paid",
+    "cancelled": "Cancelled",
+}
+
+
+@app.get("/orders/{order_id}", response_class=HTMLResponse)
+def order_detail(request: Request, order_id: int) -> HTMLResponse:
+    current_user = get_current_user(request)
+    db = SessionLocal()
+    try:
+        order = db.query(Order).filter(Order.id == order_id).one_or_none()
+        if not order:
+            return render_page("Order Not Found", "<p>Order not found.</p>", nav_html=make_nav(current_user))
+        if not current_user or (current_user.role != "admin" and current_user.business_id != order.business_id):
+            return RedirectResponse(url="/login", status_code=303)
+        business = get_business(db, order.business_id)
+    finally:
+        db.close()
+
+    items = load_cart(order.items_json)
+    items_rows = "".join(
+        f"<tr><td>{escape(str(entry.get('name', 'Item')))}</td><td>{entry.get('qty', 1)}</td>"
+        f"<td>N{entry.get('price', 0)}</td><td>N{int(entry.get('price', 0)) * int(entry.get('qty', 1))}</td></tr>"
+        for entry in items
+    )
+    subtotal = cart_total(items)
+    status_label = ORDER_STATUS_LABELS.get(order.status, order.status)
+
+    proof_html = ""
+    if order.payment_proof_text:
+        proof_html += f"<p><strong>Customer note:</strong> {escape(order.payment_proof_text)}</p>"
+    if order.payment_receipt_path:
+        proof_html += f"<a href='/orders/{order.id}/receipt' target='_blank'><img class='receipt-preview' src='/orders/{order.id}/receipt' alt='Payment receipt' /></a>"
+    if not proof_html:
+        proof_html = "<p class='form-hint'>No payment proof submitted yet.</p>"
+
+    action_button = ""
+    action_modal = ""
+    if order.status == "awaiting_delivery_fee":
+        action_button = "<button type='button' class='btn primary' onclick=\"document.getElementById('delivery-fee-modal').showModal()\">Set delivery fee</button>"
+        action_modal = f"""
+        <dialog id="delivery-fee-modal" class="modal">
+          <div class="modal-body">
+            <h3>Set delivery fee</h3>
+            <p class="form-hint">Subtotal is N{subtotal}. Enter the delivery fee to send the customer their full total and your bank details.</p>
+            <form method="post" action="/orders/{order.id}/delivery-fee">
+              <input name="delivery_fee" type="number" min="0" placeholder="Delivery fee" required autofocus />
+              <div class="modal-actions">
+                <button type="submit" class="btn primary">Send total to customer</button>
+                <button type="button" class="btn secondary" onclick="document.getElementById('delivery-fee-modal').close()">Cancel</button>
+              </div>
+            </form>
+          </div>
+        </dialog>
+        """
+    elif order.status in {"awaiting_payment", "payment_claimed"}:
+        action_button = "<button type='button' class='btn primary' onclick=\"document.getElementById('mark-paid-modal').showModal()\">Mark paid</button>"
+        action_modal = f"""
+        <dialog id="mark-paid-modal" class="modal">
+          <div class="modal-body">
+            <h3>Mark order #{order.id} as paid?</h3>
+            <p class="form-hint">Total: N{order.total}. Only confirm after checking your own bank alert for this exact amount.</p>
+            <form method="post" action="/orders/{order.id}/mark-paid">
+              <div class="modal-actions">
+                <button type="submit" class="btn primary">Yes, mark as paid</button>
+                <button type="button" class="btn secondary" onclick="document.getElementById('mark-paid-modal').close()">Cancel</button>
+              </div>
+            </form>
+          </div>
+        </dialog>
+        """
+
+    body = f"""
+    <div class="hero-panel">
+      <div>
+        <div class="eyebrow">Order #{order.id}</div>
+        <h1>{escape(business.name) if business else 'Unknown business'}</h1>
+        <p>{escape(order.customer_phone)} &middot; placed {format_age(order.created_at)}</p>
+      </div>
+      <div class="actions">
+        <span class="status-pill">{escape(status_label)}</span>
+        {action_button}
+      </div>
+    </div>
+    <div class="detail-grid">
+      <div class="card">
+        <h3>Items</h3>
+        <div class="table-wrap"><table><tr><th>Item</th><th>Qty</th><th>Price</th><th>Line total</th></tr>{items_rows}</table></div>
+      </div>
+      <div class="card">
+        <h3>Summary</h3>
+        <div class="kv-list">
+          <div class="kv-row"><span class="kv-label">Subtotal</span><span class="kv-value">N{subtotal}</span></div>
+          <div class="kv-row"><span class="kv-label">Delivery fee</span><span class="kv-value">N{order.delivery_fee}</span></div>
+          <div class="kv-row"><span class="kv-label">Total</span><span class="kv-value">N{order.total}</span></div>
+          <div class="kv-row"><span class="kv-label">Delivery address</span><span class="kv-value">{escape(order.address)}</span></div>
+        </div>
+      </div>
+    </div>
+    <div class="card">
+      <h3>Payment</h3>
+      {proof_html}
+    </div>
+    {action_modal}
+    """
+    return render_page(f"Order #{order.id}", body, nav_html=make_nav(current_user))
+
+
 @app.get("/admin/orders", response_class=HTMLResponse)
 def admin_orders(request: Request) -> HTMLResponse:
+    current_user = get_current_user(request)
+    if not current_user or current_user.role != "admin":
+        return RedirectResponse(url="/login", status_code=303)
     db = SessionLocal()
     try:
         orders = db.query(Order).order_by(Order.created_at.desc()).all()
@@ -1981,22 +2094,109 @@ def admin_orders(request: Request) -> HTMLResponse:
     finally:
         db.close()
     body = f"<div class=\"card\"><div class=\"table-wrap\"><table><tr><th>Business</th><th>Order</th><th>Customer</th><th>Address</th><th>Total</th><th>Age</th><th>Status</th></tr>{rows}</table></div></div>"
-    return render_page("Orders", body, nav_html=make_nav(get_current_user(request)))
+    return render_page("Orders", body, nav_html=make_nav(current_user))
+
+
+CONV_STAGE_LABELS = {
+    CONV_NEW: "New / idle",
+    CONV_CATEGORY: "Choosing category",
+    CONV_ITEM: "Browsing items",
+    CONV_ADDRESS: "Entering address",
+    CONV_AWAITING_PAYMENT: "Awaiting payment",
+}
 
 
 @app.get("/admin/conversations", response_class=HTMLResponse)
 def admin_conversations(request: Request) -> HTMLResponse:
+    current_user = get_current_user(request)
+    if not current_user or current_user.role != "admin":
+        return RedirectResponse(url="/login", status_code=303)
     db = SessionLocal()
     try:
         conversations = db.query(Conversation).order_by(Conversation.updated_at.desc()).all()
+        business_names = {b.id: b.name for b in db.query(Business).all()}
         rows = "".join(
-            f"<tr><td>{escape(conversation.phone_number)}</td><td>{escape(conversation.stage)}</td><td>{escape(format_cart_summary(conversation.cart_json) or (conversation.address or ''))}</td></tr>"
+            f"<tr><td>{escape(business_names.get(conversation.business_id, 'Unknown'))}</td>"
+            f"<td><a href='/conversations/{conversation.id}'>{escape(conversation.phone_number)}</a></td>"
+            f"<td>{escape(CONV_STAGE_LABELS.get(conversation.stage, conversation.stage))}</td>"
+            f"<td>{escape(format_cart_summary(conversation.cart_json) or (conversation.address or ''))}</td>"
+            f"<td>{format_age(conversation.updated_at)}</td></tr>"
             for conversation in conversations
         )
     finally:
         db.close()
-    body = f"<div class=\"card\"><div class=\"table-wrap\"><table><tr><th>Phone</th><th>Stage</th><th>Address</th></tr>{rows}</table></div></div>"
-    return render_page("Conversations", body, nav_html=make_nav(get_current_user(request)))
+    body = f"<div class=\"card\"><div class=\"table-wrap\"><table><tr><th>Business</th><th>Phone</th><th>Stage</th><th>Cart / Address</th><th>Last active</th></tr>{rows}</table></div></div>"
+    return render_page("Conversations", body, nav_html=make_nav(current_user))
+
+
+@app.get("/conversations/{conversation_id}", response_class=HTMLResponse)
+def conversation_detail(request: Request, conversation_id: int) -> HTMLResponse:
+    current_user = get_current_user(request)
+    db = SessionLocal()
+    try:
+        conversation = db.query(Conversation).filter(Conversation.id == conversation_id).one_or_none()
+        if not conversation:
+            return render_page("Conversation Not Found", "<p>Conversation not found.</p>", nav_html=make_nav(current_user))
+        if not current_user or (current_user.role != "admin" and current_user.business_id != conversation.business_id):
+            return RedirectResponse(url="/login", status_code=303)
+        business = get_business(db, conversation.business_id)
+        orders = (
+            db.query(Order)
+            .filter(Order.customer_phone == conversation.phone_number, Order.business_id == conversation.business_id)
+            .order_by(Order.created_at.desc())
+            .all()
+        )
+    finally:
+        db.close()
+
+    cart = load_cart(conversation.cart_json)
+    cart_rows = "".join(
+        f"<tr><td>{escape(str(entry.get('name', 'Item')))}</td><td>{entry.get('qty', 1)}</td><td>₦{entry.get('price', 0)}</td></tr>"
+        for entry in cart
+    )
+    cart_html = (
+        f"<div class='table-wrap'><table><tr><th>Item</th><th>Qty</th><th>Price</th></tr>{cart_rows}</table></div>"
+        if cart else "<p class='form-hint'>Cart is empty.</p>"
+    )
+
+    orders_html = "".join(render_order_row(order) for order in orders)
+    orders_section = (
+        f"<div class='table-wrap'><table><tr><th>Order</th><th>Customer</th><th>Address</th><th>Total</th><th>Age</th><th>Status</th></tr>{orders_html}</table></div>"
+        if orders else "<p class='form-hint'>No orders yet from this conversation.</p>"
+    )
+
+    stage_label = CONV_STAGE_LABELS.get(conversation.stage, conversation.stage)
+    body = f"""
+    <div class="hero-panel">
+      <div>
+        <div class="eyebrow">Conversation</div>
+        <h1>{escape(conversation.phone_number)}</h1>
+        <p>{escape(business.name) if business else 'Unknown business'} &middot; last active {format_age(conversation.updated_at)}</p>
+      </div>
+      <div class="actions">
+        <span class="status-pill">{escape(stage_label)}</span>
+      </div>
+    </div>
+    <div class="detail-grid">
+      <div class="card">
+        <h3>Current cart</h3>
+        {cart_html}
+      </div>
+      <div class="card">
+        <h3>Details</h3>
+        <div class="kv-list">
+          <div class="kv-row"><span class="kv-label">Stage</span><span class="kv-value">{escape(stage_label)}</span></div>
+          <div class="kv-row"><span class="kv-label">Address on file</span><span class="kv-value">{escape(conversation.address or '—')}</span></div>
+          <div class="kv-row"><span class="kv-label">Last active</span><span class="kv-value">{format_age(conversation.updated_at)}</span></div>
+        </div>
+      </div>
+    </div>
+    <div class="card">
+      <h3>Orders from this customer</h3>
+      {orders_section}
+    </div>
+    """
+    return render_page(f"Conversation — {conversation.phone_number}", body, nav_html=make_nav(current_user))
 
 
 @app.get("/business/{business_id}", response_class=HTMLResponse)
