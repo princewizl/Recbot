@@ -25,9 +25,8 @@ Recbot now has its own properly-scoped repo at `github.com/princewizl/Recbot`, s
 ## 1. Set up a deploy key and clone the repo
 
 This lets the server pull from the (private, presumably) `Recbot` repo without a password, the same way it already does for Collxct.
-
 ```bash
-ssh root@<server-ip>
+ssh root@158.220.84.21
 
 # Generate a dedicated key pair for this repo (no passphrase)
 ssh-keygen -t ed25519 -C "recbot-server-deploy" -f ~/.ssh/recbot_deploy -N ""

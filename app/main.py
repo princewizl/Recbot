@@ -4,6 +4,7 @@ import hmac
 import json
 import logging
 import os
+import re
 from datetime import datetime, timedelta
 from html import escape
 from typing import Dict, List, Optional
@@ -741,7 +742,20 @@ CONV_ITEM = "await_item"
 CONV_NAME = "await_name"
 CONV_ADDRESS = "await_address"
 CONV_AWAITING_PAYMENT = "awaiting_payment"
-RESET_WORDS = {"hi", "hello", "hey", "start", "menu", "restart"}
+# Greetings are "soft": mid-order they get a resume reminder instead of silently
+# wiping the cart. Hard reset words always start fresh.
+GREETING_WORDS = {"hi", "hello", "hey", "good morning", "good afternoon", "good evening", "hy", "helo"}
+HARD_RESET_WORDS = {"start", "menu", "restart", "start over", "new order"}
+STATUS_WORDS = {"status", "order status", "my order", "track", "track order", "where is my order"}
+HELP_WORDS = {"help", "info", "commands", "options"}
+CANCEL_WORDS = {"cancel", "stop", "cancel order", "quit"}
+CHECKOUT_WORDS = {"checkout", "done", "order", "place order", "pay"}
+CART_WORDS = {"cart", "my cart", "view cart", "basket"}
+BACK_WORDS = {"back", "categories", "go back"}
+CLEAR_CART_WORDS = {"clear", "clear cart", "empty cart"}
+PAYMENT_CLAIM_TOKENS = ("paid", "transfer", "sent", "receipt", "confirm", "done")
+PAYMENT_INFO_TOKENS = ("how much", "account", "bank", "details", "total", "amount")
+ACTIVE_ORDER_STATUSES = {"awaiting_delivery_fee", "awaiting_payment", "payment_claimed", "paid", "out_for_delivery"}
 STALE_CONVERSATION_AFTER = timedelta(hours=24)
 STALE_RESET_STAGES = {CONV_CATEGORY, CONV_ITEM, CONV_NAME, CONV_ADDRESS}
 
@@ -859,6 +873,27 @@ def parse_choice(text: str) -> Optional[int]:
     return int(text) if text.isdigit() else None
 
 
+def resolve_choice(text: str, names: List[str]) -> Optional[int]:
+    index = parse_choice(text)
+    if index is not None:
+        return index
+    cleaned = text.strip().lower()
+    if cleaned:
+        for i, name in enumerate(names):
+            if name.strip().lower() == cleaned:
+                return i + 1
+        if len(cleaned) >= 3:
+            matches = [i for i, name in enumerate(names) if cleaned in name.strip().lower()]
+            if len(matches) == 1:
+                return matches[0] + 1
+    # Tolerate "1.", "(2)", "item 3", "I'll take 2 please" — only when exactly one
+    # number appears, so ambiguous messages still fall through to the re-prompt.
+    numbers = re.findall(r"\d+", text)
+    if len(numbers) == 1:
+        return int(numbers[0])
+    return None
+
+
 COLLXCT_FOOTER = "\n\n_Powered by Collxct_"
 
 
@@ -919,6 +954,95 @@ def build_greeting_reply(db, business: Business, conversation: Conversation) -> 
     return f"Hi! 👋 Welcome to *{business.name}*.\n\n" + format_category_menu(categories) + COLLXCT_FOOTER
 
 
+def latest_order_for(db, business_id: int, phone_number: str) -> Optional[Order]:
+    return (
+        db.query(Order)
+        .filter(Order.customer_phone == phone_number, Order.business_id == business_id)
+        .order_by(Order.id.desc())
+        .first()
+    )
+
+
+def format_bank_info(business: Optional[Business]) -> str:
+    lines = []
+    if business and business.bank_name:
+        lines.append(f"Bank: {business.bank_name}")
+    if business and business.bank_account_number:
+        lines.append(f"Account number: {business.bank_account_number}")
+    if business and business.bank_account_name:
+        lines.append(f"Account name: {business.bank_account_name}")
+    return "\n".join(lines) if lines else "Please contact us for payment details."
+
+
+def format_payment_request(order: Order, business: Optional[Business]) -> str:
+    return (
+        f"Your order *#{order.id}* total is *N{order.total}* (including N{order.delivery_fee} delivery).\n\n"
+        f"*Please pay to:*\n{format_bank_info(business)}\n\n"
+        f"Once you've paid, reply here with confirmation or a photo of your receipt."
+    )
+
+
+def format_order_status_reply(order: Optional[Order], business: Business) -> str:
+    if not order or order.status == "cancelled":
+        return f"You don't have an active order with *{business.name}*. Reply 'menu' to see what's available. 🛍️"
+    if order.status == "awaiting_delivery_fee":
+        return (
+            f"Order *#{order.id}* is confirmed — we're working out your delivery fee "
+            f"and will send your total and payment details shortly."
+        )
+    if order.status == "awaiting_payment":
+        return f"Order *#{order.id}* is awaiting your payment.\n\n{format_payment_request(order, business)}"
+    if order.status == "payment_claimed":
+        return f"We've received your payment info for order *#{order.id}* — *{business.name}* will confirm it shortly. ✅"
+    if order.status == "paid":
+        return f"Payment confirmed! Order *#{order.id}* is being prepared. 🧑‍🍳"
+    if order.status == "out_for_delivery":
+        return f"Order *#{order.id}* is on its way to you! 🚴"
+    if order.status == "delivered":
+        return f"Order *#{order.id}* was delivered. Reply 'menu' to order again!"
+    return f"Order *#{order.id}* status: {order.status}."
+
+
+def build_help_reply(conversation: Conversation) -> str:
+    step_lines = {
+        CONV_CATEGORY: "Right now: reply with a category number to browse items.",
+        CONV_ITEM: "Right now: reply with an item number to add it to your cart.",
+        CONV_NAME: "Right now: reply with the name to put on your order.",
+        CONV_ADDRESS: "Right now: reply with your delivery address.",
+        CONV_AWAITING_PAYMENT: "Right now: reply with payment confirmation or a photo of your receipt.",
+    }
+    step = step_lines.get(conversation.stage, "Reply 'menu' to see what's available.")
+    return (
+        "🤖 *Quick guide*\n"
+        "• 'menu' — browse / start a fresh order\n"
+        "• 'cart' — view your cart\n"
+        "• 'checkout' — place your order\n"
+        "• 'status' — check your latest order\n"
+        "• 'cancel' — cancel what you're doing\n\n"
+        f"{step}"
+    )
+
+
+def record_payment_claim(db, business: Business, conversation: Conversation, order: Order, message: str, media_url: str) -> str:
+    if media_url:
+        receipt_filename = save_payment_receipt(order.id, media_url)
+        if receipt_filename:
+            order.payment_receipt_path = receipt_filename
+    if message.strip():
+        order.payment_proof_text = message.strip()
+    order.status = "payment_claimed"
+    conversation.stage = CONV_NEW
+    conversation.address = None
+    db.commit()
+    if business.owner_notify_number:
+        send_whatsapp_message(
+            business.owner_notify_number,
+            f"💰 New payment claim for order *#{order.id}*: N{order.total} from {order.customer_phone}. Check your bank alert and mark it paid on the dashboard.",
+            from_number=business.whatsapp_number,
+        )
+    return f"Thanks! We've let *{business.name}* know — they'll confirm your payment shortly. ✅"
+
+
 def handle_webhook_message(db, business: Business, conversation: Conversation, message: str, media_url: str = "") -> str:
     normalized = message.strip().lower()
 
@@ -934,22 +1058,102 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
     conversation.updated_at = datetime.utcnow()
     db.commit()
 
-    if normalized in RESET_WORDS or not conversation.stage:
+    latest_order = latest_order_for(db, business.id, conversation.phone_number)
+    active_order = latest_order if latest_order and latest_order.status in ACTIVE_ORDER_STATUSES else None
+    cart = load_cart(conversation.cart_json)
+
+    # A receipt photo or clear payment message always reaches the pending order,
+    # even if the conversation drifted to another stage (e.g. after a greeting reset).
+    if (
+        latest_order
+        and latest_order.status == "awaiting_payment"
+        and conversation.stage != CONV_AWAITING_PAYMENT
+        and not normalized.endswith("?")
+        and (
+            media_url
+            or (
+                not cart
+                and conversation.stage in {CONV_NEW, CONV_CATEGORY}
+                and any(token in normalized for token in PAYMENT_CLAIM_TOKENS)
+            )
+        )
+    ):
+        return record_payment_claim(db, business, conversation, latest_order, message, media_url)
+
+    if normalized in STATUS_WORDS:
+        db.commit()
+        return format_order_status_reply(latest_order, business) + COLLXCT_FOOTER
+
+    if normalized in HELP_WORDS:
+        db.commit()
+        return build_help_reply(conversation)
+
+    if normalized in CANCEL_WORDS and conversation.stage in {CONV_CATEGORY, CONV_ITEM, CONV_NAME, CONV_ADDRESS}:
+        conversation.cart_json = "[]"
+        conversation.customer_name = None
+        conversation.address = None
+        conversation.category_id = None
+        conversation.stage = CONV_NEW
+        db.commit()
+        return "No problem — cancelled. Reply 'hi' whenever you'd like to start a new order. 👋"
+
+    if normalized in GREETING_WORDS and conversation.stage == CONV_AWAITING_PAYMENT and active_order:
+        db.commit()
+        return (
+            "👋 Welcome back!\n\n" + format_order_status_reply(active_order, business)
+            + "\n\nReply 'menu' to start a new order."
+        )
+
+    if normalized in GREETING_WORDS and cart and conversation.stage in {CONV_CATEGORY, CONV_ITEM, CONV_NAME, CONV_ADDRESS}:
+        resume_prompts = {
+            CONV_CATEGORY: "Reply with a category number to keep shopping, or 'checkout' to place your order.",
+            CONV_ITEM: "Reply with an item number to add more, or 'checkout' to place your order.",
+            CONV_NAME: "What name should we put on this order?",
+            CONV_ADDRESS: "Please reply with your delivery address. 📍",
+        }
+        db.commit()
+        return (
+            f"👋 Welcome back! You have an order in progress:\n{format_cart_lines(cart)}\n\n"
+            f"{resume_prompts[conversation.stage]}\n\n(Reply 'restart' to start over, or 'cancel' to cancel.)"
+        )
+
+    if normalized in GREETING_WORDS or normalized in HARD_RESET_WORDS or not conversation.stage:
         conversation.cart_json = "[]"
         conversation.customer_name = None
         conversation.address = None
         reply = build_greeting_reply(db, business, conversation)
         db.commit()
+        if active_order:
+            reply = (
+                f"ℹ️ Your order *#{active_order.id}* is still in progress — reply 'status' anytime to check on it.\n\n"
+                + reply
+            )
         return reply
 
     if conversation.stage == CONV_CATEGORY:
         categories = active_categories_for_business(db, business.id)
-        index = parse_choice(normalized)
         if not categories:
             conversation.stage = CONV_NEW
             db.commit()
             return f"Sorry, {business.name} doesn't have any items available right now. Please check back soon."
+        if normalized in CART_WORDS:
+            if not cart:
+                return "Your cart is empty. " + format_category_menu(categories)
+            return (
+                f"*Your cart:*\n{format_cart_lines(cart)}\n\n*Total:* N{cart_total(cart)}\n\n"
+                "Reply 'checkout' to place your order, or pick a category to keep shopping:\n\n"
+                + format_category_menu(categories)
+            )
+        if normalized in CHECKOUT_WORDS:
+            if not cart:
+                return "Your cart is empty. " + format_category_menu(categories)
+            conversation.stage = CONV_NAME
+            db.commit()
+            return "Great! What name should we put on this order?"
+        index = resolve_choice(message, [category.name for category in categories])
         if index is None or index < 1 or index > len(categories):
+            if not message.strip() and media_url:
+                return "I can only read text here 🙂 — please reply with a number.\n\n" + format_category_menu(categories)
             db.commit()
             return "Sorry, I didn't understand that. " + format_category_menu(categories)
         category = categories[index - 1]
@@ -960,29 +1164,43 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
         return format_item_menu(items, category.name)
 
     if conversation.stage == CONV_ITEM:
-        if normalized == "cart":
-            cart = load_cart(conversation.cart_json)
+        items = active_items_for_category(db, business.id, conversation.category_id) if conversation.category_id else []
+        if not items:
+            # Category was deleted or everything in it went out of stock mid-browse.
+            conversation.category_id = None
+            categories = active_categories_for_business(db, business.id)
+            if not categories:
+                conversation.stage = CONV_NEW
+                db.commit()
+                return f"Sorry, {business.name} doesn't have any items available right now. Please check back soon."
+            conversation.stage = CONV_CATEGORY
+            db.commit()
+            return "Sorry, those items are no longer available. " + format_category_menu(categories)
+        if normalized in CART_WORDS:
             if not cart:
                 return "Your cart is empty. Reply with a number to add an item."
             return f"*Your cart:*\n{format_cart_lines(cart)}\n\n*Total:* N{cart_total(cart)}\n\nReply 'checkout' to place your order or add another item number."
-        if normalized in {"checkout", "done"}:
-            cart = load_cart(conversation.cart_json)
+        if normalized in CLEAR_CART_WORDS:
+            conversation.cart_json = "[]"
+            db.commit()
+            return "🗑️ Cart cleared. Reply with a number to add an item, or 'back' to see other categories."
+        if normalized in CHECKOUT_WORDS:
             if not cart:
                 return "Your cart is empty. Please add at least one item before checking out."
             conversation.stage = CONV_NAME
             db.commit()
             return "Great! What name should we put on this order?"
-        if normalized in {"back", "categories"}:
+        if normalized in BACK_WORDS:
             reply = build_greeting_reply(db, business, conversation)
             db.commit()
             return reply
-        items = active_items_for_category(db, business.id, conversation.category_id) if conversation.category_id else []
-        index = parse_choice(normalized)
+        index = resolve_choice(message, [item.name for item in items])
         if index is None or index < 1 or index > len(items):
             category = db.query(Category).filter(Category.id == conversation.category_id).one_or_none()
+            if not message.strip() and media_url:
+                return "I can only read text here 🙂 — please reply with a number.\n\n" + format_item_menu(items, category.name if category else "Menu")
             return "Sorry, I didn't understand that. " + format_item_menu(items, category.name if category else "Menu")
         item = items[index - 1]
-        cart = load_cart(conversation.cart_json)
         for entry in cart:
             if entry.get("item_id") == item.id:
                 entry["qty"] = int(entry.get("qty", 1)) + 1
@@ -995,18 +1213,47 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
 
     if conversation.stage == CONV_NAME:
         name = message.strip()
+        if normalized in BACK_WORDS:
+            items = active_items_for_category(db, business.id, conversation.category_id) if conversation.category_id else []
+            if items:
+                conversation.stage = CONV_ITEM
+                db.commit()
+                category = db.query(Category).filter(Category.id == conversation.category_id).one_or_none()
+                return format_item_menu(items, category.name if category else "Menu")
+            reply = build_greeting_reply(db, business, conversation)
+            db.commit()
+            return reply
+        if normalized in CART_WORDS:
+            return f"*Your cart:*\n{format_cart_lines(cart)}\n\n*Total:* N{cart_total(cart)}\n\nWhat name should we put on this order?"
+        if normalized in CHECKOUT_WORDS:
+            return "Almost there! What name should we put on this order?"
         if not name:
+            if media_url:
+                return "I can't read a name from an image 🙂 — please type it. What name should we put on this order?"
             return "Please share your name so the business knows who's ordering."
-        conversation.customer_name = name
+        if name.isdigit():
+            return "That looks like a number 🙂 — please reply with the name to put on this order."
+        conversation.customer_name = name[:255]
         conversation.stage = CONV_ADDRESS
         db.commit()
-        return f"Thanks, {name}! Please reply with your delivery address. 📍"
+        return f"Thanks, {conversation.customer_name}! Please reply with your delivery address. 📍"
 
     if conversation.stage == CONV_ADDRESS:
         address = message.strip()
+        if normalized in BACK_WORDS:
+            conversation.stage = CONV_NAME
+            db.commit()
+            return "Sure — what name should we put on this order?"
+        if normalized in CART_WORDS:
+            return f"*Your cart:*\n{format_cart_lines(cart)}\n\n*Total:* N{cart_total(cart)}\n\nPlease reply with your delivery address. 📍"
+        if normalized in CHECKOUT_WORDS:
+            return "Almost done! Please reply with your delivery address. 📍"
         if not address:
+            if media_url:
+                return "I can't read an address from an image 🙂 — please type it. Where should we deliver to?"
             return "Please share a delivery address so we can complete your order."
-        cart = load_cart(conversation.cart_json)
+        if len(address) < 5 or not any(ch.isalpha() for ch in address):
+            return "That doesn't look like a full address 🙂 — please include your street and area so the rider can find you. 📍"
         subtotal = cart_total(cart)
         order = Order(
             business_id=business.id,
@@ -1032,26 +1279,21 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
         )
 
     if conversation.stage == CONV_AWAITING_PAYMENT:
-        order = (
-            db.query(Order)
-            .filter(Order.customer_phone == conversation.phone_number, Order.business_id == business.id)
-            .order_by(Order.id.desc())
-            .first()
-        )
-        if not order:
+        order = latest_order
+        if not order or order.status == "cancelled":
             reply = build_greeting_reply(db, business, conversation)
             db.commit()
             return reply
         if order.status == "awaiting_delivery_fee":
-            if normalized == "cancel":
+            if normalized in CANCEL_WORDS:
                 order.status = "cancelled"
                 conversation.stage = CONV_NEW
                 conversation.address = None
                 db.commit()
                 return "Your order has been cancelled. Reply 'hi' anytime to start a new order."
-            return "We're still confirming your delivery fee — hang tight, we'll send your total and payment details shortly."
+            return "We're still confirming your delivery fee — hang tight, we'll send your total and payment details shortly. Reply 'status' anytime, or 'cancel' to cancel this order."
         if order.status == "awaiting_payment":
-            if normalized == "cancel":
+            if normalized in CANCEL_WORDS:
                 order.status = "cancelled"
                 conversation.stage = CONV_NEW
                 conversation.address = None
@@ -1059,27 +1301,21 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
                 return "Your order has been cancelled. Reply 'hi' anytime to start a new order."
             if not media_url and not message.strip():
                 return "Please reply with confirmation that you've made the transfer — a text message or a photo of your receipt works."
-            if media_url:
-                receipt_filename = save_payment_receipt(order.id, media_url)
-                if receipt_filename:
-                    order.payment_receipt_path = receipt_filename
-            if message.strip():
-                order.payment_proof_text = message.strip()
-            order.status = "payment_claimed"
-            conversation.stage = CONV_NEW
-            conversation.address = None
-            db.commit()
-            if business.owner_notify_number:
-                send_whatsapp_message(
-                    business.owner_notify_number,
-                    f"💰 New payment claim for order *#{order.id}*: N{order.total} from {order.customer_phone}. Check your bank alert and mark it paid on the dashboard.",
-                    from_number=business.whatsapp_number,
-                )
-            return f"Thanks! We've let *{business.name}* know — they'll confirm your payment shortly. ✅"
-        return "We've already received your payment info for this order. The business will confirm shortly."
+            # Questions ("how much?", "which account?") re-send the payment details
+            # instead of being swallowed as payment proof.
+            is_claim = bool(media_url) or any(token in normalized for token in PAYMENT_CLAIM_TOKENS)
+            if not is_claim and (normalized.endswith("?") or any(token in normalized for token in PAYMENT_INFO_TOKENS)):
+                return format_payment_request(order, business)
+            return record_payment_claim(db, business, conversation, order, message, media_url)
+        return "We've already received your payment info for this order. The business will confirm shortly. Reply 'status' anytime for updates."
 
     reply = build_greeting_reply(db, business, conversation)
     db.commit()
+    if active_order:
+        reply = (
+            f"ℹ️ Your order *#{active_order.id}* is still in progress — reply 'status' anytime to check on it.\n\n"
+            + reply
+        )
     return reply
 
 
@@ -1930,22 +2166,21 @@ def set_order_delivery_fee(request: Request, order_id: int, delivery_fee: int = 
         order.delivery_fee = delivery_fee
         order.total = items_subtotal + delivery_fee
         order.status = "awaiting_payment"
+        # If the customer's chat drifted back to idle/menu (e.g. they said "hi"
+        # while waiting), snap it to the payment stage so their next reply —
+        # even a bare "ok" — is treated as payment confirmation, not menu input.
+        conversation = (
+            db.query(Conversation)
+            .filter(Conversation.phone_number == order.customer_phone, Conversation.business_id == order.business_id)
+            .one_or_none()
+        )
+        if conversation and conversation.stage in (CONV_NEW, CONV_CATEGORY):
+            conversation.stage = CONV_AWAITING_PAYMENT
         db.commit()
-
-        bank_lines = []
-        if business and business.bank_name:
-            bank_lines.append(f"Bank: {business.bank_name}")
-        if business and business.bank_account_number:
-            bank_lines.append(f"Account number: {business.bank_account_number}")
-        if business and business.bank_account_name:
-            bank_lines.append(f"Account name: {business.bank_account_name}")
-        bank_info = "\n".join(bank_lines) if bank_lines else "Please contact us for payment details."
 
         send_whatsapp_message(
             order.customer_phone,
-            f"Your order *#{order.id}* total is *N{order.total}* (including N{delivery_fee} delivery).\n\n"
-            f"*Please pay to:*\n{bank_info}\n\n"
-            f"Once you've paid, reply here with confirmation or a photo of your receipt.{COLLXCT_FOOTER}",
+            format_payment_request(order, business) + COLLXCT_FOOTER,
             from_number=business.whatsapp_number if business else None,
         )
         business_id = order.business_id
@@ -2220,6 +2455,7 @@ CONV_STAGE_LABELS = {
     CONV_NEW: "New / idle",
     CONV_CATEGORY: "Choosing category",
     CONV_ITEM: "Browsing items",
+    CONV_NAME: "Entering name",
     CONV_ADDRESS: "Entering address",
     CONV_AWAITING_PAYMENT: "Awaiting payment",
 }
