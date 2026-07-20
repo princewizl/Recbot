@@ -9,3 +9,7 @@ receipts/
 .env
 .env.*
 !.env.example
+
+# Word temp/lock files
+~$*
+*-UPDATED.docx

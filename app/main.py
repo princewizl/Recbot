@@ -2344,6 +2344,23 @@ def homepage(request: Request, sent: Optional[str] = None) -> HTMLResponse:
           .req .tick {{ color:var(--green-strong); font-weight:800; }}
           .req div b {{ font-size:.92rem; display:block; }}
           .req div span {{ color:var(--muted); font-size:.82rem; }}
+          .doc-grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(320px,1fr)); gap:18px; }}
+          .doc-card {{ background:var(--surface); border:1px solid var(--border); border-radius:18px; padding:26px 28px; }}
+          .doc-card h3 {{ font-size:1.15rem; margin-bottom:8px; }}
+          .doc-lead {{ color:#a9b8b0; font-size:.92rem; margin-bottom:16px; }}
+          .doc-card b {{ display:block; font-size:.86rem; margin:14px 0 8px; }}
+          .doc-card b.have {{ color:var(--green-strong); }}
+          .doc-card b.need {{ color:var(--gold); }}
+          .doc-card ul {{ list-style:none; padding:0; margin:0; }}
+          .doc-card li {{ position:relative; padding:5px 0 5px 22px; color:var(--muted); font-size:.86rem; }}
+          .doc-card li::before {{ content:"•"; position:absolute; left:4px; color:var(--muted); }}
+          .doc-note {{ margin-top:16px; padding:12px 14px; border-radius:12px; background:rgba(52,211,153,.07); border:1px solid rgba(52,211,153,.22); color:#bcd8cc; font-size:.85rem; }}
+          .timeline-banner {{ display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-top:20px; }}
+          .timeline-banner > div {{ background:var(--surface); border:1px solid var(--border); border-left:3px solid var(--green-strong); border-radius:12px; padding:16px 18px; }}
+          .timeline-banner > div:last-child {{ border-left-color:var(--gold); }}
+          .timeline-banner b {{ display:block; font-size:.92rem; margin-bottom:4px; }}
+          .timeline-banner span {{ color:var(--muted); font-size:.85rem; }}
+          @media (max-width:720px) {{ .timeline-banner {{ grid-template-columns:1fr; }} }}
           .contact-grid {{ display:grid; grid-template-columns:1fr 1.1fr; gap:34px; align-items:start; }}
           .contact-info h2 {{ font-size:1.7rem; letter-spacing:-.02em; margin-bottom:12px; }}
           .contact-info p {{ color:var(--muted); margin-bottom:16px; }}
@@ -2376,6 +2393,7 @@ def homepage(request: Request, sent: Optional[str] = None) -> HTMLResponse:
             <a class="hide-sm" href="#features">Features</a>
             <a class="hide-sm" href="#how">How it works</a>
             <a class="hide-sm" href="#pricing">Pricing</a>
+            <a class="hide-sm" href="#golive">What you'll need</a>
             <a class="hide-sm" href="#contact">Contact</a>
             <a class="lp-btn" href="/login">Log in</a>
             <a class="lp-btn lp-btn-primary" href="#contact">Get started</a>
@@ -2393,7 +2411,7 @@ def homepage(request: Request, sent: Optional[str] = None) -> HTMLResponse:
                 <a class="lp-btn" href="#how">See how it works</a>
               </div>
               <div class="hero-facts">
-                <div><strong>24–48h</strong><span>to go live</span></div>
+                <div><strong>24–48h</strong><span>to build &amp; test your bot</span></div>
                 <div><strong>24/7</strong><span>orders taken for you</span></div>
                 <div><strong>0 missed</strong><span>orders — loud alerts</span></div>
               </div>
@@ -2437,13 +2455,13 @@ def homepage(request: Request, sent: Optional[str] = None) -> HTMLResponse:
           <div class="wrap">
             <div class="sec-head">
               <h2>Live in four simple steps</h2>
-              <p>No paperwork needed to start — we can launch on a trial while you finish your payment setup.</p>
+              <p>We build and test your bot in 24–48 hours. You can run on a trial while your own WhatsApp number and payments finish approval — exactly what that needs is below.</p>
             </div>
             <div class="steps">
               <div class="step"><h3>Tell us about your business</h3><p>Your WhatsApp number, menu with prices, opening hours, and how you want to get paid.</p></div>
               <div class="step"><h3>We build your bot</h3><p>Menu, categories, branches, delivery pricing, and payment details — all configured for you.</p></div>
               <div class="step"><h3>Test it together</h3><p>You place a real order end-to-end and watch it land on your dashboard with the alert chime.</p></div>
-              <div class="step"><h3>Go live in 24–48 hours</h3><p>Share your WhatsApp number everywhere. Orders start flowing; you stay in control.</p></div>
+              <div class="step"><h3>Go live &amp; grow</h3><p>Once Meta approves your number (usually a few days), share it everywhere. Orders start flowing; you stay in control.</p></div>
             </div>
           </div>
         </section>
@@ -2465,13 +2483,60 @@ def homepage(request: Request, sent: Optional[str] = None) -> HTMLResponse:
           <div class="wrap">
             <div class="sec-head">
               <h2>What we need to onboard you</h2>
-              <p>Have these ready and setup takes a single afternoon.</p>
+              <p>Have these ready and the build takes a single afternoon.</p>
             </div>
             <div class="req-grid">
-              <div class="req"><span class="tick">✓</span><div><b>A WhatsApp number</b><span>The number customers will order from (we can help you set up a business number).</span></div></div>
+              <div class="req"><span class="tick">✓</span><div><b>A WhatsApp number</b><span>Your own dedicated number for the bot (each business gets its own — we help you set one up).</span></div></div>
               <div class="req"><span class="tick">✓</span><div><b>Your menu &amp; prices</b><span>A simple list or photo is fine — we'll structure it into categories for the bot.</span></div></div>
-              <div class="req"><span class="tick">✓</span><div><b>How you get paid</b><span>Bank account details, or a free Paystack account for instant payment links.</span></div></div>
+              <div class="req"><span class="tick">✓</span><div><b>How you get paid</b><span>Your bank account details, or your own Paystack account for instant payment links.</span></div></div>
               <div class="req"><span class="tick">✓</span><div><b>Opening hours &amp; delivery</b><span>When you sell, where you deliver from, and your delivery pricing (or let us auto-calculate it).</span></div></div>
+            </div>
+          </div>
+        </section>
+
+        <section id="golive" style="padding-top:0;">
+          <div class="wrap">
+            <div class="sec-head">
+              <h2>Going fully live: what you'll need</h2>
+              <p>Your bot is built and tested in 24–48 hours. Two things carry their own approval timelines — here's exactly what they need, and what to do if you don't have them yet.</p>
+            </div>
+            <div class="doc-grid">
+              <div class="doc-card">
+                <h3>📱 Your WhatsApp business number</h3>
+                <p class="doc-lead">Each business runs on its own branded number. Meta (WhatsApp's owner) reviews and approves it before it can send messages — usually <b style="display:inline;color:var(--text);">1–5 business days</b>. We handle the technical registration under our own Meta &amp; Twilio setup; you just provide the number and details.</p>
+                <b class="have">Already have these? Fastest path:</b>
+                <ul>
+                  <li>A phone number not tied to a personal WhatsApp (or one you can move over)</li>
+                  <li>Your business name &amp; logo for the WhatsApp display profile</li>
+                </ul>
+                <b class="need">Don't have them yet? You may need:</b>
+                <ul>
+                  <li>A dedicated line for the business — a cheap new SIM works fine</li>
+                  <li>Business details for Meta's review: name, address, category</li>
+                  <li>For higher daily message limits: business verification — CAC certificate, or a utility bill / bank statement in the business name</li>
+                </ul>
+                <div class="doc-note">No business number yet? We help you pick and register one. You can still demo the bot immediately on a test line while approval is in progress.</div>
+              </div>
+              <div class="doc-card">
+                <h3>💳 Getting paid</h3>
+                <p class="doc-lead">Bank transfer works from day one with no account to set up. Paystack adds instant, auto-confirmed payment links (card, transfer, USSD) — a live Paystack account is typically approved in <b style="display:inline;color:var(--text);">1–3 days</b> and settles straight to your bank. We never hold your money.</p>
+                <b class="have">Paystack Starter (unregistered business) needs:</b>
+                <ul>
+                  <li>Your BVN</li>
+                  <li>A valid ID — NIN, driver's licence, voter's card or passport</li>
+                  <li>The bank account you want to be paid into</li>
+                </ul>
+                <b class="need">Registered-business Paystack (higher limits) needs:</b>
+                <ul>
+                  <li>CAC certificate &amp; business details (TIN if you have one)</li>
+                  <li>Directors' IDs / BVNs</li>
+                </ul>
+                <div class="doc-note">No Paystack yet? Start taking orders on bank transfer today and switch to payment links later — zero downtime.</div>
+              </div>
+            </div>
+            <div class="timeline-banner">
+              <div><b>Number + Paystack/CAC ready</b><span>Live in a few days — the time for our build plus Meta's number approval.</span></div>
+              <div><b>Starting from scratch</b><span>We launch you on bank transfer right away and go live on your own number as Meta &amp; Paystack approvals come through.</span></div>
             </div>
           </div>
         </section>
