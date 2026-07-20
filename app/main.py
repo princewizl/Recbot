@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -16,7 +17,7 @@ import httpx
 from fastapi import FastAPI, Form, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import Column, DateTime, Integer, String, Text, UniqueConstraint, create_engine, text
+from sqlalchemy import Column, DateTime, Float, Integer, String, Text, UniqueConstraint, create_engine, text
 from sqlalchemy.orm import declarative_base, sessionmaker
 from twilio.request_validator import RequestValidator
 from twilio.rest import Client as TwilioClient
@@ -56,6 +57,14 @@ class Business(Base):
     close_time = Column(String(5), nullable=True)
     utc_offset_minutes = Column(Integer, nullable=True)
     plan_reminder_sent_at = Column(DateTime, nullable=True)
+    payment_method = Column(String(20), nullable=False, default="bank_transfer")
+    paystack_secret_key = Column(String(255), nullable=True)
+    location_address = Column(Text, nullable=True)
+    geo_lat = Column(Float, nullable=True)
+    geo_lng = Column(Float, nullable=True)
+    delivery_autocalc = Column(Integer, nullable=False, default=0)
+    delivery_base_fee = Column(Integer, nullable=False, default=0)
+    delivery_per_km = Column(Integer, nullable=False, default=0)
 
 
 class Category(Base):
@@ -119,6 +128,9 @@ class Order(Base):
     action_reminded_at = Column(DateTime, nullable=True)
     payment_proof_text = Column(Text, nullable=True)
     payment_receipt_path = Column(String(255), nullable=True)
+    payment_reference = Column(String(100), nullable=True)
+    payment_link = Column(Text, nullable=True)
+    address_unverified = Column(Integer, nullable=False, default=0)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
@@ -129,6 +141,8 @@ class User(Base):
     password_hash = Column(String(255), nullable=False)
     role = Column(String(50), nullable=False, default="customer")
     business_id = Column(Integer, nullable=True)
+    totp_secret = Column(String(64), nullable=True)
+    totp_enabled = Column(Integer, nullable=False, default=0)
 
 
 class Plan(Base):
@@ -137,6 +151,7 @@ class Plan(Base):
     name = Column(String(100), nullable=False)
     price_ngn = Column(Integer, nullable=False)
     branch_access = Column(Integer, nullable=False, default=0)
+    monthly_order_cap = Column(Integer, nullable=False, default=0)
     description = Column(Text, nullable=True)
 
 
@@ -150,6 +165,7 @@ class Payment(Base):
     reference = Column(String(255), nullable=False, unique=True)
     status = Column(String(50), nullable=False, default="initialized")
     auto_renew = Column(Integer, nullable=False, default=0)
+    billing_cycle = Column(String(10), nullable=False, default="monthly")
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow)
 
@@ -214,6 +230,38 @@ def ensure_schema() -> None:
             conn.execute(text("ALTER TABLE businesses ADD COLUMN utc_offset_minutes INTEGER"))
         if not has_column("businesses", "plan_reminder_sent_at"):
             conn.execute(text("ALTER TABLE businesses ADD COLUMN plan_reminder_sent_at DATETIME"))
+        if not has_column("businesses", "payment_method"):
+            conn.execute(text("ALTER TABLE businesses ADD COLUMN payment_method VARCHAR(20) NOT NULL DEFAULT 'bank_transfer'"))
+        if not has_column("businesses", "paystack_secret_key"):
+            conn.execute(text("ALTER TABLE businesses ADD COLUMN paystack_secret_key VARCHAR(255)"))
+        if not has_column("businesses", "location_address"):
+            conn.execute(text("ALTER TABLE businesses ADD COLUMN location_address TEXT"))
+        if not has_column("businesses", "geo_lat"):
+            conn.execute(text("ALTER TABLE businesses ADD COLUMN geo_lat FLOAT"))
+        if not has_column("businesses", "geo_lng"):
+            conn.execute(text("ALTER TABLE businesses ADD COLUMN geo_lng FLOAT"))
+        if not has_column("businesses", "delivery_autocalc"):
+            conn.execute(text("ALTER TABLE businesses ADD COLUMN delivery_autocalc INTEGER NOT NULL DEFAULT 0"))
+        if not has_column("businesses", "delivery_base_fee"):
+            conn.execute(text("ALTER TABLE businesses ADD COLUMN delivery_base_fee INTEGER NOT NULL DEFAULT 0"))
+        if not has_column("businesses", "delivery_per_km"):
+            conn.execute(text("ALTER TABLE businesses ADD COLUMN delivery_per_km INTEGER NOT NULL DEFAULT 0"))
+        if not has_column("users", "totp_secret"):
+            conn.execute(text("ALTER TABLE users ADD COLUMN totp_secret VARCHAR(64)"))
+        if not has_column("users", "totp_enabled"):
+            conn.execute(text("ALTER TABLE users ADD COLUMN totp_enabled INTEGER NOT NULL DEFAULT 0"))
+        if not has_column("orders", "payment_reference"):
+            conn.execute(text("ALTER TABLE orders ADD COLUMN payment_reference VARCHAR(100)"))
+        if not has_column("orders", "payment_link"):
+            conn.execute(text("ALTER TABLE orders ADD COLUMN payment_link TEXT"))
+        if not has_column("orders", "address_unverified"):
+            conn.execute(text("ALTER TABLE orders ADD COLUMN address_unverified INTEGER NOT NULL DEFAULT 0"))
+        if not has_column("payments", "billing_cycle"):
+            conn.execute(text("ALTER TABLE payments ADD COLUMN billing_cycle VARCHAR(10) NOT NULL DEFAULT 'monthly'"))
+        if not has_column("plans", "monthly_order_cap"):
+            conn.execute(text("ALTER TABLE plans ADD COLUMN monthly_order_cap INTEGER NOT NULL DEFAULT 0"))
+            conn.execute(text("UPDATE plans SET monthly_order_cap = 300 WHERE name = 'Starter' AND monthly_order_cap = 0"))
+            conn.execute(text("UPDATE plans SET monthly_order_cap = 1000 WHERE name = 'Growth' AND monthly_order_cap = 0"))
         if not has_column("orders", "status_changed_at"):
             conn.execute(text("ALTER TABLE orders ADD COLUMN status_changed_at DATETIME"))
         if not has_column("orders", "action_reminder_count"):
@@ -292,6 +340,59 @@ def verify_auth_token(token: str) -> Optional[str]:
             return None
         email, expires = payload.rsplit("|", 1)
         if int(expires) < time.time():
+            return None
+        return email
+    except Exception:
+        return None
+
+
+# --- TOTP two-factor auth (RFC 6238, stdlib only) ---
+
+PENDING_2FA_TTL_SECONDS = 300
+
+
+def generate_totp_secret() -> str:
+    return base64.b32encode(secrets.token_bytes(20)).decode().rstrip("=")
+
+
+def _totp_code(secret: str, counter: int) -> str:
+    key = base64.b32decode(secret + "=" * (-len(secret) % 8), casefold=True)
+    digest = hmac.new(key, counter.to_bytes(8, "big"), hashlib.sha1).digest()
+    offset = digest[-1] & 0x0F
+    code = (int.from_bytes(digest[offset:offset + 4], "big") & 0x7FFFFFFF) % 1_000_000
+    return f"{code:06d}"
+
+
+def verify_totp(secret: str, code: str, window: int = 1) -> bool:
+    if not secret or not code:
+        return False
+    code = code.strip().replace(" ", "")
+    if not code.isdigit():
+        return False
+    counter = int(time.time()) // 30
+    return any(hmac.compare_digest(_totp_code(secret, counter + i), code) for i in range(-window, window + 1))
+
+
+def totp_provisioning_uri(email: str, secret: str) -> str:
+    return f"otpauth://totp/Recbot%20CRM:{email}?secret={secret}&issuer=Recbot%20CRM"
+
+
+def create_pending_2fa_token(email: str) -> str:
+    expires = int(time.time()) + PENDING_2FA_TTL_SECONDS
+    payload = f"2fa|{email}|{expires}"
+    signature = hmac.new(SECRET_KEY.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    return base64.urlsafe_b64encode(f"{payload}|{signature}".encode()).decode()
+
+
+def verify_pending_2fa_token(token: str) -> Optional[str]:
+    try:
+        decoded = base64.urlsafe_b64decode(token.encode()).decode()
+        payload, signature = decoded.rsplit("|", 1)
+        expected = hmac.new(SECRET_KEY.encode(), payload.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(signature, expected):
+            return None
+        prefix, email, expires = payload.split("|")
+        if prefix != "2fa" or int(expires) < time.time():
             return None
         return email
     except Exception:
@@ -377,6 +478,8 @@ def make_nav(current_user: Optional[User] = None) -> str:
                 links.append(f"<a class='nav-link' href='/business/{current_user.business_id}/dashboard'>Operations</a>")
                 links.append(f"<a class='nav-link' href='/business/{current_user.business_id}/config'>Config</a>")
                 links.append(f"<a class='nav-link' href='/business/{current_user.business_id}/plans'>Plans</a>")
+        if current_user.role == "admin" or is_business_owner:
+            links.append("<a class='nav-link' href='/account/security'>Security</a>")
     else:
         links.append("<a class='nav-link' href='/login'>Login</a>")
     nav_links_html = f"<div class='nav-links'>{''.join(links)}</div>"
@@ -834,6 +937,8 @@ def plan_due_label(business: Business) -> str:
 
 DEFAULT_UTC_OFFSET_MINUTES = int(os.getenv("DEFAULT_UTC_OFFSET_MINUTES", "60"))  # WAT (Lagos)
 PLAN_GRACE_DAYS = int(os.getenv("PLAN_GRACE_DAYS", "3"))
+# Annual prepay: pay this many months up front, get 12 (default = 2 months free).
+ANNUAL_MONTHS_CHARGED = int(os.getenv("ANNUAL_MONTHS_CHARGED", "10"))
 
 
 def business_local_now(business: Business) -> datetime:
@@ -907,6 +1012,139 @@ def initialize_paystack_transaction(email: str, amount_ngn: int, callback_url: s
     return None
 
 
+PAYMENT_METHOD_LABELS = {"bank_transfer": "Bank transfer", "paystack": "Paystack payment link"}
+
+
+def paystack_key_mode(key: Optional[str]) -> str:
+    key = (key or "").strip()
+    if key.startswith("sk_live_"):
+        return "live"
+    if key.startswith("sk_test_"):
+        return "test"
+    return "unknown" if key else "missing"
+
+
+def create_paystack_order_link(business: Business, order: Order) -> Optional[str]:
+    """Create a hosted Paystack checkout link for an order, using the business's
+    own secret key — the same key later verifies it, so test keys stay test and
+    live keys stay live end to end."""
+    key = (business.paystack_secret_key or "").strip()
+    if not key:
+        return None
+    reference = f"RBORD-{order.id}-{int(datetime.utcnow().timestamp())}"
+    digits = re.sub(r"[^0-9]", "", order.customer_phone) or "customer"
+    payload = {
+        "email": f"{digits}@collxct.com.ng",
+        "amount": order.total * 100,  # kobo
+        "reference": reference,
+        "currency": "NGN",
+        "metadata": {"order_id": order.id, "business_id": business.id, "customer_phone": order.customer_phone},
+    }
+    base = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+    if base:
+        payload["callback_url"] = f"{base}/pay/thanks"
+    try:
+        response = httpx.post(
+            "https://api.paystack.co/transaction/initialize",
+            json=payload, headers={"Authorization": f"Bearer {key}"}, timeout=15.0,
+        )
+        data = response.json()
+        if data.get("status"):
+            order.payment_reference = reference
+            order.payment_link = data["data"]["authorization_url"]
+            return order.payment_link
+        logger.error("paystack init rejected (order=%s, mode=%s): %s", order.id, paystack_key_mode(key), data.get("message"))
+    except Exception as exc:
+        logger.error("paystack init failed (order=%s): %s", order.id, exc)
+    return None
+
+
+def verify_paystack_order_payment(business: Business, order: Order) -> Optional[bool]:
+    """True = confirmed paid, False = definitely not paid yet, None = couldn't check."""
+    key = (business.paystack_secret_key or "").strip()
+    if not key or not order.payment_reference:
+        return None
+    try:
+        response = httpx.get(
+            f"https://api.paystack.co/transaction/verify/{order.payment_reference}",
+            headers={"Authorization": f"Bearer {key}"}, timeout=15.0,
+        )
+        data = response.json()
+        if not data.get("status"):
+            return None
+        tx = data.get("data") or {}
+        if tx.get("status") != "success":
+            return False
+        # Guard against a lesser amount slipping through.
+        return int(tx.get("amount") or 0) >= order.total * 100
+    except Exception as exc:
+        logger.error("paystack verify failed (order=%s): %s", order.id, exc)
+        return None
+
+
+@app.get("/pay/thanks", response_class=HTMLResponse)
+def payment_thanks() -> HTMLResponse:
+    body = """
+    <div class="card" style="text-align:center;">
+      <h2>🎉 Thanks — payment received!</h2>
+      <p>You can close this page and head back to WhatsApp. Reply <strong>paid</strong> there and we'll confirm your order instantly.</p>
+    </div>
+    """
+    return render_page("Payment Complete", body, nav_html=make_nav(None))
+
+
+# --- Delivery fee auto-calculation (OpenStreetMap geocoding + haversine) ---
+
+MAX_AUTO_DELIVERY_KM = float(os.getenv("MAX_AUTO_DELIVERY_KM", "30"))
+GEOCODER_USER_AGENT = os.getenv("GEOCODER_USER_AGENT", "RecbotCRM/1.0 (recbot@collxct.com.ng)")
+
+
+def geocode_address(address: str):
+    """Best-effort geocode via Nominatim (free, no key). Returns (lat, lng) or None."""
+    if not address or not address.strip():
+        return None
+    try:
+        response = httpx.get(
+            "https://nominatim.openstreetmap.org/search",
+            params={"q": address.strip(), "format": "json", "limit": 1, "countrycodes": "ng"},
+            headers={"User-Agent": GEOCODER_USER_AGENT}, timeout=6.0,
+        )
+        results = response.json()
+        if isinstance(results, list) and results:
+            return float(results[0]["lat"]), float(results[0]["lon"])
+    except Exception as exc:
+        logger.warning("geocode failed for %r: %s", address, exc)
+    return None
+
+
+def haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlmb = math.radians(lng2 - lng1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlmb / 2) ** 2
+    return 2 * 6371.0 * math.asin(math.sqrt(a))
+
+
+def compute_auto_delivery_fee(business: Business, address: str) -> Optional[Dict[str, object]]:
+    """Base fee + per-km rate, like Nigerian dispatch pricing. Returns
+    {'fee': int, 'km': float} or None when auto-pricing isn't possible —
+    callers fall back to the manual owner-sets-fee flow."""
+    if not business.delivery_autocalc or business.geo_lat is None or business.geo_lng is None:
+        return None
+    if not (business.delivery_base_fee or business.delivery_per_km):
+        return None
+    coords = geocode_address(address)
+    if not coords:
+        return None
+    km = haversine_km(business.geo_lat, business.geo_lng, coords[0], coords[1])
+    if km > MAX_AUTO_DELIVERY_KM:
+        # Probably a bad geocoder match (or genuinely out of range) — let a human price it.
+        return None
+    fee = (business.delivery_base_fee or 0) + int(math.ceil(km)) * (business.delivery_per_km or 0)
+    fee = int(round(fee / 50.0) * 50)  # round to the nearest N50 like ride apps
+    return {"fee": fee, "km": round(km, 1)}
+
+
 def verify_paystack_signature(request: Request, payload: bytes) -> bool:
     secret_key = os.getenv("PAYSTACK_SECRET_KEY")
     if not secret_key:
@@ -919,8 +1157,8 @@ def verify_paystack_signature(request: Request, payload: bytes) -> bool:
 def create_plan_seed_data(db) -> None:
     if db.query(Plan).count() == 0:
         plans = [
-            Plan(name="Starter", price_ngn=7500, branch_access=0, description="Single-location plan with menu and order management. WhatsApp messaging costs included."),
-            Plan(name="Growth", price_ngn=20000, branch_access=1, description="Full branch access, advanced menus, and premium workflows. WhatsApp messaging costs included."),
+            Plan(name="Starter", price_ngn=7500, branch_access=0, monthly_order_cap=300, description="Single-location plan with menu and order management. Includes 300 orders/month."),
+            Plan(name="Growth", price_ngn=20000, branch_access=1, monthly_order_cap=1000, description="Full branch access, advanced menus, and premium workflows. Includes 1,000 orders/month."),
         ]
         db.add_all(plans)
         db.commit()
@@ -940,8 +1178,8 @@ def get_paystack_redirect(business_id: int, plan_id: int, amount: int, auto_rene
     return f"/paystack/simulate?business_id={business_id}&plan_id={plan_id}&amount={amount}&auto_renew={int(auto_renew)}&reference={reference}"
 
 
-def upsert_payment(db, business_id: int, user_email: str, plan_id: int, amount: int, reference: str, auto_renew: bool) -> Payment:
-    payment = Payment(business_id=business_id, user_email=user_email, plan_id=plan_id, amount=amount, reference=reference, status="initialized", auto_renew=1 if auto_renew else 0)
+def upsert_payment(db, business_id: int, user_email: str, plan_id: int, amount: int, reference: str, auto_renew: bool, billing_cycle: str = "monthly") -> Payment:
+    payment = Payment(business_id=business_id, user_email=user_email, plan_id=plan_id, amount=amount, reference=reference, status="initialized", auto_renew=1 if auto_renew else 0, billing_cycle=billing_cycle)
     db.add(payment)
     db.commit()
     db.refresh(payment)
@@ -959,8 +1197,10 @@ def apply_payment_success(db, reference: str, status: str = "success") -> Option
     if business and plan:
         business.plan_id = plan.id
         business.plan_status = "active"
-        business.plan_expiry = datetime.utcnow() + timedelta(days=30)
+        duration_days = 365 if payment.billing_cycle == "annual" else 30
+        business.plan_expiry = datetime.utcnow() + timedelta(days=duration_days)
         business.auto_renew = payment.auto_renew
+        business.plan_reminder_sent_at = None
     db.commit()
     return payment
 
@@ -1116,6 +1356,45 @@ def notify_owner_action(business: Business, order_id: int, headline: str) -> Non
     link = order_link(order_id)
     link_line = f"\n\nOpen: {link}" if link else "\n\nOpen your Recbot dashboard to respond."
     send_whatsapp_message(business.owner_notify_number, headline + link_line, from_number=business.whatsapp_number)
+
+
+def month_start_utc() -> datetime:
+    return datetime.utcnow().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
+
+def monthly_order_usage(db, business: Business):
+    """Returns (used, cap, plan) for the current calendar month; cap 0 = uncapped."""
+    plan = get_plan(db, business.plan_id) if business.plan_id else None
+    cap = plan.monthly_order_cap if plan else 0
+    if not cap:
+        return 0, 0, plan
+    used = db.query(Order).filter(Order.business_id == business.id, Order.created_at >= month_start_utc()).count()
+    return used, cap, plan
+
+
+def notify_order_cap_usage(db, business: Business) -> None:
+    """Soft cap: never blocks orders, just nudges the owner exactly once at 80%
+    and once when crossing the cap."""
+    if not business.owner_notify_number:
+        return
+    used, cap, plan = monthly_order_usage(db, business)
+    if not cap:
+        return
+    threshold_80 = max(1, int(cap * 0.8))
+    if used == threshold_80 and used < cap:
+        send_whatsapp_message(
+            business.owner_notify_number,
+            f"📈 Heads up: you've used *{used}* of the *{cap}* orders included in your {plan.name} plan this month. "
+            f"Orders won't be blocked — but consider upgrading if you're trending past it.",
+            from_number=business.whatsapp_number,
+        )
+    elif used == cap + 1:
+        send_whatsapp_message(
+            business.owner_notify_number,
+            f"🔔 You've passed the *{cap}* orders/month included in your {plan.name} plan. Orders keep flowing as normal — "
+            f"please upgrade your plan to match your volume.",
+            from_number=business.whatsapp_number,
+        )
 
 
 def action_needed_orders(db, business_id: Optional[int] = None) -> List[Order]:
@@ -1412,6 +1691,12 @@ def format_bank_info(business: Optional[Business]) -> str:
 
 
 def format_payment_request(order: Order, business: Optional[Business]) -> str:
+    if business and business.payment_method == "paystack" and order.payment_link:
+        return (
+            f"Your order *#{order.id}* total is *N{order.total}* (including N{order.delivery_fee} delivery).\n\n"
+            f"*Pay securely here:* {order.payment_link}\n\n"
+            f"Cards, bank transfer, and USSD all work. Reply *paid* once you're done and we'll confirm instantly. ⚡"
+        )
     return (
         f"Your order *#{order.id}* total is *N{order.total}* (including N{order.delivery_fee} delivery).\n\n"
         f"*Please pay to:*\n{format_bank_info(business)}\n\n"
@@ -1461,6 +1746,33 @@ def build_help_reply(conversation: Conversation) -> str:
 
 
 def record_payment_claim(db, business: Business, conversation: Conversation, order: Order, message: str, media_url: str) -> str:
+    # Gateway orders: verify with Paystack right now — no owner action needed
+    # when the money has actually landed.
+    if business.payment_method == "paystack" and order.payment_reference:
+        verified = verify_paystack_order_payment(business, order)
+        if verified:
+            set_order_status(order, "paid")
+            conversation.stage = CONV_NEW
+            conversation.address = None
+            db.commit()
+            if business.owner_notify_number:
+                link = order_link(order.id)
+                link_line = f"\nOpen: {link}" if link else ""
+                send_whatsapp_message(
+                    business.owner_notify_number,
+                    f"✅ Paystack confirmed payment for order *#{order.id}* (N{order.total}, "
+                    f"{order.customer_name or order.customer_phone}) automatically — it's ready to prepare.{link_line}",
+                    from_number=business.whatsapp_number,
+                )
+            return f"🎉 Payment confirmed for order *#{order.id}*! *{business.name}* is preparing your order now."
+        if verified is False:
+            db.commit()
+            return (
+                f"Hmm — Paystack hasn't seen your payment for order *#{order.id}* yet. "
+                f"If you just paid, give it a minute and reply *paid* again.\n\n"
+                f"Pay here if you haven't: {order.payment_link or 'link unavailable — please contact us'}"
+            )
+        # verified is None: Paystack unreachable — fall through to the manual claim flow.
     if media_url:
         receipt_filename = save_payment_receipt(order.id, media_url)
         if receipt_filename:
@@ -1706,17 +2018,19 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
         if len(address) < 5 or not any(ch.isalpha() for ch in address):
             return "That doesn't look like a full address 🙂 — please include your street and area so the rider can find you. 📍"
         subtotal = cart_total(cart)
+        auto = compute_auto_delivery_fee(business, address)
         order = Order(
             business_id=business.id,
             branch_id=conversation.branch_id,
             customer_phone=conversation.phone_number,
             customer_name=conversation.customer_name,
             items_json=conversation.cart_json or "[]",
-            total=subtotal,
-            delivery_fee=0,
+            total=subtotal + (auto["fee"] if auto else 0),
+            delivery_fee=auto["fee"] if auto else 0,
             address=address,
-            status="awaiting_delivery_fee",
+            status="awaiting_payment" if auto else "awaiting_delivery_fee",
             status_changed_at=datetime.utcnow(),
+            address_unverified=1 if (business.delivery_autocalc and not auto) else 0,
         )
         db.add(order)
         conversation.cart_json = "[]"
@@ -1724,15 +2038,39 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
         conversation.category_id = None
         conversation.stage = CONV_AWAITING_PAYMENT
         db.commit()
+        name_prefix = f"Thanks, {conversation.customer_name}! " if conversation.customer_name else "Thanks! "
+        notify_order_cap_usage(db, business)
+        if auto:
+            if business.payment_method == "paystack":
+                create_paystack_order_link(business, order)
+                db.commit()
+            if business.owner_notify_number:
+                link = order_link(order.id)
+                link_line = f"\nOpen: {link}" if link else ""
+                send_whatsapp_message(
+                    business.owner_notify_number,
+                    f"🆕 New order *#{order.id}* from {conversation.customer_name or conversation.phone_number} — "
+                    f"delivery auto-priced at N{auto['fee']} ({auto['km']} km). Payment details sent to the customer; "
+                    f"nothing to do until payment lands.{link_line}",
+                    from_number=business.whatsapp_number,
+                )
+            return (
+                f"{name_prefix}Here's your order:\n{format_cart_lines(cart)}\n\n"
+                f"*Subtotal:* N{subtotal}\n*Delivery ({auto['km']} km):* N{auto['fee']}\n*Total:* N{order.total}\n"
+                f"*Deliver to:* {address}\n\n" + format_payment_request(order, business) + COLLXCT_FOOTER
+            )
+        unlocated_note = (
+            "\n\n⚠️ This address couldn't be located on the map, so the fee wasn't auto-calculated."
+            if business.delivery_autocalc else ""
+        )
         notify_owner_action(
             business,
             order.id,
             f"🚨 *ACTION NEEDED — new order #{order.id}*\n\n"
             f"From: {conversation.customer_name or conversation.phone_number} ({conversation.phone_number})\n"
             f"{format_cart_lines(cart)}\n*Subtotal:* N{subtotal}\n*Deliver to:* {address}\n\n"
-            f"Set the delivery fee now — the customer can't pay until you do.",
+            f"Set the delivery fee now — the customer can't pay until you do.{unlocated_note}",
         )
-        name_prefix = f"Thanks, {conversation.customer_name}! " if conversation.customer_name else "Thanks! "
         return (
             f"{name_prefix}Here's your order:\n{format_cart_lines(cart)}\n\n*Subtotal:* N{subtotal}\n*Delivery to:* {address}\n\n"
             f"We're confirming your delivery fee now and will send your full total and payment details shortly.{COLLXCT_FOOTER}"
@@ -1937,25 +2275,179 @@ def login_submit(request: Request, email: str = Form(...), password: str = Form(
             if not user.password_hash.startswith("pbkdf2:"):
                 user.password_hash = hash_password(password)
                 db.commit()
-            token = create_auth_token(email)
-            if user.role == "admin":
-                redirect_url = "/admin/"
-            elif user.role in {"business_owner", "business-owner", "owner"}:
-                redirect_url = f"/owner/portal" if not user.business_id else f"/business/{user.business_id}/dashboard"
-            else:
-                redirect_url = "/"
-            is_https = request.headers.get("x-forwarded-proto", request.url.scheme) == "https"
-            redirect = RedirectResponse(url=redirect_url, status_code=303)
-            redirect.set_cookie(
-                key="auth_token", value=token, httponly=True, samesite="lax",
-                secure=is_https, max_age=AUTH_TOKEN_TTL_SECONDS,
-            )
             _login_attempts.pop(throttle_key, None)
-            return redirect
+            if user.totp_enabled and user.totp_secret:
+                is_https = request.headers.get("x-forwarded-proto", request.url.scheme) == "https"
+                redirect = RedirectResponse(url="/login/verify", status_code=303)
+                redirect.set_cookie(
+                    key="pending_2fa", value=create_pending_2fa_token(user.email), httponly=True,
+                    samesite="lax", secure=is_https, max_age=PENDING_2FA_TTL_SECONDS,
+                )
+                return redirect
+            return issue_session_redirect(request, user)
     finally:
         db.close()
     record_login_failure(throttle_key)
     return RedirectResponse(url="/login", status_code=303)
+
+
+def landing_url_for(user: User) -> str:
+    if user.role == "admin":
+        return "/admin/"
+    if user.role in {"business_owner", "business-owner", "owner"}:
+        return "/owner/portal" if not user.business_id else f"/business/{user.business_id}/dashboard"
+    return "/"
+
+
+def issue_session_redirect(request: Request, user: User) -> RedirectResponse:
+    token = create_auth_token(user.email)
+    is_https = request.headers.get("x-forwarded-proto", request.url.scheme) == "https"
+    redirect = RedirectResponse(url=landing_url_for(user), status_code=303)
+    redirect.set_cookie(
+        key="auth_token", value=token, httponly=True, samesite="lax",
+        secure=is_https, max_age=AUTH_TOKEN_TTL_SECONDS,
+    )
+    redirect.delete_cookie("pending_2fa")
+    return redirect
+
+
+@app.get("/login/verify", response_class=HTMLResponse)
+def login_verify_page(request: Request) -> HTMLResponse:
+    if not verify_pending_2fa_token(request.cookies.get("pending_2fa", "")):
+        return RedirectResponse(url="/login", status_code=303)
+    body = """
+    <div class="auth-shell">
+      <div class="auth-hero">
+        <div class="eyebrow">Two-factor authentication</div>
+        <h2>One more step</h2>
+        <p>Enter the 6-digit code from your authenticator app to finish signing in.</p>
+      </div>
+      <div class="card auth-form">
+        <h2>Enter your code</h2>
+        <form method="post" action="/login/verify">
+          <div class="form-row">
+            <input name="code" inputmode="numeric" pattern="[0-9 ]*" placeholder="123 456" autocomplete="one-time-code" autofocus required />
+          </div>
+          <div class="form-actions">
+            <button type="submit">Verify</button>
+            <a class="btn" href="/login">Start over</a>
+          </div>
+        </form>
+      </div>
+    </div>
+    """
+    return render_page("Verify Sign-in", body, nav_html=make_nav(None))
+
+
+@app.post("/login/verify")
+def login_verify_submit(request: Request, code: str = Form(...)):
+    email = verify_pending_2fa_token(request.cookies.get("pending_2fa", ""))
+    if not email:
+        return RedirectResponse(url="/login", status_code=303)
+    throttle_key = f"2fa|{client_ip(request)}|{email.lower()}"
+    if login_rate_limited(throttle_key):
+        return RedirectResponse(url="/login", status_code=303)
+    db = SessionLocal()
+    try:
+        user = get_user_by_email(db, email)
+        if user and user.totp_enabled and verify_totp(user.totp_secret, code):
+            _login_attempts.pop(throttle_key, None)
+            return issue_session_redirect(request, user)
+    finally:
+        db.close()
+    record_login_failure(throttle_key)
+    return RedirectResponse(url="/login/verify", status_code=303)
+
+
+@app.get("/account/security", response_class=HTMLResponse)
+def account_security(request: Request) -> HTMLResponse:
+    current_user = get_current_user(request)
+    if not current_user or current_user.role not in STAFF_ROLES:
+        return RedirectResponse(url="/login", status_code=303)
+    if current_user.totp_enabled:
+        body = """
+        <div class="card">
+          <div class="section-head">
+            <h3>Two-factor authentication</h3>
+            <span class="status-pill">✅ Enabled</span>
+          </div>
+          <p>Every sign-in to this account requires a code from your authenticator app.</p>
+          <form method="post" action="/account/security/disable">
+            <label>Current code <input name="code" inputmode="numeric" placeholder="123456" required /></label>
+            <div class="form-actions">
+              <button type="submit" class="btn">Disable 2FA</button>
+            </div>
+          </form>
+        </div>
+        """
+        return render_page("Account Security", body, nav_html=make_nav(current_user))
+
+    # Not yet enabled: make sure a secret exists to enrol against.
+    db = SessionLocal()
+    try:
+        user = get_user_by_email(db, current_user.email)
+        if not user.totp_secret:
+            user.totp_secret = generate_totp_secret()
+            db.commit()
+        secret = user.totp_secret
+    finally:
+        db.close()
+    uri = totp_provisioning_uri(current_user.email, secret)
+    body = f"""
+    <div class="card">
+      <div class="section-head">
+        <h3>Enable two-factor authentication</h3>
+        <span class="status-pill" style="background:rgba(255,196,0,.12);border-color:rgba(255,196,0,.35);color:#ffd866;">Not enabled</span>
+      </div>
+      <p>Add a second lock on your account: after your password, sign-in will also require a 6-digit code from an authenticator app (Google Authenticator, Authy, 1Password…).</p>
+      <ol>
+        <li>Open your authenticator app and choose <strong>Add account → Enter setup key</strong>.</li>
+        <li>Account name: <code>{escape(current_user.email)}</code> — Key: <code>{escape(secret)}</code> (time-based).</li>
+        <li>On a phone you can also tap this link directly: <a href="{escape(uri)}">{escape(uri)}</a></li>
+        <li>Enter the code the app shows to confirm:</li>
+      </ol>
+      <form method="post" action="/account/security/enable">
+        <input name="code" inputmode="numeric" placeholder="123456" required />
+        <div class="form-actions">
+          <button type="submit">Turn on 2FA</button>
+        </div>
+      </form>
+    </div>
+    """
+    return render_page("Account Security", body, nav_html=make_nav(current_user))
+
+
+@app.post("/account/security/enable")
+def account_security_enable(request: Request, code: str = Form(...)) -> RedirectResponse:
+    current_user = get_current_user(request)
+    if not current_user or current_user.role not in STAFF_ROLES:
+        return RedirectResponse(url="/login", status_code=303)
+    db = SessionLocal()
+    try:
+        user = get_user_by_email(db, current_user.email)
+        if user and user.totp_secret and verify_totp(user.totp_secret, code):
+            user.totp_enabled = 1
+            db.commit()
+    finally:
+        db.close()
+    return RedirectResponse(url="/account/security", status_code=303)
+
+
+@app.post("/account/security/disable")
+def account_security_disable(request: Request, code: str = Form(...)) -> RedirectResponse:
+    current_user = get_current_user(request)
+    if not current_user or current_user.role not in STAFF_ROLES:
+        return RedirectResponse(url="/login", status_code=303)
+    db = SessionLocal()
+    try:
+        user = get_user_by_email(db, current_user.email)
+        if user and user.totp_enabled and verify_totp(user.totp_secret, code):
+            user.totp_enabled = 0
+            user.totp_secret = None
+            db.commit()
+    finally:
+        db.close()
+    return RedirectResponse(url="/account/security", status_code=303)
 
 
 @app.get("/register", response_class=HTMLResponse)
@@ -2200,6 +2692,10 @@ def edit_user_page(request: Request, user_id: int) -> HTMLResponse:
             f"<option value='{role}' {'selected' if user.role == role else ''}>{role.replace('_', ' ').title()}</option>"
             for role in ("admin", "business_owner", "customer")
         )
+        reset_2fa_html = (
+            "<label><input type='checkbox' name='reset_2fa' /> Reset two-factor authentication (user has 2FA enabled — use this if they lost their device)</label>"
+            if user.totp_enabled else "<p class='form-hint'>2FA: not enabled by this user.</p>"
+        )
         body = f"""
         <div class="card">
           <h3>Edit User</h3>
@@ -2210,6 +2706,7 @@ def edit_user_page(request: Request, user_id: int) -> HTMLResponse:
               <option value="">No business</option>
               {business_options_html(businesses, user.business_id)}
             </select>
+            {reset_2fa_html}
             <div class="form-actions">
               <button type="submit">Save User</button>
             </div>
@@ -2222,7 +2719,13 @@ def edit_user_page(request: Request, user_id: int) -> HTMLResponse:
 
 
 @app.post("/admin/users/{user_id}")
-def update_user(request: Request, user_id: int, role: str = Form(...), business_id: Optional[int] = Form(default=None)) -> RedirectResponse:
+def update_user(
+    request: Request,
+    user_id: int,
+    role: str = Form(...),
+    business_id: Optional[int] = Form(default=None),
+    reset_2fa: Optional[str] = Form(default=None),
+) -> RedirectResponse:
     current_user = get_current_user(request)
     if not current_user or current_user.role != "admin":
         return RedirectResponse(url="/login", status_code=303)
@@ -2232,6 +2735,9 @@ def update_user(request: Request, user_id: int, role: str = Form(...), business_
         if user:
             user.role = role
             user.business_id = business_id or None
+            if reset_2fa:
+                user.totp_enabled = 0
+                user.totp_secret = None
             db.commit()
     finally:
         db.close()
@@ -2257,6 +2763,13 @@ def admin_businesses(request: Request) -> HTMLResponse:
             <input name="name" placeholder="Business Name" required />
             <input name="whatsapp_number" placeholder="WhatsApp Number" required />
             <input name="owner_notify_number" placeholder="Owner Notify Number" />
+            <label>How will customers pay?
+              <select name="payment_method">
+                <option value="bank_transfer">Bank transfer — owner confirms payments manually</option>
+                <option value="paystack">Paystack payment link — confirmed automatically</option>
+              </select>
+            </label>
+            <p class="form-hint">Add the matching details (bank account or Paystack secret key) on the business page after creating it.</p>
             <button type="submit">Create Business</button>
           </form>
         </div>
@@ -2276,15 +2789,18 @@ def create_business(
     name: str = Form(...),
     whatsapp_number: str = Form(...),
     owner_notify_number: str = Form(default=""),
+    payment_method: str = Form(default="bank_transfer"),
 ) -> RedirectResponse:
     current_user = get_current_user(request)
     if not current_user or current_user.role != "admin":
         return RedirectResponse(url="/login", status_code=303)
+    if payment_method not in PAYMENT_METHOD_LABELS:
+        payment_method = "bank_transfer"
     db = SessionLocal()
     try:
         if db.query(Business).filter(Business.whatsapp_number == whatsapp_number).first():
             return RedirectResponse(url="/admin/businesses", status_code=303)
-        business = Business(name=name, whatsapp_number=whatsapp_number, owner_notify_number=owner_notify_number or None)
+        business = Business(name=name, whatsapp_number=whatsapp_number, owner_notify_number=owner_notify_number or None, payment_method=payment_method)
         db.add(business)
         db.commit()
         db.refresh(business)
@@ -2331,6 +2847,22 @@ def business_detail(request: Request, business_id: int, notice: Optional[str] = 
         f"<div class='notice-banner'>{escape(NOTICE_MESSAGES[notice])}</div>"
         if notice in NOTICE_MESSAGES else ""
     )
+    method = business.payment_method or "bank_transfer"
+    key_mode = paystack_key_mode(business.paystack_secret_key)
+    key_badges = {
+        "live": "<span class='status-pill'>✅ Live Paystack key saved</span>",
+        "test": "<span class='status-pill' style='background:rgba(255,196,0,.12);border-color:rgba(255,196,0,.35);color:#ffd866;'>⚠️ TEST key saved — real customers can't pay with this</span>",
+        "unknown": "<span class='status-pill' style='background:rgba(255,94,122,.12);border-color:rgba(255,94,122,.3);color:var(--danger);'>⚠️ Key doesn't look like sk_test_… / sk_live_…</span>",
+        "missing": "",
+    }
+    key_badge = key_badges.get(key_mode, "")
+    if business.delivery_autocalc:
+        if business.geo_lat is not None and business.geo_lng is not None:
+            geo_hint = f"📍 Pickup point located ({business.geo_lat:.4f}, {business.geo_lng:.4f})."
+        else:
+            geo_hint = "⚠️ Pickup address not located on the map yet — auto-pricing is off until it is."
+    else:
+        geo_hint = ""
     body = f"""
     {notice_html}
     <div class="hero-panel">
@@ -2361,6 +2893,22 @@ def business_detail(request: Request, business_id: int, notice: Optional[str] = 
             <label>Opens at <input name="open_time" type="time" value="{escape(business.open_time or '')}" /></label>
             <label>Closes at <input name="close_time" type="time" value="{escape(business.close_time or '')}" /></label>
             <p class="form-hint">Leave both times empty to take orders 24/7. Outside these hours the bot politely tells customers you're closed (status checks and pending payments still work). Overnight windows like 18:00–02:00 are supported. Times are in your local time (WAT).</p>
+            <hr style="border:none;border-top:1px solid var(--border);margin:14px 0;" />
+            <label>How do customers pay?
+              <select name="payment_method">
+                <option value="bank_transfer" {"selected" if method == "bank_transfer" else ""}>Bank transfer — you confirm each payment manually</option>
+                <option value="paystack" {"selected" if method == "paystack" else ""}>Paystack payment link — confirmed automatically</option>
+              </select>
+            </label>
+            <input name="paystack_secret_key" type="password" value="{escape(business.paystack_secret_key or '')}" placeholder="Paystack secret key (sk_live_… — required for payment links)" autocomplete="off" />
+            {key_badge}
+            <p class="form-hint">With Paystack, customers get a secure checkout link (card, transfer, USSD) and payment is confirmed automatically — no bank-alert checking. Use the secret key from <em>your own</em> Paystack dashboard: an sk_live_ key takes real payments; an sk_test_ key only works with test cards.</p>
+            <hr style="border:none;border-top:1px solid var(--border);margin:14px 0;" />
+            <label><input type="checkbox" name="delivery_autocalc" {"checked" if business.delivery_autocalc else ""} /> Auto-calculate delivery fees by distance</label>
+            <textarea name="location_address" placeholder="Pickup address — where deliveries leave from (defaults to your first branch's address)">{escape(business.location_address or '')}</textarea>
+            <input name="delivery_base_fee" type="number" min="0" value="{business.delivery_base_fee or 0}" placeholder="Base delivery fee (₦)" />
+            <input name="delivery_per_km" type="number" min="0" value="{business.delivery_per_km or 0}" placeholder="Additional fee per km (₦)" />
+            <p class="form-hint">Fee = base + per-km × distance, rounded to the nearest ₦50 — like dispatch apps price rides (e.g. ₦1,000 base + ₦200/km). {geo_hint} If a customer's address can't be found on the map, the order falls back to you setting the fee manually, with a note on the alert.</p>
           </div>
           <div class="form-actions">
             <button type="submit">Save</button>
@@ -2449,11 +2997,14 @@ def purchase_plan(
     business_id: int,
     plan_id: int = Form(...),
     auto_renew: Optional[str] = Form(default=None),
+    billing_cycle: str = Form(default="monthly"),
 ) -> RedirectResponse:
     current_user = get_current_user(request)
     if not current_user or (current_user.role != "admin" and current_user.business_id != business_id):
         return RedirectResponse(url="/login", status_code=303)
 
+    if billing_cycle not in {"monthly", "annual"}:
+        billing_cycle = "monthly"
     db = SessionLocal()
     try:
         business = get_business(db, business_id)
@@ -2463,13 +3014,13 @@ def purchase_plan(
         auto_renew_flag = auto_renew == "1"
         # Capture scalars before commit/close: commit expires ORM instances and
         # attribute access after close raises DetachedInstanceError.
-        plan_price = plan.price_ngn
+        amount = plan.price_ngn * (ANNUAL_MONTHS_CHARGED if billing_cycle == "annual" else 1)
         reference = build_paystack_reference(business.id, plan.id)
-        upsert_payment(db, business_id, current_user.email, plan_id, plan_price, reference, auto_renew_flag)
+        upsert_payment(db, business_id, current_user.email, plan_id, amount, reference, auto_renew_flag, billing_cycle)
     finally:
         db.close()
 
-    auth_url = get_paystack_redirect(business_id, plan_id, plan_price, auto_renew_flag, current_user)
+    auth_url = get_paystack_redirect(business_id, plan_id, amount, auto_renew_flag, current_user)
     return RedirectResponse(url=auth_url, status_code=303)
 
 
@@ -2529,6 +3080,12 @@ def update_business(
     bank_account_name: str = Form(default=""),
     open_time: str = Form(default=""),
     close_time: str = Form(default=""),
+    payment_method: str = Form(default="bank_transfer"),
+    paystack_secret_key: str = Form(default=""),
+    delivery_autocalc: Optional[str] = Form(default=None),
+    location_address: str = Form(default=""),
+    delivery_base_fee: int = Form(default=0),
+    delivery_per_km: int = Form(default=0),
 ) -> RedirectResponse:
     current_user = get_current_user(request)
     if not current_user or (current_user.role != "admin" and current_user.business_id != business_id):
@@ -2550,6 +3107,23 @@ def update_business(
             else:
                 business.open_time = None
                 business.close_time = None
+            if payment_method in PAYMENT_METHOD_LABELS:
+                business.payment_method = payment_method
+            business.paystack_secret_key = paystack_secret_key.strip() or None
+            business.delivery_autocalc = 1 if delivery_autocalc else 0
+            business.delivery_base_fee = max(0, delivery_base_fee)
+            business.delivery_per_km = max(0, delivery_per_km)
+            new_location = location_address.strip() or None
+            if not new_location and business.delivery_autocalc:
+                # Fall back to the first branch's address as the pickup point.
+                branch = db.query(Branch).filter(Branch.business_id == business_id).order_by(Branch.id).first()
+                if branch and branch.address:
+                    new_location = branch.address.strip()
+            if new_location != (business.location_address or None) or (new_location and business.geo_lat is None):
+                business.location_address = new_location
+                coords = geocode_address(new_location) if new_location else None
+                business.geo_lat = coords[0] if coords else None
+                business.geo_lng = coords[1] if coords else None
             db.commit()
     finally:
         db.close()
@@ -2779,6 +3353,8 @@ def set_order_delivery_fee(request: Request, order_id: int, delivery_fee: int = 
         order.delivery_fee = delivery_fee
         order.total = items_subtotal + delivery_fee
         set_order_status(order, "awaiting_payment")
+        if business and business.payment_method == "paystack":
+            create_paystack_order_link(business, order)
         # If the customer's chat drifted back to idle/menu (e.g. they said "hi"
         # while waiting), snap it to the payment stage so their next reply —
         # even a bare "ok" — is treated as payment confirmation, not menu input.
@@ -2882,6 +3458,30 @@ def mark_order_delivered(request: Request, order_id: int) -> RedirectResponse:
     return RedirectResponse(url=f"/business/{business_id}/dashboard", status_code=303)
 
 
+@app.post("/orders/{order_id}/verify-payment")
+def verify_order_payment(request: Request, order_id: int) -> RedirectResponse:
+    current_user = get_current_user(request)
+    db = SessionLocal()
+    try:
+        order = db.query(Order).filter(Order.id == order_id).one_or_none()
+        if not order:
+            return RedirectResponse(url="/admin/orders", status_code=303)
+        if not current_user or (current_user.role != "admin" and current_user.business_id != order.business_id):
+            return RedirectResponse(url="/login", status_code=303)
+        business = get_business(db, order.business_id)
+        if business and order.status in {"awaiting_payment", "payment_claimed"} and verify_paystack_order_payment(business, order):
+            set_order_status(order, "paid")
+            db.commit()
+            send_whatsapp_message(
+                order.customer_phone,
+                f"🎉 Payment confirmed for order *#{order.id}*! *{business.name}* is preparing your order now.{COLLXCT_FOOTER}",
+                from_number=business.whatsapp_number,
+            )
+    finally:
+        db.close()
+    return RedirectResponse(url=f"/orders/{order_id}", status_code=303)
+
+
 @app.get("/orders/{order_id}/receipt")
 def get_order_receipt(request: Request, order_id: int):
     current_user = get_current_user(request)
@@ -2968,12 +3568,25 @@ def order_detail(request: Request, order_id: int) -> HTMLResponse:
     status_label = ORDER_STATUS_LABELS.get(order.status, order.status)
 
     proof_html = ""
+    if business and business.payment_method == "paystack":
+        proof_html += f"<p><span class='pill'>💳 Paystack ({escape(paystack_key_mode(business.paystack_secret_key))} mode)</span></p>"
+        if order.payment_link:
+            proof_html += f"<p><strong>Payment link:</strong> <a href='{escape(order.payment_link)}' target='_blank'>{escape(order.payment_link)}</a></p>"
+        if order.payment_reference:
+            proof_html += f"<p><strong>Gateway reference:</strong> {escape(order.payment_reference)}</p>"
     if order.payment_proof_text:
         proof_html += f"<p><strong>Customer note:</strong> {escape(order.payment_proof_text)}</p>"
     if order.payment_receipt_path:
         proof_html += f"<a href='/orders/{order.id}/receipt' target='_blank'><img class='receipt-preview' src='/orders/{order.id}/receipt' alt='Payment receipt' /></a>"
     if not proof_html:
         proof_html = "<p class='form-hint'>No payment proof submitted yet.</p>"
+
+    verify_button = ""
+    if business and business.payment_method == "paystack" and order.payment_reference and order.status in {"awaiting_payment", "payment_claimed"}:
+        verify_button = (
+            f"<form method='post' action='/orders/{order.id}/verify-payment' style='margin:0;'>"
+            f"<button type='submit'>Check Paystack status</button></form>"
+        )
 
     action_button = ""
     action_modal = ""
@@ -3052,6 +3665,7 @@ def order_detail(request: Request, order_id: int) -> HTMLResponse:
       </div>
       <div class="actions">
         <span class="status-pill">{escape(status_label)}</span>
+        {verify_button}
         {action_button}
       </div>
     </div>
@@ -3068,7 +3682,7 @@ def order_detail(request: Request, order_id: int) -> HTMLResponse:
           <div class="kv-row"><span class="kv-label">Subtotal</span><span class="kv-value">N{subtotal}</span></div>
           <div class="kv-row"><span class="kv-label">Delivery fee</span><span class="kv-value">N{order.delivery_fee}</span></div>
           <div class="kv-row"><span class="kv-label">Total</span><span class="kv-value">N{order.total}</span></div>
-          <div class="kv-row"><span class="kv-label">Delivery address</span><span class="kv-value">{escape(order.address)}</span></div>
+          <div class="kv-row"><span class="kv-label">Delivery address</span><span class="kv-value">{escape(order.address)}{" ⚠️ <em>not found on map</em>" if order.address_unverified else ""}</span></div>
         </div>
       </div>
     </div>
@@ -3263,6 +3877,20 @@ def business_dashboard(request: Request, business_id: int) -> HTMLResponse:
                     f"<div class='notice-banner'>⚠️ Your plan expires on {business.plan_expiry.strftime('%b %d')}. "
                     f"<a href='{plans_url}'>Renew</a> to avoid any pause in ordering.</div>"
                 )
+        cap_banner = ""
+        used, cap, cap_plan = monthly_order_usage(db, business)
+        if cap and used >= max(1, int(cap * 0.8)):
+            plans_url = f"/business/{business.id}/plans"
+            if used > cap:
+                cap_banner = (
+                    f"<div class='notice-banner'>📈 {used}/{cap} monthly orders used — you're past your {escape(cap_plan.name)} plan's included allowance. "
+                    f"Orders are <strong>not</strong> blocked, but please <a href='{plans_url}'>upgrade</a>.</div>"
+                )
+            else:
+                cap_banner = (
+                    f"<div class='notice-banner'>📈 {used}/{cap} monthly orders used on your {escape(cap_plan.name)} plan. "
+                    f"<a href='{plans_url}'>Upgrade</a> if you're trending past it.</div>"
+                )
         action_stat_class = " alert" if action_orders else ""
         if business.open_time and business.close_time:
             if business_is_open(business):
@@ -3273,6 +3901,7 @@ def business_dashboard(request: Request, business_id: int) -> HTMLResponse:
             hours_pill = "<span class='status-pill'>🟢 Open 24/7</span>"
         body = f"""
         {plan_banner}
+        {cap_banner}
         <div class="hero-panel">
           <div>
             <div class="eyebrow">Owner workspace</div>
@@ -3346,7 +3975,7 @@ def business_plans(request: Request, business_id: int) -> HTMLResponse:
     current_plan_name = active_plan.name if active_plan else "Starter"
     current_plan_expiry = plan_due_label(business)
     cards = "".join(
-        f"<div class=\"plan-card{' active' if active_plan and active_plan.id == plan.id else ''}\"><span class=\"tag\">{'Current' if active_plan and active_plan.id == plan.id else 'Recommended'}</span><h4>{escape(plan.name)}</h4><div class=\"price\">₦{plan.price_ngn}</div><p>{escape(plan.description or 'Premium tools for daily order and branch management.')}</p><p>{'Single branch access' if plan.branch_access == 0 else 'Unlimited branches'}</p><label><input type=\"radio\" name=\"plan_id\" value=\"{plan.id}\" {'checked' if idx == 0 else ''} /> Select this plan</label></div>"
+        f"<div class=\"plan-card{' active' if active_plan and active_plan.id == plan.id else ''}\"><span class=\"tag\">{'Current' if active_plan and active_plan.id == plan.id else 'Recommended'}</span><h4>{escape(plan.name)}</h4><div class=\"price\">₦{plan.price_ngn}<span style=\"font-size:.85rem;font-weight:500;color:var(--muted);\">/mo</span></div><p class=\"form-hint\">or ₦{plan.price_ngn * ANNUAL_MONTHS_CHARGED}/year — 2 months free</p><p>{escape(plan.description or 'Premium tools for daily order and branch management.')}</p><p>{'Single branch access' if plan.branch_access == 0 else 'Unlimited branches'} · {f'{plan.monthly_order_cap} orders/mo included' if plan.monthly_order_cap else 'unlimited orders'}</p><label><input type=\"radio\" name=\"plan_id\" value=\"{plan.id}\" {'checked' if idx == 0 else ''} /> Select this plan</label></div>"
         for idx, plan in enumerate(plans)
     )
     body = f"""
@@ -3369,7 +3998,9 @@ def business_plans(request: Request, business_id: int) -> HTMLResponse:
     <form method="post" action="/business/{business.id}/purchase-plan">
       <div class="plan-grid">{cards}</div>
       <div class="card">
-        <label><input type="checkbox" name="auto_renew" value="1" checked /> Auto renew monthly</label>
+        <label><input type="radio" name="billing_cycle" value="monthly" checked /> Monthly billing</label>
+        <label><input type="radio" name="billing_cycle" value="annual" /> Annual billing — pay for {ANNUAL_MONTHS_CHARGED} months, get 12 (2 months free)</label>
+        <label><input type="checkbox" name="auto_renew" value="1" checked /> Auto renew</label>
         <button type="submit" class="btn primary">Checkout with Paystack</button>
       </div>
     </form>
@@ -3399,8 +4030,10 @@ def admin_plans(request: Request) -> HTMLResponse:
               <form method="post" action="/admin/plans/{plan.id}">
                 <label>Name <input name="name" value="{escape(plan.name)}" required /></label>
                 <label>Monthly price (₦) <input name="price_ngn" type="number" min="0" value="{plan.price_ngn}" required /></label>
+                <label>Included orders/month (0 = unlimited) <input name="monthly_order_cap" type="number" min="0" value="{plan.monthly_order_cap}" /></label>
                 <textarea name="description" placeholder="What's included?">{escape(plan.description or '')}</textarea>
                 <label><input type="checkbox" name="branch_access" {"checked" if plan.branch_access == 1 else ""} /> Multi-branch access</label>
+                <p class="form-hint">Annual price is automatic: {ANNUAL_MONTHS_CHARGED}× the monthly price for 12 months. The order cap is soft — owners get nudged at 80% and past the cap, but orders are never blocked.</p>
                 <div class="form-actions">
                   <button type="submit">Save plan</button>
                 </div>
@@ -3434,6 +4067,7 @@ def update_plan(
     price_ngn: int = Form(...),
     description: str = Form(default=""),
     branch_access: Optional[str] = Form(default=None),
+    monthly_order_cap: int = Form(default=0),
 ) -> RedirectResponse:
     current_user = get_current_user(request)
     if not current_user or current_user.role != "admin":
@@ -3446,6 +4080,7 @@ def update_plan(
             plan.price_ngn = max(0, price_ngn)
             plan.description = description or None
             plan.branch_access = 1 if branch_access else 0
+            plan.monthly_order_cap = max(0, monthly_order_cap)
             db.commit()
     finally:
         db.close()
@@ -3472,7 +4107,7 @@ def admin_business_plans(request: Request, business_id: int) -> HTMLResponse:
     current_plan_name = active_plan.name if active_plan else "Starter"
     current_plan_expiry = plan_due_label(business)
     cards = "".join(
-        f"<div class=\"plan-card{' active' if active_plan and active_plan.id == plan.id else ''}\"><span class=\"tag\">{'Current' if active_plan and active_plan.id == plan.id else 'Recommended'}</span><h4>{escape(plan.name)}</h4><div class=\"price\">₦{plan.price_ngn}</div><p>{escape(plan.description or 'Premium tools for daily order and branch management.')}</p><p>{'Single branch access' if plan.branch_access == 0 else 'Unlimited branches'}</p><label><input type=\"radio\" name=\"plan_id\" value=\"{plan.id}\" {'checked' if idx == 0 else ''} /> Select this plan</label></div>"
+        f"<div class=\"plan-card{' active' if active_plan and active_plan.id == plan.id else ''}\"><span class=\"tag\">{'Current' if active_plan and active_plan.id == plan.id else 'Recommended'}</span><h4>{escape(plan.name)}</h4><div class=\"price\">₦{plan.price_ngn}<span style=\"font-size:.85rem;font-weight:500;color:var(--muted);\">/mo</span></div><p class=\"form-hint\">or ₦{plan.price_ngn * ANNUAL_MONTHS_CHARGED}/year — 2 months free</p><p>{escape(plan.description or 'Premium tools for daily order and branch management.')}</p><p>{'Single branch access' if plan.branch_access == 0 else 'Unlimited branches'} · {f'{plan.monthly_order_cap} orders/mo included' if plan.monthly_order_cap else 'unlimited orders'}</p><label><input type=\"radio\" name=\"plan_id\" value=\"{plan.id}\" {'checked' if idx == 0 else ''} /> Select this plan</label></div>"
         for idx, plan in enumerate(plans)
     )
     body = f"""
@@ -3495,7 +4130,9 @@ def admin_business_plans(request: Request, business_id: int) -> HTMLResponse:
     <form method="post" action="/business/{business.id}/purchase-plan">
       <div class="plan-grid">{cards}</div>
       <div class="card">
-        <label><input type="checkbox" name="auto_renew" value="1" checked /> Auto renew monthly</label>
+        <label><input type="radio" name="billing_cycle" value="monthly" checked /> Monthly billing</label>
+        <label><input type="radio" name="billing_cycle" value="annual" /> Annual billing — pay for {ANNUAL_MONTHS_CHARGED} months, get 12 (2 months free)</label>
+        <label><input type="checkbox" name="auto_renew" value="1" checked /> Auto renew</label>
         <button type="submit" class="btn primary">Checkout with Paystack</button>
       </div>
     </form>

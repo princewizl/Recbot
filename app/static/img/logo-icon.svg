@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" fill="none">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="48" y2="48" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#34d399"/>
+      <stop offset="100%" stop-color="#059669"/>
+    </linearGradient>
+    <linearGradient id="sheen" x1="0" y1="0" x2="0" y2="1" gradientUnits="objectBoundingBox">
+      <stop offset="0%" stop-color="rgba(255,255,255,0.2)"/>
+      <stop offset="100%" stop-color="rgba(255,255,255,0)"/>
+    </linearGradient>
+  </defs>
+  <!-- Background square -->
+  <rect width="48" height="48" rx="13" fill="url(#bg)"/>
+  <!-- Top sheen overlay -->
+  <rect width="48" height="28" rx="13" fill="url(#sheen)"/>
+  <!-- C arc — center (34,24), radius 13.5, semicircle opening right -->
+  <path d="M34,10.5 A13.5,13.5 0 1,0 34,37.5"
+        stroke="white" stroke-width="4" stroke-linecap="round" fill="none"/>
+  <!-- Arrow chevron at arc start (top) -->
+  <path d="M30.5,7 L34,10.5 L37.5,7"
+        stroke="white" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+  <!-- Two Naira-style lines through the C interior -->
+  <line x1="7" y1="21" x2="33" y2="21" stroke="white" stroke-width="2.8" stroke-linecap="round"/>
+  <line x1="7" y1="27" x2="33" y2="27" stroke="white" stroke-width="2.8" stroke-linecap="round"/>
+</svg>

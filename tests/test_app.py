@@ -225,6 +225,146 @@ def test_single_branch_plan_limit_for_owners(tmp_path, monkeypatch):
     assert "notice=branch_limit" in second.headers["location"]
 
 
+def test_totp_two_factor_login_flow(tmp_path, monkeypatch):
+    import time as time_module
+
+    db_path = tmp_path / "test_bot.db"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
+    monkeypatch.setenv("ADMIN_EMAIL", "admin@example.com")
+    monkeypatch.setenv("ADMIN_PASSWORD", "test-admin-password")
+
+    import app.main as main
+    importlib.reload(main)
+    client = TestClient(main.app)
+
+    # Enable 2FA directly on the seeded admin.
+    secret = main.generate_totp_secret()
+    db = main.SessionLocal()
+    admin = db.query(main.User).filter(main.User.email == "admin@example.com").one()
+    admin.totp_secret = secret
+    admin.totp_enabled = 1
+    db.commit()
+    db.close()
+
+    # Password alone must not grant a session — it redirects to the verify step.
+    response = client.post(
+        "/login",
+        data={"email": "admin@example.com", "password": "test-admin-password"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert response.headers["location"] == "/login/verify"
+    assert client.get("/admin/", follow_redirects=False).status_code == 303  # still logged out
+
+    # A wrong code bounces back to the verify page.
+    response = client.post("/login/verify", data={"code": "000000"}, follow_redirects=False)
+    assert response.headers["location"] == "/login/verify"
+
+    # The correct TOTP code completes the sign-in.
+    code = main._totp_code(secret, int(time_module.time()) // 30)
+    response = client.post("/login/verify", data={"code": code}, follow_redirects=False)
+    assert response.headers["location"] == "/admin/"
+    assert client.get("/admin/").status_code == 200
+
+
+def test_auto_delivery_fee_and_paystack_flow(tmp_path, monkeypatch):
+    db_path = tmp_path / "test_bot.db"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
+    monkeypatch.setenv("ADMIN_EMAIL", "admin@example.com")
+    monkeypatch.setenv("ADMIN_PASSWORD", "test-admin-password")
+
+    import app.main as main
+    importlib.reload(main)
+    client = TestClient(main.app)
+
+    # Configure the demo shop: Paystack + auto delivery fee, pickup located.
+    db = main.SessionLocal()
+    business = db.query(main.Business).first()
+    business.payment_method = "paystack"
+    business.paystack_secret_key = "sk_test_x"
+    business.delivery_autocalc = 1
+    business.delivery_base_fee = 1000
+    business.delivery_per_km = 200
+    business.geo_lat = 6.45
+    business.geo_lng = 3.40
+    db.commit()
+    db.close()
+
+    # ~2.2 km away; no real network calls in tests.
+    monkeypatch.setattr(main, "geocode_address", lambda address: (6.47, 3.40))
+
+    def fake_link(business, order):
+        order.payment_reference = f"RBORD-{order.id}-test"
+        order.payment_link = "https://checkout.paystack.com/test123"
+        return order.payment_link
+
+    monkeypatch.setattr(main, "create_paystack_order_link", fake_link)
+
+    phone = "2348011111111"
+    client.post("/webhook", json={"from": phone, "message": "hi"})
+    client.post("/webhook", json={"from": phone, "message": "1"})
+    client.post("/webhook", json={"from": phone, "message": "1"})
+    client.post("/webhook", json={"from": phone, "message": "checkout"})
+    client.post("/webhook", json={"from": phone, "message": "Ada"})
+    reply = client.post("/webhook", json={"from": phone, "message": "12 Marina Road, Lagos"}).json()["reply"]
+
+    # Fee auto-calculated (base 1000 + ceil(2.2km) * 200 = 1600, rounded to N50)
+    # and the payment link sent immediately — no owner action needed.
+    assert "checkout.paystack.com" in reply
+    assert "Delivery (2.2 km)" in reply
+
+    db = main.SessionLocal()
+    order = db.query(main.Order).first()
+    assert order.status == "awaiting_payment"
+    assert order.delivery_fee == 1600
+    db.close()
+
+    # Customer says "paid": Paystack verification confirms automatically.
+    monkeypatch.setattr(main, "verify_paystack_order_payment", lambda business, order: True)
+    reply = client.post("/webhook", json={"from": phone, "message": "paid"}).json()["reply"]
+    assert "Payment confirmed" in reply
+    db = main.SessionLocal()
+    assert db.query(main.Order).first().status == "paid"
+    db.close()
+
+    # Nothing ever entered the action queue.
+    client.post("/login", data={"email": "admin@example.com", "password": "test-admin-password"}, follow_redirects=False)
+    assert client.get("/api/action-required").json()["count"] == 0
+
+
+def test_annual_prepay_extends_expiry_a_year(tmp_path, monkeypatch):
+    db_path = tmp_path / "test_bot.db"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
+    monkeypatch.setenv("ADMIN_EMAIL", "admin@example.com")
+    monkeypatch.setenv("ADMIN_PASSWORD", "test-admin-password")
+    monkeypatch.delenv("PAYSTACK_SECRET_KEY", raising=False)
+
+    import app.main as main
+    importlib.reload(main)
+    client = TestClient(main.app)
+
+    client.post("/login", data={"email": "admin@example.com", "password": "test-admin-password"}, follow_redirects=False)
+    purchase = client.post(
+        "/business/1/purchase-plan",
+        data={"plan_id": "2", "billing_cycle": "annual", "auto_renew": "1"},
+        follow_redirects=False,
+    )
+    assert purchase.status_code == 303
+    simulate_url = purchase.headers["location"]
+    assert simulate_url.startswith("/paystack/simulate")
+    client.get(simulate_url)
+
+    db = main.SessionLocal()
+    business = db.query(main.Business).filter(main.Business.id == 1).one()
+    payment = db.query(main.Payment).order_by(main.Payment.id.desc()).first()
+    growth = db.query(main.Plan).filter(main.Plan.id == 2).one()
+    assert payment.billing_cycle == "annual"
+    assert payment.amount == growth.price_ngn * 10
+    days = (business.plan_expiry - main.datetime.utcnow()).days
+    assert 360 <= days <= 366
+    db.close()
+
+
 def test_login_rate_limiting(tmp_path, monkeypatch):
     db_path = tmp_path / "test_bot.db"
     monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
