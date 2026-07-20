@@ -40,9 +40,10 @@ def test_admin_dashboard_and_business_creation(tmp_path, monkeypatch):
     importlib.reload(main)
     client = TestClient(main.app)
 
-    response = client.get("/admin/")
-    assert response.status_code == 200
-    assert "Admin Dashboard" in response.text
+    # Unauthenticated visitors must be bounced to login, not shown the dashboard.
+    response = client.get("/admin/", follow_redirects=False)
+    assert response.status_code == 303
+    assert response.headers["location"] == "/login"
 
     login_response = client.post(
         "/login",
@@ -50,6 +51,10 @@ def test_admin_dashboard_and_business_creation(tmp_path, monkeypatch):
         follow_redirects=False,
     )
     assert login_response.status_code == 303
+
+    response = client.get("/admin/")
+    assert response.status_code == 200
+    assert "Admin Dashboard" in response.text
 
     response = client.post(
         "/admin/businesses",
@@ -107,3 +112,48 @@ def test_menu_item_descriptions_show_in_admin_and_conversations(tmp_path, monkey
     conversation_page = client.get("/admin/conversations")
     assert conversation_page.status_code == 200
     assert "Crispy grilled burger with cheddar" in conversation_page.text
+
+
+def test_action_required_alerts_for_new_order(tmp_path, monkeypatch):
+    db_path = tmp_path / "test_bot.db"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
+    monkeypatch.setenv("ADMIN_EMAIL", "admin@example.com")
+    monkeypatch.setenv("ADMIN_PASSWORD", "test-admin-password")
+
+    import app.main as main
+    importlib.reload(main)
+    client = TestClient(main.app)
+
+    # Walk the seeded demo shop's flow: greet, pick category, pick item, checkout.
+    phone = "2348012345678"
+    client.post("/webhook", json={"from": phone, "message": "hi"})
+    client.post("/webhook", json={"from": phone, "message": "1"})
+    client.post("/webhook", json={"from": phone, "message": "1"})
+    client.post("/webhook", json={"from": phone, "message": "checkout"})
+    client.post("/webhook", json={"from": phone, "message": "Ada"})
+    response = client.post("/webhook", json={"from": phone, "message": "12 Marina Road, Lagos"})
+    assert "delivery fee" in response.json()["reply"].lower()
+
+    # The alert API requires a staff login.
+    unauthenticated = client.get("/api/action-required")
+    assert unauthenticated.status_code == 401
+
+    login_response = client.post(
+        "/login",
+        data={"email": "admin@example.com", "password": "test-admin-password"},
+        follow_redirects=False,
+    )
+    assert login_response.status_code == 303
+
+    payload = client.get("/api/action-required").json()
+    assert payload["count"] == 1
+    order = payload["orders"][0]
+    assert order["status"] == "awaiting_delivery_fee"
+    assert order["action"] == "Set delivery fee"
+    assert order["customer"] == "Ada"
+
+    # Setting the delivery fee resolves the alert.
+    fee_response = client.post(f"/orders/{order['id']}/delivery-fee", data={"delivery_fee": "500"}, follow_redirects=False)
+    assert fee_response.status_code == 303
+    payload = client.get("/api/action-required").json()
+    assert payload["count"] == 0

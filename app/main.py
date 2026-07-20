@@ -1,3 +1,4 @@
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -5,13 +6,15 @@ import json
 import logging
 import os
 import re
+import secrets
+import time
 from datetime import datetime, timedelta
 from html import escape
 from typing import Dict, List, Optional
 
 import httpx
 from fastapi import FastAPI, Form, Request, Response
-from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import Column, DateTime, Integer, String, Text, UniqueConstraint, create_engine, text
 from sqlalchemy.orm import declarative_base, sessionmaker
@@ -107,6 +110,9 @@ class Order(Base):
     delivery_fee = Column(Integer, nullable=False, default=0)
     address = Column(Text, nullable=False)
     status = Column(String(50), nullable=False, default="new")
+    status_changed_at = Column(DateTime, nullable=True)
+    action_reminder_count = Column(Integer, nullable=False, default=0)
+    action_reminded_at = Column(DateTime, nullable=True)
     payment_proof_text = Column(Text, nullable=True)
     payment_receipt_path = Column(String(255), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -196,6 +202,15 @@ def ensure_schema() -> None:
             conn.execute(text("ALTER TABLE orders ADD COLUMN payment_proof_text TEXT"))
         if not has_column("orders", "payment_receipt_path"):
             conn.execute(text("ALTER TABLE orders ADD COLUMN payment_receipt_path VARCHAR(255)"))
+        if not has_column("orders", "status_changed_at"):
+            conn.execute(text("ALTER TABLE orders ADD COLUMN status_changed_at DATETIME"))
+        if not has_column("orders", "action_reminder_count"):
+            conn.execute(text("ALTER TABLE orders ADD COLUMN action_reminder_count INTEGER NOT NULL DEFAULT 0"))
+        if not has_column("orders", "action_reminded_at"):
+            conn.execute(text("ALTER TABLE orders ADD COLUMN action_reminded_at DATETIME"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_orders_business_id ON orders(business_id)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_orders_status ON orders(status)"))
+        conn.execute(text("CREATE INDEX IF NOT EXISTS ix_orders_customer_phone ON orders(customer_phone)"))
 
         if not has_index("conversations", "ix_conversations_phone_business"):
             conn.execute(text(
@@ -223,32 +238,52 @@ ensure_schema()
 app = FastAPI(title="Recbot CRM")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 SECRET_KEY = os.getenv("SECRET_KEY", "supersecret-key")
+if SECRET_KEY == "supersecret-key":
+    logger.warning("SECRET_KEY is the built-in default — set a random SECRET_KEY in .env before going live.")
+
+PBKDF2_ITERATIONS = 260000
+AUTH_TOKEN_TTL_SECONDS = 30 * 24 * 3600
 
 
 def hash_password(password: str) -> str:
-    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+    salt = secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), bytes.fromhex(salt), PBKDF2_ITERATIONS).hex()
+    return f"pbkdf2:{PBKDF2_ITERATIONS}:{salt}:{digest}"
 
 
 def verify_password(password: str, password_hash: str) -> bool:
-    return hash_password(password) == password_hash
+    if password_hash.startswith("pbkdf2:"):
+        try:
+            _, iterations, salt, digest = password_hash.split(":")
+            computed = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), bytes.fromhex(salt), int(iterations)).hex()
+            return hmac.compare_digest(computed, digest)
+        except Exception:
+            return False
+    # Legacy unsalted SHA-256 hashes; upgraded transparently on next login.
+    legacy = hashlib.sha256(password.encode("utf-8")).hexdigest()
+    return hmac.compare_digest(legacy, password_hash)
 
 
 def create_auth_token(email: str) -> str:
-    signature = hmac.new(SECRET_KEY.encode(), email.encode(), hashlib.sha256).hexdigest()
-    token = f"{email}:{signature}"
-    return base64.urlsafe_b64encode(token.encode()).decode()
+    expires = int(time.time()) + AUTH_TOKEN_TTL_SECONDS
+    payload = f"{email}|{expires}"
+    signature = hmac.new(SECRET_KEY.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    return base64.urlsafe_b64encode(f"{payload}|{signature}".encode()).decode()
 
 
 def verify_auth_token(token: str) -> Optional[str]:
     try:
         decoded = base64.urlsafe_b64decode(token.encode()).decode()
-        email, signature = decoded.split(":")
-        expected = hmac.new(SECRET_KEY.encode(), email.encode(), hashlib.sha256).hexdigest()
-        if hmac.compare_digest(signature, expected):
-            return email
+        payload, signature = decoded.rsplit("|", 1)
+        expected = hmac.new(SECRET_KEY.encode(), payload.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(signature, expected):
+            return None
+        email, expires = payload.rsplit("|", 1)
+        if int(expires) < time.time():
+            return None
+        return email
     except Exception:
         return None
-    return None
 
 
 def get_user_by_email(db, email: str) -> Optional[User]:
@@ -274,9 +309,11 @@ def make_nav(current_user: Optional[User] = None) -> str:
     if current_user:
         if current_user.role == "admin":
             links.append("<a class='nav-link' href='/admin/'>Command Center</a>")
-            links.append("<a class='nav-link' href='/register'>Create Owners</a>")
+            links.append("<a class='nav-link' href='/admin/orders'>Orders</a>")
+            links.append("<a class='nav-link' href='/admin/conversations'>Conversations</a>")
             links.append("<a class='nav-link' href='/admin/businesses'>Businesses</a>")
             links.append("<a class='nav-link' href='/admin/users'>Users</a>")
+            links.append("<a class='nav-link' href='/register'>Create Owners</a>")
         is_business_owner = current_user.role in {"business_owner", "business-owner", "owner"}
         if is_business_owner:
             links.append("<a class='nav-link' href='/owner/portal'>Owner Portal</a>")
@@ -347,6 +384,124 @@ MASCOT_WIDGET_HTML = """
   });
   applyState();
   setInterval(rotateTip, 6500);
+})();
+</script>
+"""
+
+
+ALERT_WIDGET_HTML = """
+<div id="rb-alert" class="rb-alert" hidden>
+  <div class="rb-alert-head">
+    <span class="rb-alert-icon">🚨</span>
+    <span id="rb-alert-title">Action needed</span>
+    <span class="rb-alert-spacer"></span>
+    <button id="rb-alert-sound" class="rb-alert-btn" type="button" hidden>🔊 Enable sound</button>
+    <button id="rb-alert-mute" class="rb-alert-btn" type="button" title="Silence the chime for 5 minutes — a new order will ring again">Mute 5 min</button>
+  </div>
+  <div id="rb-alert-items" class="rb-alert-items"></div>
+</div>
+<script>
+(function () {
+  var POLL_MS = 12000;
+  var MUTE_MS = 5 * 60 * 1000;
+  var box = document.getElementById("rb-alert");
+  if (!box) return;
+  var itemsEl = document.getElementById("rb-alert-items");
+  var titleEl = document.getElementById("rb-alert-title");
+  var muteBtn = document.getElementById("rb-alert-mute");
+  var soundBtn = document.getElementById("rb-alert-sound");
+  var baseTitle = document.title;
+  var ctx = null, chimeTimer = null, stopped = false, knownIds = null;
+
+  function getMuteUntil() { try { return parseInt(localStorage.getItem("rb_alert_mute_until") || "0", 10) || 0; } catch (e) { return 0; } }
+  function setMuteUntil(ts) { try { localStorage.setItem("rb_alert_mute_until", String(ts)); } catch (e) {} }
+  function audioCtx() {
+    if (!ctx) { try { ctx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { return null; } }
+    return ctx;
+  }
+  function tone(freq, start, dur, peak) {
+    var c = audioCtx(); if (!c) return;
+    var osc = c.createOscillator(), gain = c.createGain();
+    osc.type = "sine"; osc.frequency.value = freq;
+    var t = c.currentTime + start;
+    gain.gain.setValueAtTime(0.0001, t);
+    gain.gain.exponentialRampToValueAtTime(peak, t + 0.04);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    osc.connect(gain); gain.connect(c.destination);
+    osc.start(t); osc.stop(t + dur + 0.05);
+  }
+  function playChime() {
+    var c = audioCtx(); if (!c) return;
+    if (c.state === "suspended") { soundBtn.hidden = false; return; }
+    soundBtn.hidden = true;
+    // Long, insistent three-round chime (~3s) that repeats while unacknowledged.
+    [0, 1.0, 2.0].forEach(function (offset) {
+      tone(880, offset, 0.5, 0.22);
+      tone(1174.66, offset + 0.18, 0.55, 0.18);
+      tone(659.25, offset + 0.36, 0.7, 0.15);
+    });
+  }
+  function startAlarm() {
+    if (Date.now() < getMuteUntil()) return;
+    playChime();
+    if (chimeTimer) return;
+    chimeTimer = setInterval(function () {
+      if (Date.now() < getMuteUntil()) return;
+      playChime();
+    }, 6000);
+  }
+  function stopAlarm() { if (chimeTimer) { clearInterval(chimeTimer); chimeTimer = null; } }
+
+  muteBtn.addEventListener("click", function () { setMuteUntil(Date.now() + MUTE_MS); });
+  soundBtn.addEventListener("click", function () {
+    var c = audioCtx();
+    if (c && c.state === "suspended") { c.resume().then(playChime); } else { playChime(); }
+  });
+  document.addEventListener("click", function () {
+    if (ctx && ctx.state === "suspended") ctx.resume();
+  });
+
+  function esc(s) {
+    return String(s == null ? "" : s).replace(/[&<>"']/g, function (m) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[m];
+    });
+  }
+  function render(data) {
+    if (!data.count) {
+      box.hidden = true;
+      document.title = baseTitle;
+      stopAlarm();
+      knownIds = [];
+      return;
+    }
+    var html = "";
+    data.orders.slice(0, 6).forEach(function (o) {
+      html += "<a class='rb-alert-item' href='" + esc(o.url) + "'>"
+        + "<span class='rb-alert-item-main'><strong>#" + esc(o.id) + "</strong> · " + esc(o.customer)
+        + (o.business ? " · " + esc(o.business) : "") + " · ₦" + esc(o.total) + "</span>"
+        + "<span class='rb-alert-item-sub'>" + esc(o.label) + " — waiting " + esc(o.age) + "</span>"
+        + "<span class='rb-alert-item-cta'>" + esc(o.action) + " →</span></a>";
+    });
+    if (data.count > 6) html += "<div class='rb-alert-more'>+" + (data.count - 6) + " more on the Orders page…</div>";
+    itemsEl.innerHTML = html;
+    titleEl.textContent = data.count === 1 ? "1 order needs your action" : data.count + " orders need your action";
+    box.hidden = false;
+    document.title = "(" + data.count + ") 🔔 " + baseTitle;
+    var ids = data.orders.map(function (o) { return String(o.id); });
+    var hasNew = knownIds !== null && ids.some(function (id) { return knownIds.indexOf(id) === -1; });
+    if (hasNew) setMuteUntil(0); // a brand-new alert always rings, even if muted
+    knownIds = ids;
+    if (Date.now() >= getMuteUntil()) { startAlarm(); } else { stopAlarm(); }
+  }
+  function poll() {
+    if (stopped) return;
+    fetch("/api/action-required", { credentials: "same-origin" }).then(function (r) {
+      if (r.status === 401) { stopped = true; box.hidden = true; document.title = baseTitle; stopAlarm(); return null; }
+      return r.ok ? r.json() : null;
+    }).then(function (data) { if (data) render(data); }).catch(function () {});
+  }
+  poll();
+  setInterval(poll, POLL_MS);
 })();
 </script>
 """
@@ -480,6 +635,36 @@ def render_page(title: str, body: str, nav_html: Optional[str] = None) -> HTMLRe
                     .kv-list .kv-value {{ font-weight:600; text-align:right; }}
                     .receipt-preview {{ max-width:100%; border-radius:var(--radius-md); border:1px solid var(--border); margin-top:10px; }}
                     @media (max-width:780px) {{ .detail-grid {{ grid-template-columns:1fr; }} }}
+                    .rb-alert {{ position:fixed; top:14px; left:50%; transform:translateX(-50%); z-index:10001; width:min(560px, calc(100vw - 24px)); background:linear-gradient(160deg,#2a1218,#1a0d11); border:1px solid rgba(255,94,122,.55); border-radius:var(--radius-md); overflow:hidden; animation:rb-alert-pulse 1.6s ease-in-out infinite; }}
+                    .rb-alert-head {{ display:flex; align-items:center; gap:10px; padding:12px 16px; border-bottom:1px solid rgba(255,94,122,.25); font-weight:700; color:#ffb3c1; }}
+                    .rb-alert-icon {{ font-size:1.1rem; animation:rb-alert-ring 1.2s ease-in-out infinite; }}
+                    .rb-alert-spacer {{ flex:1; }}
+                    .rb-alert-btn {{ padding:5px 10px; border-radius:8px; border:1px solid rgba(255,94,122,.4); background:rgba(255,94,122,.12); color:#ffb3c1; font-size:.76rem; font-weight:700; cursor:pointer; margin-right:0; }}
+                    .rb-alert-btn:hover {{ background:rgba(255,94,122,.22); transform:none; }}
+                    .rb-alert-item {{ display:flex; flex-direction:column; gap:2px; padding:10px 16px; text-decoration:none; border-bottom:1px solid rgba(255,255,255,.06); transition:background .15s ease; }}
+                    .rb-alert-item:last-child {{ border-bottom:none; }}
+                    .rb-alert-item:hover {{ background:rgba(255,94,122,.08); }}
+                    .rb-alert-item-main {{ color:var(--text); font-size:.9rem; }}
+                    .rb-alert-item-sub {{ color:#ff8fa3; font-size:.78rem; font-weight:600; }}
+                    .rb-alert-item-cta {{ color:var(--primary-strong); font-size:.8rem; font-weight:700; }}
+                    .rb-alert-more {{ padding:8px 16px; color:var(--muted); font-size:.8rem; }}
+                    @keyframes rb-alert-pulse {{ 0%,100% {{ box-shadow:0 18px 50px rgba(0,0,0,.6), 0 0 0 1px rgba(255,94,122,.25); }} 50% {{ box-shadow:0 18px 50px rgba(0,0,0,.6), 0 0 0 6px rgba(255,94,122,.30); }} }}
+                    @keyframes rb-alert-ring {{ 0%,100% {{ transform:rotate(0); }} 20% {{ transform:rotate(14deg); }} 40% {{ transform:rotate(-12deg); }} 60% {{ transform:rotate(8deg); }} 80% {{ transform:rotate(-6deg); }} }}
+                    .queue-list {{ display:flex; flex-direction:column; gap:10px; }}
+                    .queue-item {{ display:flex; align-items:center; gap:14px; padding:14px 16px; border:1px solid rgba(255,94,122,.35); border-radius:var(--radius-md); background:rgba(255,94,122,.06); text-decoration:none; transition:background .15s ease, transform .1s ease; }}
+                    .queue-item:hover {{ background:rgba(255,94,122,.12); transform:translateY(-1px); }}
+                    .queue-main {{ display:flex; flex-direction:column; gap:2px; min-width:0; }}
+                    .queue-id {{ font-weight:800; color:var(--text); }}
+                    .queue-customer {{ color:var(--text); font-size:.9rem; }}
+                    .queue-biz {{ color:var(--muted); font-size:.78rem; }}
+                    .queue-meta {{ margin-left:auto; display:flex; flex-direction:column; align-items:flex-end; gap:2px; flex-shrink:0; }}
+                    .queue-total {{ font-weight:700; color:var(--text); }}
+                    .queue-status {{ color:#ff8fa3; font-size:.78rem; font-weight:600; }}
+                    .queue-age {{ color:var(--muted); font-size:.75rem; }}
+                    .queue-cta {{ flex-shrink:0; }}
+                    .empty-state {{ padding:18px; border:1px dashed var(--border-strong); border-radius:var(--radius-md); color:var(--muted); text-align:center; }}
+                    .stat-card.alert {{ border-color:rgba(255,94,122,.5); background:rgba(255,94,122,.07); }}
+                    .stat-card.alert .value {{ color:var(--danger); }}
                     .rb-mascot {{ position:fixed; right:20px; bottom:20px; z-index:9999; display:flex; flex-direction:column; align-items:flex-end; gap:10px; }}
                     .rb-bubble {{ max-width:240px; padding:12px 14px; border-radius:16px 16px 4px 16px; background:var(--surface); border:1px solid var(--border-strong); color:var(--text); font-size:.85rem; line-height:1.4; box-shadow:var(--shadow-md); }}
                     .rb-toggle {{ width:130px; height:130px; padding:0; border:none; background:transparent; cursor:pointer; display:flex; align-items:center; justify-content:center; transition:transform .2s ease; filter:drop-shadow(0 18px 30px rgba(0,0,0,.4)); }}
@@ -533,6 +718,7 @@ def render_page(title: str, body: str, nav_html: Optional[str] = None) -> HTMLRe
           </div>
         </div>
         {MASCOT_WIDGET_HTML}
+        {ALERT_WIDGET_HTML}
       </body>
     </html>
     """
@@ -559,7 +745,7 @@ def get_business_context(business_id: int) -> Dict[str, object]:
         categories = db.query(Category).filter(Category.business_id == business.id).order_by(Category.name).all()
         branches = db.query(Branch).filter(Branch.business_id == business.id).order_by(Branch.name).all()
         items = db.query(MenuItem).filter(MenuItem.business_id == business.id).order_by(MenuItem.id).all()
-        orders = db.query(Order).filter(Order.business_id == business.id).order_by(Order.created_at.desc()).all()
+        orders = db.query(Order).filter(Order.business_id == business.id).order_by(Order.created_at.desc()).limit(100).all()
         return {"business": business, "categories": categories, "branches": branches, "items": items, "orders": orders}
     finally:
         db.close()
@@ -724,7 +910,10 @@ def seed_data() -> None:
 
         if db.query(User).filter(User.role == "admin").count() == 0:
             admin_email = os.getenv("ADMIN_EMAIL", "olufemi.mohammed11@gmail.com")
-            admin_password = os.getenv("ADMIN_PASSWORD", "Pass@12345")
+            admin_password = os.getenv("ADMIN_PASSWORD")
+            if not admin_password:
+                admin_password = "Pass@12345"
+                logger.warning("Seeded admin user with the built-in default password — set ADMIN_PASSWORD in .env and change it before going live.")
             db.add(User(email=admin_email, password_hash=hash_password(admin_password), role="admin", business_id=None))
             db.commit()
         if db.query(Plan).count() == 0:
@@ -786,6 +975,101 @@ def send_whatsapp_message(to_number: str, body: str, from_number: Optional[str] 
     except Exception as exc:
         logger.error("send_whatsapp_message failed (to=%s from=%s): %s", to, from_, exc)
         return False
+
+
+# Orders in these statuses are blocked on the business/admin, not the customer.
+ACTION_NEEDED_STATUSES = ("awaiting_delivery_fee", "payment_claimed")
+ACTION_LABELS = {
+    "awaiting_delivery_fee": "Set delivery fee",
+    "payment_claimed": "Confirm payment",
+}
+STAFF_ROLES = {"admin", "business_owner", "business-owner", "owner"}
+ACTION_REMINDER_AFTER = timedelta(minutes=int(os.getenv("ACTION_REMINDER_AFTER_MINUTES", "10")))
+ACTION_REMINDER_MAX = int(os.getenv("ACTION_REMINDER_MAX", "3"))
+ACTION_REMINDER_INTERVAL_SECONDS = int(os.getenv("ACTION_REMINDER_INTERVAL_SECONDS", "120"))
+
+
+def set_order_status(order: Order, status: str) -> None:
+    order.status = status
+    order.status_changed_at = datetime.utcnow()
+    order.action_reminder_count = 0
+    order.action_reminded_at = None
+
+
+def order_link(order_id: int) -> str:
+    base = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+    return f"{base}/orders/{order_id}" if base else ""
+
+
+def notify_owner_action(business: Business, order_id: int, headline: str) -> None:
+    if not business or not business.owner_notify_number:
+        return
+    link = order_link(order_id)
+    link_line = f"\n\nOpen: {link}" if link else "\n\nOpen your Recbot dashboard to respond."
+    send_whatsapp_message(business.owner_notify_number, headline + link_line, from_number=business.whatsapp_number)
+
+
+def action_needed_orders(db, business_id: Optional[int] = None) -> List[Order]:
+    query = db.query(Order).filter(Order.status.in_(ACTION_NEEDED_STATUSES))
+    if business_id is not None:
+        query = query.filter(Order.business_id == business_id)
+    return query.order_by(Order.created_at.asc()).all()
+
+
+def run_action_reminders() -> None:
+    """Re-ping the business owner on WhatsApp while an order sits waiting on them."""
+    db = SessionLocal()
+    try:
+        now = datetime.utcnow()
+        orders = (
+            db.query(Order)
+            .filter(Order.status.in_(ACTION_NEEDED_STATUSES), Order.action_reminder_count < ACTION_REMINDER_MAX)
+            .all()
+        )
+        if not orders:
+            return
+        businesses = {b.id: b for b in db.query(Business).filter(Business.id.in_({o.business_id for o in orders})).all()}
+        for order in orders:
+            business = businesses.get(order.business_id)
+            if not business or not business.owner_notify_number:
+                continue
+            waiting_since = order.status_changed_at or order.created_at or now
+            last_ping = order.action_reminded_at or waiting_since
+            if now - waiting_since < ACTION_REMINDER_AFTER or now - last_ping < ACTION_REMINDER_AFTER:
+                continue
+            action = ACTION_LABELS.get(order.status, "review")
+            minutes = int((now - waiting_since).total_seconds() // 60)
+            link = order_link(order.id)
+            link_line = f"\n\nOpen: {link}" if link else "\n\nOpen your Recbot dashboard to respond."
+            sent = send_whatsapp_message(
+                business.owner_notify_number,
+                f"⏰ *REMINDER {order.action_reminder_count + 1}/{ACTION_REMINDER_MAX}* — order *#{order.id}* "
+                f"(N{order.total}, {order.customer_name or order.customer_phone}) has been waiting *{minutes} min* "
+                f"for you to {action.lower()}. The customer is on hold until you do.{link_line}",
+                from_number=business.whatsapp_number,
+            )
+            if sent:
+                order.action_reminder_count += 1
+                order.action_reminded_at = now
+        db.commit()
+    finally:
+        db.close()
+
+
+async def action_reminder_loop() -> None:
+    while True:
+        await asyncio.sleep(ACTION_REMINDER_INTERVAL_SECONDS)
+        try:
+            await asyncio.to_thread(run_action_reminders)
+        except Exception:
+            logger.exception("action reminder sweep failed")
+
+
+@app.on_event("startup")
+async def start_action_reminder_loop() -> None:
+    # Only worth running when WhatsApp sending is configured (keeps tests quiet).
+    if os.getenv("TWILIO_ACCOUNT_SID") and os.getenv("TWILIO_AUTH_TOKEN"):
+        asyncio.create_task(action_reminder_loop())
 
 
 RECEIPT_EXTENSIONS = {"image/jpeg": "jpg", "image/png": "png", "application/pdf": "pdf"}
@@ -1030,16 +1314,16 @@ def record_payment_claim(db, business: Business, conversation: Conversation, ord
             order.payment_receipt_path = receipt_filename
     if message.strip():
         order.payment_proof_text = message.strip()
-    order.status = "payment_claimed"
+    set_order_status(order, "payment_claimed")
     conversation.stage = CONV_NEW
     conversation.address = None
     db.commit()
-    if business.owner_notify_number:
-        send_whatsapp_message(
-            business.owner_notify_number,
-            f"💰 New payment claim for order *#{order.id}*: N{order.total} from {order.customer_phone}. Check your bank alert and mark it paid on the dashboard.",
-            from_number=business.whatsapp_number,
-        )
+    notify_owner_action(
+        business,
+        order.id,
+        f"🚨 *ACTION NEEDED — confirm payment*\n\nOrder *#{order.id}*: {order.customer_name or order.customer_phone} says they've paid *N{order.total}*. "
+        f"Check your bank alert for this exact amount, then mark the order paid so it can move forward.",
+    )
     return f"Thanks! We've let *{business.name}* know — they'll confirm your payment shortly. ✅"
 
 
@@ -1265,6 +1549,7 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
             delivery_fee=0,
             address=address,
             status="awaiting_delivery_fee",
+            status_changed_at=datetime.utcnow(),
         )
         db.add(order)
         conversation.cart_json = "[]"
@@ -1272,6 +1557,14 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
         conversation.category_id = None
         conversation.stage = CONV_AWAITING_PAYMENT
         db.commit()
+        notify_owner_action(
+            business,
+            order.id,
+            f"🚨 *ACTION NEEDED — new order #{order.id}*\n\n"
+            f"From: {conversation.customer_name or conversation.phone_number} ({conversation.phone_number})\n"
+            f"{format_cart_lines(cart)}\n*Subtotal:* N{subtotal}\n*Deliver to:* {address}\n\n"
+            f"Set the delivery fee now — the customer can't pay until you do.",
+        )
         name_prefix = f"Thanks, {conversation.customer_name}! " if conversation.customer_name else "Thanks! "
         return (
             f"{name_prefix}Here's your order:\n{format_cart_lines(cart)}\n\n*Subtotal:* N{subtotal}\n*Delivery to:* {address}\n\n"
@@ -1286,7 +1579,7 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
             return reply
         if order.status == "awaiting_delivery_fee":
             if normalized in CANCEL_WORDS:
-                order.status = "cancelled"
+                set_order_status(order, "cancelled")
                 conversation.stage = CONV_NEW
                 conversation.address = None
                 db.commit()
@@ -1294,7 +1587,7 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
             return "We're still confirming your delivery fee — hang tight, we'll send your total and payment details shortly. Reply 'status' anytime, or 'cancel' to cancel this order."
         if order.status == "awaiting_payment":
             if normalized in CANCEL_WORDS:
-                order.status = "cancelled"
+                set_order_status(order, "cancelled")
                 conversation.stage = CONV_NEW
                 conversation.address = None
                 db.commit()
@@ -1341,6 +1634,11 @@ async def webhook(request: Request) -> Response:
         if int(form.get("NumMedia", "0") or 0) > 0:
             media_url = str(form.get("MediaUrl0", ""))
     else:
+        # The JSON body is an unauthenticated test convenience. Once Twilio is
+        # configured, only signed Twilio form posts are accepted — otherwise
+        # anyone could impersonate a customer's phone number.
+        if os.getenv("TWILIO_AUTH_TOKEN") and os.getenv("ALLOW_JSON_WEBHOOK") != "1":
+            return Response(content="JSON webhook disabled in production", status_code=403)
         payload = await request.json()
         from_number = normalize_whatsapp_number(str(payload.get("from", "")))
         message = str(payload.get("message", ""))
@@ -1454,11 +1752,14 @@ def login_page(request: Request) -> HTMLResponse:
 
 
 @app.post("/login")
-def login_submit(response: Response, email: str = Form(...), password: str = Form(...)) -> RedirectResponse:
+def login_submit(request: Request, email: str = Form(...), password: str = Form(...)) -> RedirectResponse:
     db = SessionLocal()
     try:
         user = get_user_by_email(db, email)
         if user and verify_password(password, user.password_hash):
+            if not user.password_hash.startswith("pbkdf2:"):
+                user.password_hash = hash_password(password)
+                db.commit()
             token = create_auth_token(email)
             if user.role == "admin":
                 redirect_url = "/admin/"
@@ -1466,8 +1767,12 @@ def login_submit(response: Response, email: str = Form(...), password: str = For
                 redirect_url = f"/owner/portal" if not user.business_id else f"/business/{user.business_id}/dashboard"
             else:
                 redirect_url = "/"
+            is_https = request.headers.get("x-forwarded-proto", request.url.scheme) == "https"
             redirect = RedirectResponse(url=redirect_url, status_code=303)
-            redirect.set_cookie(key="auth_token", value=token, httponly=True)
+            redirect.set_cookie(
+                key="auth_token", value=token, httponly=True, samesite="lax",
+                secure=is_https, max_age=AUTH_TOKEN_TTL_SECONDS,
+            )
             return redirect
     finally:
         db.close()
@@ -1565,60 +1870,121 @@ def logout(response: Response) -> RedirectResponse:
 
 @app.get("/admin/", response_class=HTMLResponse)
 def admin_dashboard(request: Request) -> HTMLResponse:
+    current_user = get_current_user(request)
+    if not current_user or current_user.role != "admin":
+        return RedirectResponse(url="/login", status_code=303)
     db = SessionLocal()
     try:
         businesses = db.query(Business).order_by(Business.id).all()
-        orders = db.query(Order).order_by(Order.created_at.desc()).limit(10).all()
-        conversations = db.query(Conversation).order_by(Conversation.updated_at.desc()).limit(10).all()
+        business_names = {b.id: b.name for b in businesses}
+        action_orders = action_needed_orders(db)
+        open_orders = db.query(Order).filter(Order.status.in_(ACTIVE_ORDER_STATUSES)).count()
+        today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+        orders_today = db.query(Order).filter(Order.created_at >= today_start).count()
+        revenue_today = sum(
+            o.total for o in db.query(Order)
+            .filter(Order.created_at >= today_start, Order.status.in_(("paid", "out_for_delivery", "delivered")))
+            .all()
+        )
+        recent_orders = db.query(Order).order_by(Order.created_at.desc()).limit(10).all()
+        conversations = db.query(Conversation).order_by(Conversation.updated_at.desc()).limit(8).all()
+
+        action_queue_html = render_action_queue(action_orders, business_names)
+        orders_rows = "".join(
+            render_order_row(order, show_business_name=True, business_name=business_names.get(order.business_id, ""))
+            for order in recent_orders
+        )
+        orders_table = (
+            f"<div class='table-wrap'><table><tr><th>Business</th><th>Order</th><th>Customer</th><th>Address</th><th>Total</th><th>Age</th><th>Status</th></tr>{orders_rows}</table></div>"
+            if recent_orders else "<p class='form-hint'>No orders yet.</p>"
+        )
+        conversation_rows = "".join(
+            f"<tr><td>{escape(business_names.get(conversation.business_id, 'Unknown'))}</td>"
+            f"<td><a href='/conversations/{conversation.id}'>{escape(conversation.phone_number)}</a></td>"
+            f"<td>{escape(CONV_STAGE_LABELS.get(conversation.stage, conversation.stage))}</td>"
+            f"<td>{format_age(conversation.updated_at)}</td></tr>"
+            for conversation in conversations
+        )
+        conversations_table = (
+            f"<div class='table-wrap'><table><tr><th>Business</th><th>Phone</th><th>Stage</th><th>Last active</th></tr>{conversation_rows}</table></div>"
+            if conversations else "<p class='form-hint'>No conversations yet.</p>"
+        )
         business_list = "".join(
             f"<li><a href='/admin/businesses/{business.id}'>{escape(business.name)}</a></li>" for business in businesses
         )
-        order_list = "".join(
-            f"<li>{escape(db.query(Business).filter(Business.id == order.business_id).one_or_none().name or 'Unknown')} — ₦{order.total} — {escape(order.status)}</li>" for order in orders
-        )
-        conversation_list = "".join(
-            f"<li>{escape(conversation.phone_number)} — {escape(conversation.stage)}</li>" for conversation in conversations
-        )
+        action_stat_class = " alert" if action_orders else ""
         body = f"""
-        <div class="hero">
-          <div class="eyebrow">Control tower</div>
-          <h1>Admin command center</h1>
-          <p>Manage every business, owner, order, and conversation from one intelligent workspace.</p>
+        <div class="hero-panel">
+          <div>
+            <div class="eyebrow">Control tower</div>
+            <h1>Admin command center</h1>
+            <p>Anything in the red queue below is blocking a customer right now — clear it first.</p>
+          </div>
+          <div class="actions">
+            <a class="btn primary" href="/admin/orders">All orders</a>
+            <a class="btn" href="/admin/conversations">Conversations</a>
+          </div>
         </div>
-        <div class="grid">
-          <div class="card metric">
+        <div class="stats-grid">
+          <div class="card stat-card metric{action_stat_class}">
+            <span class="label">Needs action now</span>
+            <span class="value">{len(action_orders)}</span>
+          </div>
+          <div class="card stat-card metric">
+            <span class="label">Open orders</span>
+            <span class="value">{open_orders}</span>
+          </div>
+          <div class="card stat-card metric">
+            <span class="label">Orders today</span>
+            <span class="value">{orders_today}</span>
+          </div>
+          <div class="card stat-card metric">
+            <span class="label">Confirmed revenue today</span>
+            <span class="value">₦{revenue_today}</span>
+          </div>
+          <div class="card stat-card metric">
             <span class="label">Businesses</span>
             <span class="value">{len(businesses)}</span>
           </div>
-          <div class="card metric">
-            <span class="label">Orders</span>
-            <span class="value">{len(orders)}</span>
+        </div>
+        <div class="card">
+          <div class="section-head">
+            <h3>⚡ Needs your action</h3>
+            <span class="status-pill">Customers are waiting on these</span>
           </div>
-          <div class="card metric">
-            <span class="label">Conversations</span>
-            <span class="value">{len(conversations)}</span>
+          {action_queue_html}
+        </div>
+        <div class="panel-grid">
+          <div class="card">
+            <div class="section-head">
+              <h3>Recent orders</h3>
+              <a class="btn" href="/admin/orders">View all</a>
+            </div>
+            {orders_table}
+          </div>
+          <div class="card">
+            <div class="section-head">
+              <h3>Live conversations</h3>
+              <a class="btn" href="/admin/conversations">View all</a>
+            </div>
+            {conversations_table}
           </div>
         </div>
         <div class="card">
           <h3>Businesses</h3>
           <ul>{business_list}</ul>
         </div>
-        <div class="card">
-          <h3>Recent Orders</h3>
-          <ul>{order_list}</ul>
-        </div>
-        <div class="card">
-          <h3>Recent Conversations</h3>
-          <ul>{conversation_list}</ul>
-        </div>
         """
     finally:
         db.close()
-    return render_page("Admin Dashboard", body, nav_html=make_nav(get_current_user(request)))
+    return render_page("Admin Dashboard", body, nav_html=make_nav(current_user))
 
 
 @app.get("/admin/users", response_class=HTMLResponse)
 def admin_users(request: Request) -> HTMLResponse:
+    current_user = get_current_user(request)
+    if not current_user or current_user.role != "admin":
+        return RedirectResponse(url="/login", status_code=303)
     db = SessionLocal()
     try:
         users = db.query(User).order_by(User.id).all()
@@ -1695,6 +2061,9 @@ def update_user(request: Request, user_id: int, role: str = Form(...), business_
 
 @app.get("/admin/businesses", response_class=HTMLResponse)
 def admin_businesses(request: Request) -> HTMLResponse:
+    current_user = get_current_user(request)
+    if not current_user or current_user.role != "admin":
+        return RedirectResponse(url="/login", status_code=303)
     db = SessionLocal()
     try:
         businesses = db.query(Business).order_by(Business.id).all()
@@ -1890,7 +2259,7 @@ def purchase_plan(
     auto_renew: Optional[str] = Form(default=None),
 ) -> RedirectResponse:
     current_user = get_current_user(request)
-    if not current_user:
+    if not current_user or (current_user.role != "admin" and current_user.business_id != business_id):
         return RedirectResponse(url="/login", status_code=303)
 
     db = SessionLocal()
@@ -1900,12 +2269,15 @@ def purchase_plan(
         if not business or not plan:
             return RedirectResponse(url=f"/admin/businesses/{business_id}", status_code=303)
         auto_renew_flag = auto_renew == "1"
+        # Capture scalars before commit/close: commit expires ORM instances and
+        # attribute access after close raises DetachedInstanceError.
+        plan_price = plan.price_ngn
         reference = build_paystack_reference(business.id, plan.id)
-        upsert_payment(db, business.id, current_user.email, plan.id, plan.price_ngn, reference, auto_renew_flag)
+        upsert_payment(db, business_id, current_user.email, plan_id, plan_price, reference, auto_renew_flag)
     finally:
         db.close()
 
-    auth_url = get_paystack_redirect(business.id, plan.id, plan.price_ngn, auto_renew_flag, current_user)
+    auth_url = get_paystack_redirect(business_id, plan_id, plan_price, auto_renew_flag, current_user)
     return RedirectResponse(url=auth_url, status_code=303)
 
 
@@ -1916,7 +2288,14 @@ def paystack_simulate(
     amount: int,
     auto_renew: int = 0,
     reference: str = "",
+    request: Request = None,
 ) -> HTMLResponse:
+    # Simulation is a dev fallback only: never available once Paystack is
+    # configured, and only for a logged-in staff user — otherwise anyone who
+    # guesses a reference could activate a paid plan for free.
+    current_user = get_current_user(request) if request else None
+    if os.getenv("PAYSTACK_SECRET_KEY") or not current_user or current_user.role not in {"admin", "business_owner", "business-owner", "owner"}:
+        return RedirectResponse(url="/login", status_code=303)
     db = SessionLocal()
     try:
         payment = db.query(Payment).filter(Payment.reference == reference).one_or_none()
@@ -2151,6 +2530,29 @@ def render_order_row(order: Order, show_business_name: bool = False, business_na
     )
 
 
+def render_action_queue(orders: List[Order], business_names: Optional[Dict[int, str]] = None) -> str:
+    if not orders:
+        return "<div class='empty-state'>✅ All clear — nothing needs your attention right now.</div>"
+    rows = []
+    for order in orders:
+        waiting_since = order.status_changed_at or order.created_at
+        business_cell = (
+            f"<span class='queue-biz'>{escape(business_names.get(order.business_id, ''))}</span>"
+            if business_names else ""
+        )
+        action = ACTION_LABELS.get(order.status, "Review")
+        rows.append(
+            f"<a class='queue-item' href='/orders/{order.id}'>"
+            f"<div class='queue-main'><span class='queue-id'>#{order.id}</span>"
+            f"<span class='queue-customer'>{escape(order.customer_name or order.customer_phone)}</span>{business_cell}</div>"
+            f"<div class='queue-meta'><span class='queue-total'>₦{order.total}</span>"
+            f"<span class='queue-status'>{escape(ORDER_STATUS_LABELS.get(order.status, order.status))}</span>"
+            f"<span class='queue-age'>waiting {format_age(waiting_since)}</span></div>"
+            f"<span class='btn primary queue-cta'>{escape(action)}</span></a>"
+        )
+    return f"<div class='queue-list'>{''.join(rows)}</div>"
+
+
 @app.post("/orders/{order_id}/delivery-fee")
 def set_order_delivery_fee(request: Request, order_id: int, delivery_fee: int = Form(...)) -> RedirectResponse:
     current_user = get_current_user(request)
@@ -2165,7 +2567,7 @@ def set_order_delivery_fee(request: Request, order_id: int, delivery_fee: int = 
         items_subtotal = cart_total(load_cart(order.items_json))
         order.delivery_fee = delivery_fee
         order.total = items_subtotal + delivery_fee
-        order.status = "awaiting_payment"
+        set_order_status(order, "awaiting_payment")
         # If the customer's chat drifted back to idle/menu (e.g. they said "hi"
         # while waiting), snap it to the payment stage so their next reply —
         # even a bare "ok" — is treated as payment confirmation, not menu input.
@@ -2201,7 +2603,7 @@ def mark_order_paid(request: Request, order_id: int) -> RedirectResponse:
             return RedirectResponse(url="/admin/orders", status_code=303)
         if not current_user or (current_user.role != "admin" and current_user.business_id != order.business_id):
             return RedirectResponse(url="/login", status_code=303)
-        order.status = "paid"
+        set_order_status(order, "paid")
         db.commit()
         business = get_business(db, order.business_id)
         send_whatsapp_message(
@@ -2227,7 +2629,7 @@ def dispatch_order(request: Request, order_id: int) -> RedirectResponse:
             return RedirectResponse(url="/admin/orders", status_code=303)
         if not current_user or (current_user.role != "admin" and current_user.business_id != order.business_id):
             return RedirectResponse(url="/login", status_code=303)
-        order.status = "out_for_delivery"
+        set_order_status(order, "out_for_delivery")
         db.commit()
         business = get_business(db, order.business_id)
         send_whatsapp_message(
@@ -2253,7 +2655,7 @@ def mark_order_delivered(request: Request, order_id: int) -> RedirectResponse:
             return RedirectResponse(url="/admin/orders", status_code=303)
         if not current_user or (current_user.role != "admin" and current_user.business_id != order.business_id):
             return RedirectResponse(url="/login", status_code=303)
-        order.status = "delivered"
+        set_order_status(order, "delivered")
         db.commit()
         business = get_business(db, order.business_id)
         send_whatsapp_message(
@@ -2296,6 +2698,39 @@ ORDER_STATUS_LABELS = {
     "delivered": "Delivered",
     "cancelled": "Cancelled",
 }
+
+
+@app.get("/api/action-required")
+def api_action_required(request: Request) -> JSONResponse:
+    current_user = get_current_user(request)
+    if not current_user or current_user.role not in STAFF_ROLES:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    db = SessionLocal()
+    try:
+        if current_user.role == "admin":
+            orders = action_needed_orders(db)
+        elif current_user.business_id:
+            orders = action_needed_orders(db, current_user.business_id)
+        else:
+            orders = []
+        business_names = {b.id: b.name for b in db.query(Business).all()} if orders else {}
+        items = []
+        for order in orders:
+            waiting_since = order.status_changed_at or order.created_at
+            items.append({
+                "id": order.id,
+                "business": business_names.get(order.business_id, ""),
+                "customer": order.customer_name or order.customer_phone,
+                "total": order.total,
+                "status": order.status,
+                "label": ORDER_STATUS_LABELS.get(order.status, order.status),
+                "action": ACTION_LABELS.get(order.status, "Review"),
+                "age": format_age(waiting_since),
+                "url": f"/orders/{order.id}",
+            })
+    finally:
+        db.close()
+    return JSONResponse({"count": len(items), "orders": items})
 
 
 @app.get("/orders/{order_id}", response_class=HTMLResponse)
@@ -2442,7 +2877,7 @@ def admin_orders(request: Request) -> HTMLResponse:
         return RedirectResponse(url="/login", status_code=303)
     db = SessionLocal()
     try:
-        orders = db.query(Order).order_by(Order.created_at.desc()).all()
+        orders = db.query(Order).order_by(Order.created_at.desc()).limit(200).all()
         business_names = {b.id: b.name for b in db.query(Business).all()}
         rows = "".join(render_order_row(order, show_business_name=True, business_name=business_names.get(order.business_id, "")) for order in orders)
     finally:
@@ -2468,7 +2903,7 @@ def admin_conversations(request: Request) -> HTMLResponse:
         return RedirectResponse(url="/login", status_code=303)
     db = SessionLocal()
     try:
-        conversations = db.query(Conversation).order_by(Conversation.updated_at.desc()).all()
+        conversations = db.query(Conversation).order_by(Conversation.updated_at.desc()).limit(200).all()
         business_names = {b.id: b.name for b in db.query(Business).all()}
         rows = "".join(
             f"<tr><td>{escape(business_names.get(conversation.business_id, 'Unknown'))}</td>"
@@ -2557,66 +2992,98 @@ def conversation_detail(request: Request, conversation_id: int) -> HTMLResponse:
 @app.get("/business/{business_id}", response_class=HTMLResponse)
 @app.get("/business/{business_id}/dashboard", response_class=HTMLResponse)
 def business_dashboard(request: Request, business_id: int) -> HTMLResponse:
-    context = get_business_context(business_id)
-    business = context["business"]
-    if not business:
-        return render_page("Business Not Found", "<p>Business not found.</p>", nav_html=make_nav(get_current_user(request)))
-    body = f"""
-    <div class="hero-panel">
-      <div>
-        <div class="eyebrow">Owner workspace</div>
-        <h1>{escape(business.name)} operations</h1>
-        <p>Monitor your outlets, menu portfolio, and customer activity from a streamlined control center.</p>
-      </div>
-      <div class="actions">
-        <a class="btn primary" href="/business/{business.id}/config">Manage setup</a>
-        <a class="btn" href="/admin/businesses/{business.id}">Admin view</a>
-      </div>
-    </div>
-    <div class="stats-grid">
-      <div class="card stat-card metric">
-        <span class="label">Branches</span>
-        <span class="value">{len(context['branches'])}</span>
-      </div>
-      <div class="card stat-card metric">
-        <span class="label">Categories</span>
-        <span class="value">{len(context['categories'])}</span>
-      </div>
-      <div class="card stat-card metric">
-        <span class="label">Menu items</span>
-        <span class="value">{len(context['items'])}</span>
-      </div>
-      <div class="card stat-card metric">
-        <span class="label">Orders tracked</span>
-        <span class="value">{len(context['orders'])}</span>
-      </div>
-    </div>
-    <div class="panel-grid">
-      <div class="card">
-        <div class="section-head">
-          <h3>Quick actions</h3>
-          <span class="status-pill">Fast access</span>
+    current_user = get_current_user(request)
+    if not current_user or (current_user.role != "admin" and current_user.business_id != business_id):
+        return RedirectResponse(url="/login", status_code=303)
+    db = SessionLocal()
+    try:
+        business = get_business(db, business_id)
+        if not business:
+            return render_page("Business Not Found", "<p>Business not found.</p>", nav_html=make_nav(current_user))
+        action_orders = action_needed_orders(db, business_id)
+        open_orders = (
+            db.query(Order)
+            .filter(Order.business_id == business_id, Order.status.in_(ACTIVE_ORDER_STATUSES))
+            .count()
+        )
+        today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+        orders_today = db.query(Order).filter(Order.business_id == business_id, Order.created_at >= today_start).count()
+        revenue_today = sum(
+            o.total for o in db.query(Order)
+            .filter(
+                Order.business_id == business_id,
+                Order.created_at >= today_start,
+                Order.status.in_(("paid", "out_for_delivery", "delivered")),
+            )
+            .all()
+        )
+        recent_orders = (
+            db.query(Order)
+            .filter(Order.business_id == business_id)
+            .order_by(Order.created_at.desc())
+            .limit(10)
+            .all()
+        )
+        item_count = db.query(MenuItem).filter(MenuItem.business_id == business_id).count()
+
+        action_queue_html = render_action_queue(action_orders)
+        orders_rows = "".join(render_order_row(order) for order in recent_orders)
+        orders_table = (
+            f"<div class='table-wrap'><table><tr><th>Order</th><th>Customer</th><th>Address</th><th>Total</th><th>Age</th><th>Status</th></tr>{orders_rows}</table></div>"
+            if recent_orders else "<p class='form-hint'>No orders yet — they'll appear here the moment a customer checks out on WhatsApp.</p>"
+        )
+        action_stat_class = " alert" if action_orders else ""
+        body = f"""
+        <div class="hero-panel">
+          <div>
+            <div class="eyebrow">Owner workspace</div>
+            <h1>{escape(business.name)} operations</h1>
+            <p>Anything in the red queue below is blocking a customer right now — clear it first.</p>
+          </div>
+          <div class="actions">
+            <a class="btn primary" href="/business/{business.id}/config">Manage setup</a>
+            <a class="btn" href="/business/{business.id}/plans">Plans</a>
+          </div>
         </div>
-        <p>Jump into setup, menus, and subscriptions in a single tap.</p>
-        <div class="pill-list">
-          <a class="btn primary" href="/business/{business.id}/config">Configure</a>
-          <a class="btn" href="/business/{business.id}/plans">Plans</a>
+        <div class="stats-grid">
+          <div class="card stat-card metric{action_stat_class}">
+            <span class="label">Needs action now</span>
+            <span class="value">{len(action_orders)}</span>
+          </div>
+          <div class="card stat-card metric">
+            <span class="label">Open orders</span>
+            <span class="value">{open_orders}</span>
+          </div>
+          <div class="card stat-card metric">
+            <span class="label">Orders today</span>
+            <span class="value">{orders_today}</span>
+          </div>
+          <div class="card stat-card metric">
+            <span class="label">Confirmed revenue today</span>
+            <span class="value">₦{revenue_today}</span>
+          </div>
+          <div class="card stat-card metric">
+            <span class="label">Menu items</span>
+            <span class="value">{item_count}</span>
+          </div>
         </div>
-      </div>
-      <div class="card">
-        <div class="section-head">
-          <h3>Recent activity</h3>
-          <span class="status-pill">Live</span>
+        <div class="card">
+          <div class="section-head">
+            <h3>⚡ Needs your action</h3>
+            <span class="status-pill">Customers are waiting on these</span>
+          </div>
+          {action_queue_html}
         </div>
-        <ul>
-          <li>{len(context['items'])} menu items loaded</li>
-          <li>{len(context['orders'])} orders tracked</li>
-          <li>{len(context['branches'])} active branches ready</li>
-        </ul>
-      </div>
-    </div>
-    """
-    return render_page(f"{business.name} Dashboard", body, nav_html=make_nav(get_current_user(request)))
+        <div class="card">
+          <div class="section-head">
+            <h3>Recent orders</h3>
+          </div>
+          {orders_table}
+        </div>
+        """
+    finally:
+        db.close()
+    return render_page(f"{business.name} Dashboard", body, nav_html=make_nav(current_user))
 
 
 @app.get("/business/{business_id}/plans", response_class=HTMLResponse)
