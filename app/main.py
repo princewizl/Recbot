@@ -52,6 +52,10 @@ class Business(Base):
     bank_name = Column(String(255), nullable=True)
     bank_account_number = Column(String(50), nullable=True)
     bank_account_name = Column(String(255), nullable=True)
+    open_time = Column(String(5), nullable=True)
+    close_time = Column(String(5), nullable=True)
+    utc_offset_minutes = Column(Integer, nullable=True)
+    plan_reminder_sent_at = Column(DateTime, nullable=True)
 
 
 class Category(Base):
@@ -202,6 +206,14 @@ def ensure_schema() -> None:
             conn.execute(text("ALTER TABLE orders ADD COLUMN payment_proof_text TEXT"))
         if not has_column("orders", "payment_receipt_path"):
             conn.execute(text("ALTER TABLE orders ADD COLUMN payment_receipt_path VARCHAR(255)"))
+        if not has_column("businesses", "open_time"):
+            conn.execute(text("ALTER TABLE businesses ADD COLUMN open_time VARCHAR(5)"))
+        if not has_column("businesses", "close_time"):
+            conn.execute(text("ALTER TABLE businesses ADD COLUMN close_time VARCHAR(5)"))
+        if not has_column("businesses", "utc_offset_minutes"):
+            conn.execute(text("ALTER TABLE businesses ADD COLUMN utc_offset_minutes INTEGER"))
+        if not has_column("businesses", "plan_reminder_sent_at"):
+            conn.execute(text("ALTER TABLE businesses ADD COLUMN plan_reminder_sent_at DATETIME"))
         if not has_column("orders", "status_changed_at"):
             conn.execute(text("ALTER TABLE orders ADD COLUMN status_changed_at DATETIME"))
         if not has_column("orders", "action_reminder_count"):
@@ -286,6 +298,49 @@ def verify_auth_token(token: str) -> Optional[str]:
         return None
 
 
+# Login brute-force throttle: max attempts per (ip, email) inside the window.
+# In-memory is fine for a single-process deployment.
+LOGIN_MAX_ATTEMPTS = 5
+LOGIN_WINDOW_SECONDS = 900
+_login_attempts: Dict[str, List[float]] = {}
+
+
+def client_ip(request: Request) -> str:
+    forwarded = request.headers.get("x-real-ip") or request.headers.get("x-forwarded-for", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def login_rate_limited(key: str) -> bool:
+    now = time.time()
+    attempts = [t for t in _login_attempts.get(key, []) if now - t < LOGIN_WINDOW_SECONDS]
+    _login_attempts[key] = attempts
+    return len(attempts) >= LOGIN_MAX_ATTEMPTS
+
+
+def record_login_failure(key: str) -> None:
+    _login_attempts.setdefault(key, []).append(time.time())
+
+
+@app.middleware("http")
+async def enforce_same_origin_posts(request: Request, call_next):
+    """CSRF backstop on top of SameSite=Lax cookies: browser form posts carry an
+    Origin/Referer header — reject ones from another site. Webhooks are exempt
+    (they authenticate with signatures), and requests without either header
+    (curl, tests, Twilio) pass through."""
+    if request.method == "POST" and request.url.path not in {"/webhook", "/paystack/webhook"}:
+        source = request.headers.get("origin") or request.headers.get("referer") or ""
+        if source:
+            source_host = source.split("//", 1)[-1].split("/", 1)[0].split(":", 1)[0].lower()
+            request_host = (
+                request.headers.get("x-forwarded-host") or request.headers.get("host", "")
+            ).split(":", 1)[0].lower()
+            if source_host and request_host and source_host != request_host:
+                return Response(content="Cross-origin request blocked", status_code=403)
+    return await call_next(request)
+
+
 def get_user_by_email(db, email: str) -> Optional[User]:
     return db.query(User).filter(User.email == email).one_or_none()
 
@@ -312,6 +367,7 @@ def make_nav(current_user: Optional[User] = None) -> str:
             links.append("<a class='nav-link' href='/admin/orders'>Orders</a>")
             links.append("<a class='nav-link' href='/admin/conversations'>Conversations</a>")
             links.append("<a class='nav-link' href='/admin/businesses'>Businesses</a>")
+            links.append("<a class='nav-link' href='/admin/plans'>Plans & Pricing</a>")
             links.append("<a class='nav-link' href='/admin/users'>Users</a>")
             links.append("<a class='nav-link' href='/register'>Create Owners</a>")
         is_business_owner = current_user.role in {"business_owner", "business-owner", "owner"}
@@ -663,6 +719,9 @@ def render_page(title: str, body: str, nav_html: Optional[str] = None) -> HTMLRe
                     .queue-age {{ color:var(--muted); font-size:.75rem; }}
                     .queue-cta {{ flex-shrink:0; }}
                     .empty-state {{ padding:18px; border:1px dashed var(--border-strong); border-radius:var(--radius-md); color:var(--muted); text-align:center; }}
+                    .notice-banner {{ padding:14px 18px; border:1px solid rgba(255,196,0,.4); border-radius:var(--radius-md); background:rgba(255,196,0,.08); color:#ffd866; font-weight:600; }}
+                    .notice-banner.danger {{ border-color:rgba(255,94,122,.45); background:rgba(255,94,122,.08); color:#ff8fa3; }}
+                    .notice-banner a {{ color:inherit; text-decoration:underline; }}
                     .stat-card.alert {{ border-color:rgba(255,94,122,.5); background:rgba(255,94,122,.07); }}
                     .stat-card.alert .value {{ color:var(--danger); }}
                     .rb-mascot {{ position:fixed; right:20px; bottom:20px; z-index:9999; display:flex; flex-direction:column; align-items:flex-end; gap:10px; }}
@@ -771,6 +830,56 @@ def plan_due_label(business: Business) -> str:
     if business.plan_expiry < datetime.utcnow():
         return "Expired"
     return business.plan_expiry.strftime("%b %d, %Y")
+
+
+DEFAULT_UTC_OFFSET_MINUTES = int(os.getenv("DEFAULT_UTC_OFFSET_MINUTES", "60"))  # WAT (Lagos)
+PLAN_GRACE_DAYS = int(os.getenv("PLAN_GRACE_DAYS", "3"))
+
+
+def business_local_now(business: Business) -> datetime:
+    offset = business.utc_offset_minutes if business.utc_offset_minutes is not None else DEFAULT_UTC_OFFSET_MINUTES
+    return datetime.utcnow() + timedelta(minutes=offset)
+
+
+def parse_hhmm(value: Optional[str]):
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value.strip(), "%H:%M").time()
+    except ValueError:
+        return None
+
+
+def business_is_open(business: Business) -> bool:
+    """True unless both opening hours are set and local time falls outside them.
+
+    Supports overnight windows (e.g. 18:00–02:00).
+    """
+    open_t = parse_hhmm(business.open_time)
+    close_t = parse_hhmm(business.close_time)
+    if not open_t or not close_t or open_t == close_t:
+        return True
+    now_t = business_local_now(business).time()
+    if open_t < close_t:
+        return open_t <= now_t < close_t
+    return now_t >= open_t or now_t < close_t
+
+
+def format_closed_reply(business: Business) -> str:
+    return (
+        f"⏰ *{business.name}* is closed right now.\n\n"
+        f"Opening hours: *{business.open_time}–{business.close_time}* daily. "
+        f"Please message us again then — we'd love to serve you!\n\n"
+        f"(You can still reply 'status' to check an existing order.)" + COLLXCT_FOOTER
+    )
+
+
+def plan_is_blocked(business: Business) -> bool:
+    """A lapsed paid plan blocks new ordering after a grace period. Businesses
+    without an expiry date (trial / admin-managed) are never blocked."""
+    if not business.plan_expiry:
+        return False
+    return datetime.utcnow() > business.plan_expiry + timedelta(days=PLAN_GRACE_DAYS)
 
 
 def initialize_paystack_transaction(email: str, amount_ngn: int, callback_url: str, reference: str) -> Optional[str]:
@@ -1056,11 +1165,55 @@ def run_action_reminders() -> None:
         db.close()
 
 
+def run_plan_reminders() -> None:
+    """Daily WhatsApp nudges when a paid plan is about to expire or has lapsed.
+    Stops 7 days past expiry."""
+    db = SessionLocal()
+    try:
+        now = datetime.utcnow()
+        soon = now + timedelta(days=PLAN_GRACE_DAYS)
+        businesses = db.query(Business).filter(Business.plan_expiry.isnot(None)).all()
+        base = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+        for business in businesses:
+            expiry = business.plan_expiry
+            if not business.owner_notify_number or expiry > soon or now - expiry > timedelta(days=7):
+                continue
+            if business.plan_reminder_sent_at and now - business.plan_reminder_sent_at < timedelta(hours=23):
+                continue
+            renew_line = (
+                f"\n\nRenew: {base}/business/{business.id}/plans" if base
+                else "\n\nRenew from the Plans page on your Recbot dashboard."
+            )
+            if expiry > now:
+                days_left = max(1, (expiry - now).days)
+                message = (
+                    f"⚠️ Your *{business.name}* Recbot plan expires on {expiry.strftime('%b %d')} "
+                    f"(about {days_left} day(s) left). Renew now to keep WhatsApp ordering live.{renew_line}"
+                )
+            elif not plan_is_blocked(business):
+                resume = (expiry + timedelta(days=PLAN_GRACE_DAYS)).strftime("%b %d")
+                message = (
+                    f"🚨 Your *{business.name}* Recbot plan expired on {expiry.strftime('%b %d')}. "
+                    f"WhatsApp ordering pauses on {resume} unless you renew.{renew_line}"
+                )
+            else:
+                message = (
+                    f"🚫 WhatsApp ordering for *{business.name}* is paused — your plan expired on "
+                    f"{expiry.strftime('%b %d')}. Renew to switch it back on.{renew_line}"
+                )
+            if send_whatsapp_message(business.owner_notify_number, message, from_number=business.whatsapp_number):
+                business.plan_reminder_sent_at = now
+        db.commit()
+    finally:
+        db.close()
+
+
 async def action_reminder_loop() -> None:
     while True:
         await asyncio.sleep(ACTION_REMINDER_INTERVAL_SECONDS)
         try:
             await asyncio.to_thread(run_action_reminders)
+            await asyncio.to_thread(run_plan_reminders)
         except Exception:
             logger.exception("action reminder sweep failed")
 
@@ -1380,6 +1533,20 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
         conversation.stage = CONV_NEW
         db.commit()
         return "No problem — cancelled. Reply 'hi' whenever you'd like to start a new order. 👋"
+
+    # Business-hours / subscription gate: status, help, cancel, and payment for
+    # an existing order still work above — but shopping is paused while the
+    # business is closed or its plan has lapsed past the grace period.
+    if conversation.stage in {CONV_NEW, CONV_CATEGORY, CONV_ITEM, CONV_NAME, CONV_ADDRESS}:
+        if plan_is_blocked(business):
+            db.commit()
+            return (
+                f"Sorry, *{business.name}* isn't taking WhatsApp orders right now. "
+                f"Please check back later.{COLLXCT_FOOTER}"
+            )
+        if not business_is_open(business):
+            db.commit()
+            return format_closed_reply(business)
 
     if normalized in GREETING_WORDS and conversation.stage == CONV_AWAITING_PAYMENT and active_order:
         db.commit()
@@ -1752,7 +1919,17 @@ def login_page(request: Request) -> HTMLResponse:
 
 
 @app.post("/login")
-def login_submit(request: Request, email: str = Form(...), password: str = Form(...)) -> RedirectResponse:
+def login_submit(request: Request, email: str = Form(...), password: str = Form(...)):
+    throttle_key = f"{client_ip(request)}|{email.strip().lower()}"
+    if login_rate_limited(throttle_key):
+        body = """
+        <div class="card">
+          <h3>Too many login attempts</h3>
+          <p class="form-hint">For your security, this account is temporarily locked. Try again in about 15 minutes.</p>
+          <div class="form-actions"><a class="btn" href="/login">Back to login</a></div>
+        </div>
+        """
+        return render_page("Too Many Attempts", body, nav_html=make_nav(None))
     db = SessionLocal()
     try:
         user = get_user_by_email(db, email)
@@ -1773,9 +1950,11 @@ def login_submit(request: Request, email: str = Form(...), password: str = Form(
                 key="auth_token", value=token, httponly=True, samesite="lax",
                 secure=is_https, max_age=AUTH_TOKEN_TTL_SECONDS,
             )
+            _login_attempts.pop(throttle_key, None)
             return redirect
     finally:
         db.close()
+    record_login_failure(throttle_key)
     return RedirectResponse(url="/login", status_code=303)
 
 
@@ -2114,8 +2293,13 @@ def create_business(
     return RedirectResponse(url=f"/admin/businesses/{business.id}", status_code=303)
 
 
+NOTICE_MESSAGES = {
+    "branch_limit": "⚠️ Your current plan includes a single branch. Upgrade to a multi-branch plan to add more locations.",
+}
+
+
 @app.get("/admin/businesses/{business_id}", response_class=HTMLResponse)
-def business_detail(request: Request, business_id: int) -> HTMLResponse:
+def business_detail(request: Request, business_id: int, notice: Optional[str] = None) -> HTMLResponse:
     current_user = get_current_user(request)
     if not current_user or (current_user.role != "admin" and current_user.business_id != business_id):
         return RedirectResponse(url="/login", status_code=303)
@@ -2143,7 +2327,12 @@ def business_detail(request: Request, business_id: int) -> HTMLResponse:
     )
     category_options = "".join(f"<option value='{category.id}'>{escape(category.name)}</option>" for category in context["categories"])
     branch_options = "".join(f"<option value='{branch.id}'>{escape(branch.name)}</option>" for branch in context["branches"])
+    notice_html = (
+        f"<div class='notice-banner'>{escape(NOTICE_MESSAGES[notice])}</div>"
+        if notice in NOTICE_MESSAGES else ""
+    )
     body = f"""
+    {notice_html}
     <div class="hero-panel">
       <div>
         <div class="eyebrow">Business control room</div>
@@ -2169,6 +2358,9 @@ def business_detail(request: Request, business_id: int) -> HTMLResponse:
             <input name="bank_name" value="{escape(business.bank_name or '')}" placeholder="Bank name (for customer payments)" />
             <input name="bank_account_number" value="{escape(business.bank_account_number or '')}" placeholder="Bank account number" />
             <input name="bank_account_name" value="{escape(business.bank_account_name or '')}" placeholder="Account holder name" />
+            <label>Opens at <input name="open_time" type="time" value="{escape(business.open_time or '')}" /></label>
+            <label>Closes at <input name="close_time" type="time" value="{escape(business.close_time or '')}" /></label>
+            <p class="form-hint">Leave both times empty to take orders 24/7. Outside these hours the bot politely tells customers you're closed (status checks and pending payments still work). Overnight windows like 18:00–02:00 are supported. Times are in your local time (WAT).</p>
           </div>
           <div class="form-actions">
             <button type="submit">Save</button>
@@ -2335,6 +2527,8 @@ def update_business(
     bank_name: str = Form(default=""),
     bank_account_number: str = Form(default=""),
     bank_account_name: str = Form(default=""),
+    open_time: str = Form(default=""),
+    close_time: str = Form(default=""),
 ) -> RedirectResponse:
     current_user = get_current_user(request)
     if not current_user or (current_user.role != "admin" and current_user.business_id != business_id):
@@ -2349,6 +2543,13 @@ def update_business(
             business.bank_name = bank_name or None
             business.bank_account_number = bank_account_number or None
             business.bank_account_name = bank_account_name or None
+            # Hours only stick when both parse as HH:MM; anything else means 24/7.
+            if parse_hhmm(open_time) and parse_hhmm(close_time):
+                business.open_time = open_time.strip()
+                business.close_time = close_time.strip()
+            else:
+                business.open_time = None
+                business.close_time = None
             db.commit()
     finally:
         db.close()
@@ -2376,6 +2577,16 @@ def create_branch(request: Request, business_id: int, name: str = Form(...), add
         return RedirectResponse(url="/login", status_code=303)
     db = SessionLocal()
     try:
+        business = get_business(db, business_id)
+        if not business:
+            return RedirectResponse(url="/admin/businesses", status_code=303)
+        # Plan gating: single-branch plans (and trial) get one branch. Admins may override.
+        if current_user.role != "admin":
+            plan = get_plan(db, business.plan_id) if business.plan_id else None
+            multi_branch = bool(plan and plan.branch_access == 1)
+            existing = db.query(Branch).filter(Branch.business_id == business_id).count()
+            if not multi_branch and existing >= 1:
+                return RedirectResponse(url=f"/admin/businesses/{business_id}?notice=branch_limit", status_code=303)
         db.add(Branch(business_id=business_id, name=name, address=address or None))
         db.commit()
     finally:
@@ -3032,8 +3243,36 @@ def business_dashboard(request: Request, business_id: int) -> HTMLResponse:
             f"<div class='table-wrap'><table><tr><th>Order</th><th>Customer</th><th>Address</th><th>Total</th><th>Age</th><th>Status</th></tr>{orders_rows}</table></div>"
             if recent_orders else "<p class='form-hint'>No orders yet — they'll appear here the moment a customer checks out on WhatsApp.</p>"
         )
+        plan_banner = ""
+        if business.plan_expiry:
+            now = datetime.utcnow()
+            plans_url = f"/business/{business.id}/plans"
+            if plan_is_blocked(business):
+                plan_banner = (
+                    f"<div class='notice-banner danger'>🚫 Your plan expired on {business.plan_expiry.strftime('%b %d')} and WhatsApp ordering is paused. "
+                    f"<a href='{plans_url}'>Renew now</a> to switch it back on.</div>"
+                )
+            elif business.plan_expiry < now:
+                resume = (business.plan_expiry + timedelta(days=PLAN_GRACE_DAYS)).strftime("%b %d")
+                plan_banner = (
+                    f"<div class='notice-banner danger'>🚨 Your plan has expired — ordering pauses on {resume} unless you "
+                    f"<a href='{plans_url}'>renew</a>.</div>"
+                )
+            elif business.plan_expiry - now <= timedelta(days=PLAN_GRACE_DAYS):
+                plan_banner = (
+                    f"<div class='notice-banner'>⚠️ Your plan expires on {business.plan_expiry.strftime('%b %d')}. "
+                    f"<a href='{plans_url}'>Renew</a> to avoid any pause in ordering.</div>"
+                )
         action_stat_class = " alert" if action_orders else ""
+        if business.open_time and business.close_time:
+            if business_is_open(business):
+                hours_pill = f"<span class='status-pill'>🟢 Open now · {escape(business.open_time)}–{escape(business.close_time)}</span>"
+            else:
+                hours_pill = f"<span class='status-pill' style='background:rgba(255,94,122,.12);border-color:rgba(255,94,122,.3);color:var(--danger);'>🔴 Closed now · opens {escape(business.open_time)}</span>"
+        else:
+            hours_pill = "<span class='status-pill'>🟢 Open 24/7</span>"
         body = f"""
+        {plan_banner}
         <div class="hero-panel">
           <div>
             <div class="eyebrow">Owner workspace</div>
@@ -3041,6 +3280,7 @@ def business_dashboard(request: Request, business_id: int) -> HTMLResponse:
             <p>Anything in the red queue below is blocking a customer right now — clear it first.</p>
           </div>
           <div class="actions">
+            {hours_pill}
             <a class="btn primary" href="/business/{business.id}/config">Manage setup</a>
             <a class="btn" href="/business/{business.id}/plans">Plans</a>
           </div>
@@ -3135,6 +3375,81 @@ def business_plans(request: Request, business_id: int) -> HTMLResponse:
     </form>
     """
     return render_page(f"{business.name} Plans", body, nav_html=make_nav(current_user))
+
+
+@app.get("/admin/plans", response_class=HTMLResponse)
+def admin_plans(request: Request) -> HTMLResponse:
+    current_user = get_current_user(request)
+    if not current_user or current_user.role != "admin":
+        return RedirectResponse(url="/login", status_code=303)
+    db = SessionLocal()
+    try:
+        plans = db.query(Plan).order_by(Plan.price_ngn).all()
+        counts = {
+            plan.id: db.query(Business).filter(Business.plan_id == plan.id).count()
+            for plan in plans
+        }
+        plan_cards = "".join(
+            f"""
+            <div class="card">
+              <div class="section-head">
+                <h3>{escape(plan.name)}</h3>
+                <span class="status-pill">{counts.get(plan.id, 0)} business(es) on this plan</span>
+              </div>
+              <form method="post" action="/admin/plans/{plan.id}">
+                <label>Name <input name="name" value="{escape(plan.name)}" required /></label>
+                <label>Monthly price (₦) <input name="price_ngn" type="number" min="0" value="{plan.price_ngn}" required /></label>
+                <textarea name="description" placeholder="What's included?">{escape(plan.description or '')}</textarea>
+                <label><input type="checkbox" name="branch_access" {"checked" if plan.branch_access == 1 else ""} /> Multi-branch access</label>
+                <div class="form-actions">
+                  <button type="submit">Save plan</button>
+                </div>
+              </form>
+            </div>
+            """
+            for plan in plans
+        )
+    finally:
+        db.close()
+    body = f"""
+    <div class="hero-panel">
+      <div>
+        <div class="eyebrow">Pricing control</div>
+        <h1>Subscription plans</h1>
+        <p>Changes apply to new checkouts immediately. Existing subscriptions keep the price they already paid until renewal.</p>
+      </div>
+    </div>
+    <div class="panel-grid">
+      {plan_cards}
+    </div>
+    """
+    return render_page("Plans & Pricing", body, nav_html=make_nav(current_user))
+
+
+@app.post("/admin/plans/{plan_id}")
+def update_plan(
+    request: Request,
+    plan_id: int,
+    name: str = Form(...),
+    price_ngn: int = Form(...),
+    description: str = Form(default=""),
+    branch_access: Optional[str] = Form(default=None),
+) -> RedirectResponse:
+    current_user = get_current_user(request)
+    if not current_user or current_user.role != "admin":
+        return RedirectResponse(url="/login", status_code=303)
+    db = SessionLocal()
+    try:
+        plan = get_plan(db, plan_id)
+        if plan:
+            plan.name = name
+            plan.price_ngn = max(0, price_ngn)
+            plan.description = description or None
+            plan.branch_access = 1 if branch_access else 0
+            db.commit()
+    finally:
+        db.close()
+    return RedirectResponse(url="/admin/plans", status_code=303)
 
 
 @app.get("/admin/businesses/{business_id}/plans", response_class=HTMLResponse)

@@ -73,6 +73,8 @@ Fill in:
 - `PUBLIC_PORT` — leave as `8443` unless that's taken (check with `ss -ltnp`)
 - `PUBLIC_BASE_URL` → `https://collxct.com.ng:8443` — used to build the clickable order links inside the "ACTION NEEDED" WhatsApp alerts sent to business owners
 - `ACTION_REMINDER_AFTER_MINUTES` / `ACTION_REMINDER_MAX` — how often and how many times an owner gets re-pinged on WhatsApp while an order sits waiting on them (defaults: every 10 minutes, 3 times per stage)
+- `DEFAULT_UTC_OFFSET_MINUTES` — local-time offset for business opening hours (default 60 = WAT/Lagos)
+- `PLAN_GRACE_DAYS` — days a business keeps taking orders after its paid plan expires before the bot pauses ordering (default 3); renewal reminders go out daily from 3 days before expiry until 7 days after
 
 Note on the security hardening (July 2026): once `TWILIO_AUTH_TOKEN` is set, the JSON test form of `/webhook` is disabled (only signed Twilio posts are accepted); `/paystack/simulate` is disabled once `PAYSTACK_SECRET_KEY` is set; and the app logs a warning at boot if `SECRET_KEY` or the seeded admin password are still the built-in defaults.
 

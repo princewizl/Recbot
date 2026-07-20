@@ -157,3 +157,87 @@ def test_action_required_alerts_for_new_order(tmp_path, monkeypatch):
     assert fee_response.status_code == 303
     payload = client.get("/api/action-required").json()
     assert payload["count"] == 0
+
+
+def test_bot_respects_business_hours(tmp_path, monkeypatch):
+    db_path = tmp_path / "test_bot.db"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
+
+    import app.main as main
+    importlib.reload(main)
+    client = TestClient(main.app)
+
+    # Close the seeded demo shop: local "now" is outside a window starting in 1h.
+    db = main.SessionLocal()
+    business = db.query(main.Business).first()
+    local_now = main.business_local_now(business)
+    business.open_time = (local_now + main.timedelta(hours=1)).strftime("%H:%M")
+    business.close_time = (local_now + main.timedelta(hours=2)).strftime("%H:%M")
+    db.commit()
+    db.close()
+
+    phone = "2348012340000"
+    reply = client.post("/webhook", json={"from": phone, "message": "hi"}).json()["reply"]
+    assert "closed" in reply.lower()
+    assert "category" not in reply.lower()
+
+    # Status checks still work while closed.
+    reply = client.post("/webhook", json={"from": phone, "message": "status"}).json()["reply"]
+    assert "closed" not in reply.lower()
+
+    # Reopen (24/7) and ordering resumes.
+    db = main.SessionLocal()
+    business = db.query(main.Business).first()
+    business.open_time = None
+    business.close_time = None
+    db.commit()
+    db.close()
+    reply = client.post("/webhook", json={"from": phone, "message": "hi"}).json()["reply"]
+    assert "category" in reply.lower()
+
+
+def test_single_branch_plan_limit_for_owners(tmp_path, monkeypatch):
+    db_path = tmp_path / "test_bot.db"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
+    monkeypatch.setenv("ADMIN_EMAIL", "admin@example.com")
+    monkeypatch.setenv("ADMIN_PASSWORD", "test-admin-password")
+
+    import app.main as main
+    importlib.reload(main)
+    client = TestClient(main.app)
+
+    client.post("/login", data={"email": "admin@example.com", "password": "test-admin-password"}, follow_redirects=False)
+    create_business = client.post(
+        "/admin/businesses",
+        data={"name": "Solo Kitchen", "whatsapp_number": "+2348000000002"},
+        follow_redirects=False,
+    )
+    business_id = int(create_business.headers["location"].split("/")[-1])
+    client.post("/register", data={"email": "owner@example.com", "password": "owner-pass", "business_id": str(business_id)}, follow_redirects=False)
+    client.get("/logout")
+
+    client.post("/login", data={"email": "owner@example.com", "password": "owner-pass"}, follow_redirects=False)
+    first = client.post(f"/admin/businesses/{business_id}/branches", data={"name": "Main"}, follow_redirects=False)
+    assert first.status_code == 303
+    assert "notice" not in first.headers["location"]
+    second = client.post(f"/admin/businesses/{business_id}/branches", data={"name": "Annex"}, follow_redirects=False)
+    assert second.status_code == 303
+    assert "notice=branch_limit" in second.headers["location"]
+
+
+def test_login_rate_limiting(tmp_path, monkeypatch):
+    db_path = tmp_path / "test_bot.db"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
+    monkeypatch.setenv("ADMIN_EMAIL", "admin@example.com")
+    monkeypatch.setenv("ADMIN_PASSWORD", "test-admin-password")
+
+    import app.main as main
+    importlib.reload(main)
+    client = TestClient(main.app)
+
+    for _ in range(5):
+        response = client.post("/login", data={"email": "admin@example.com", "password": "wrong"}, follow_redirects=False)
+        assert response.status_code == 303
+    locked = client.post("/login", data={"email": "admin@example.com", "password": "test-admin-password"}, follow_redirects=False)
+    assert locked.status_code == 200
+    assert "Too many login attempts" in locked.text
