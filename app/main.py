@@ -8,7 +8,9 @@ import math
 import os
 import re
 import secrets
+import smtplib
 import time
+from email.message import EmailMessage
 from datetime import datetime, timedelta
 from html import escape
 from typing import Dict, List, Optional
@@ -170,6 +172,18 @@ class Payment(Base):
     updated_at = Column(DateTime, default=datetime.utcnow)
 
 
+class ContactMessage(Base):
+    __tablename__ = "contact_messages"
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String(255), nullable=False)
+    business_name = Column(String(255), nullable=True)
+    phone = Column(String(50), nullable=True)
+    email = Column(String(255), nullable=True)
+    message = Column(Text, nullable=False)
+    emailed = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
 Base.metadata.create_all(bind=engine)
 
 
@@ -295,7 +309,7 @@ def ensure_schema() -> None:
 
 ensure_schema()
 
-app = FastAPI(title="Recbot CRM")
+app = FastAPI(title="Collxct")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 SECRET_KEY = os.getenv("SECRET_KEY", "supersecret-key")
 if SECRET_KEY == "supersecret-key":
@@ -374,7 +388,7 @@ def verify_totp(secret: str, code: str, window: int = 1) -> bool:
 
 
 def totp_provisioning_uri(email: str, secret: str) -> str:
-    return f"otpauth://totp/Recbot%20CRM:{email}?secret={secret}&issuer=Recbot%20CRM"
+    return f"otpauth://totp/Collxct:{email}?secret={secret}&issuer=Collxct"
 
 
 def create_pending_2fa_token(email: str) -> str:
@@ -442,6 +456,46 @@ async def enforce_same_origin_posts(request: Request, call_next):
     return await call_next(request)
 
 
+CONTACT_EMAIL = os.getenv("CONTACT_EMAIL", "support@collxct.com.ng")
+ONBOARDING_FEE_NGN = int(os.getenv("ONBOARDING_FEE_NGN", "100000"))
+
+
+def send_email(subject: str, body: str, to_address: str) -> bool:
+    """Send via SMTP configured in env. Returns False (and just logs) when SMTP
+    isn't configured — callers should have their own fallback (we store contact
+    messages in the DB regardless)."""
+    host = os.getenv("SMTP_HOST")
+    if not host:
+        logger.warning("send_email skipped: SMTP_HOST not configured")
+        return False
+    port = int(os.getenv("SMTP_PORT", "587"))
+    username = os.getenv("SMTP_USERNAME", "")
+    password = os.getenv("SMTP_PASSWORD", "")
+    from_address = os.getenv("SMTP_FROM", username or f"no-reply@{host}")
+    use_ssl = os.getenv("SMTP_USE_SSL") == "1"
+    message = EmailMessage()
+    message["Subject"] = subject
+    message["From"] = from_address
+    message["To"] = to_address
+    message.set_content(body)
+    try:
+        if use_ssl:
+            with smtplib.SMTP_SSL(host, port, timeout=15) as server:
+                if username:
+                    server.login(username, password)
+                server.send_message(message)
+        else:
+            with smtplib.SMTP(host, port, timeout=15) as server:
+                server.starttls()
+                if username:
+                    server.login(username, password)
+                server.send_message(message)
+        return True
+    except Exception as exc:
+        logger.error("send_email failed (to=%s): %s", to_address, exc)
+        return False
+
+
 def get_user_by_email(db, email: str) -> Optional[User]:
     return db.query(User).filter(User.email == email).one_or_none()
 
@@ -469,6 +523,7 @@ def make_nav(current_user: Optional[User] = None) -> str:
             links.append("<a class='nav-link' href='/admin/conversations'>Conversations</a>")
             links.append("<a class='nav-link' href='/admin/businesses'>Businesses</a>")
             links.append("<a class='nav-link' href='/admin/plans'>Plans & Pricing</a>")
+            links.append("<a class='nav-link' href='/admin/messages'>Leads</a>")
             links.append("<a class='nav-link' href='/admin/users'>Users</a>")
             links.append("<a class='nav-link' href='/register'>Create Owners</a>")
         is_business_owner = current_user.role in {"business_owner", "business-owner", "owner"}
@@ -503,7 +558,7 @@ MASCOT_WIDGET_HTML = """
 <script src="https://unpkg.com/@dotlottie/player-component@2.7.12/dist/dotlottie-player.mjs" type="module"></script>
 <div id="rb-mascot" class="rb-mascot">
   <div id="rb-bubble" class="rb-bubble">
-    <span id="rb-tip">Hi, I'm Ada! I'll pop up with tips as you work around Recbot CRM.</span>
+    <span id="rb-tip">Hi, I'm Ada! I'll pop up with tips as you work around Collxct.</span>
   </div>
   <button id="rb-toggle" class="rb-toggle" type="button" aria-label="Toggle Ada, your Recbot helper" title="Ada, your Recbot helper">
     <dotlottie-player id="rb-avatar" class="rb-avatar" src="/static/lottie/chatbot.lottie" background="transparent" speed="1" loop autoplay></dotlottie-player>
@@ -516,7 +571,7 @@ MASCOT_WIDGET_HTML = """
   var toggle = document.getElementById("rb-toggle");
   var tipEl = document.getElementById("rb-tip");
   var tips = [
-    "Hi, I'm Ada! I'll pop up with tips as you work around Recbot CRM.",
+    "Hi, I'm Ada! I'll pop up with tips as you work around Collxct.",
     "New business owner? Go to Create Owners and pick their business right from the dropdown — no need to remember ID numbers.",
     "Forgot to attach someone to a business? Open Users, click Edit next to their name, and pick a business anytime.",
     "Add categories and branches on a business's page before adding menu items — it keeps the menu tidy.",
@@ -673,15 +728,17 @@ def render_page(title: str, body: str, nav_html: Optional[str] = None) -> HTMLRe
     <html>
       <head>
         <meta charset="utf-8" />
-        <title>{escape(title)}</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>{escape(title)} · Collxct</title>
+        <link rel="icon" type="image/svg+xml" href="/static/img/logo-icon.svg" />
         <link rel="preconnect" href="https://fonts.googleapis.com" />
         <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
         <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
         <style>
                     :root {{
-                      --bg:#09090b; --surface:#111114; --surface-2:#18181c; --surface-hover:#1f1f25;
-                      --text:#f2f3f5; --muted:#8b8d97; --muted-2:#5f606b;
-                      --primary:#5b7cff; --primary-strong:#7c98ff; --accent:#28d7b6; --danger:#ff5e7a;
+                      --bg:#090c0b; --surface:#101413; --surface-2:#161c1a; --surface-hover:#1c2422;
+                      --text:#f1f5f3; --muted:#8b9792; --muted-2:#5e6a65;
+                      --primary:#10b981; --primary-strong:#34d399; --accent:#f59e0b; --success:#34d399; --danger:#ff5e7a;
                       --border:rgba(255,255,255,.08); --border-strong:rgba(255,255,255,.14);
                       --radius-sm:8px; --radius-md:12px; --radius-lg:18px;
                       --shadow-sm:0 1px 2px rgba(0,0,0,.5); --shadow-md:0 12px 32px rgba(0,0,0,.4);
@@ -691,19 +748,18 @@ def render_page(title: str, body: str, nav_html: Optional[str] = None) -> HTMLRe
                     body {{
                       margin:0; font-family:'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
                       font-size:15px; line-height:1.6; color:var(--text);
-                      background: radial-gradient(1100px circle at 12% -8%, rgba(91,124,255,.12), transparent 55%), radial-gradient(900px circle at 100% 0%, rgba(40,215,182,.07), transparent 50%), var(--bg);
+                      background: radial-gradient(1100px circle at 12% -8%, rgba(16,185,129,.12), transparent 55%), radial-gradient(900px circle at 100% 0%, rgba(245,158,11,.05), transparent 50%), var(--bg);
                     }}
                     .shell {{ display:flex; min-height:100vh; }}
                     .sidebar {{ width:258px; flex-shrink:0; background:var(--surface); border-right:1px solid var(--border); display:flex; flex-direction:column; padding:18px 14px; position:sticky; top:0; height:100vh; overflow-y:auto; }}
-                    .brand {{ display:flex; align-items:center; gap:10px; padding:4px 8px 18px; margin-bottom:10px; border-bottom:1px solid var(--border); }}
-                    .brand-mark {{ width:26px; height:26px; border-radius:7px; background:linear-gradient(135deg,var(--primary),var(--accent)); flex-shrink:0; box-shadow:0 4px 14px rgba(91,124,255,.35); }}
-                    .brand-name {{ font-weight:700; font-size:1.02rem; letter-spacing:-.02em; color:var(--text); }}
+                    .brand {{ display:flex; align-items:center; gap:10px; padding:4px 8px 18px; margin-bottom:10px; border-bottom:1px solid var(--border); text-decoration:none; }}
+                    .brand-logo {{ height:32px; width:auto; display:block; }}
                     .nav-links {{ display:flex; flex-direction:column; gap:2px; }}
                     .nav-link {{ display:flex; align-items:center; gap:9px; padding:9px 11px; border-radius:var(--radius-sm); color:var(--muted); font-weight:500; font-size:.9rem; text-decoration:none; transition:background .15s ease, color .15s ease; }}
                     .nav-link:hover {{ background:var(--surface-2); color:var(--text); }}
                     .nav-footer {{ margin-top:auto; padding-top:14px; border-top:1px solid var(--border); display:flex; flex-direction:column; gap:6px; }}
                     .user-chip {{ display:flex; align-items:center; gap:9px; padding:8px 10px; border-radius:var(--radius-sm); background:var(--surface-2); }}
-                    .user-avatar {{ width:26px; height:26px; border-radius:50%; background:linear-gradient(135deg,var(--primary),var(--accent)); color:#fff; display:flex; align-items:center; justify-content:center; font-size:.72rem; font-weight:700; flex-shrink:0; }}
+                    .user-avatar {{ width:26px; height:26px; border-radius:50%; background:linear-gradient(135deg,#34d399,#059669); color:#fff; display:flex; align-items:center; justify-content:center; font-size:.72rem; font-weight:700; flex-shrink:0; }}
                     .user-email {{ font-size:.82rem; color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
                     .nav-link.logout {{ color:var(--danger); }}
                     .nav-link.logout:hover {{ background:rgba(255,94,122,.1); color:var(--danger); }}
@@ -713,18 +769,18 @@ def render_page(title: str, body: str, nav_html: Optional[str] = None) -> HTMLRe
                     .page-title h1 {{ margin:0; font-size:1.3rem; font-weight:700; letter-spacing:-.01em; color:var(--text); }}
                     .page-title p {{ margin:6px 0 0; color:var(--muted); font-size:.88rem; }}
                     .content {{ padding:28px 32px 64px; max-width:1280px; display:flex; flex-direction:column; gap:22px; width:100%; }}
-                    .hero, .hero-panel, .auth-hero {{ border-radius:var(--radius-lg); border:1px solid var(--border-strong); background:linear-gradient(135deg,#1a2040 0%,#121a30 48%,#0d1220 100%); box-shadow:inset 0 1px 0 rgba(255,255,255,.05), var(--shadow-md); color:var(--text); }}
+                    .hero, .hero-panel, .auth-hero {{ border-radius:var(--radius-lg); border:1px solid var(--border-strong); background:linear-gradient(135deg,#0d2f24 0%,#0a231c 48%,#071710 100%); box-shadow:inset 0 1px 0 rgba(255,255,255,.05), var(--shadow-md); color:var(--text); }}
                     .hero {{ padding:30px; }}
                     .hero h1 {{ margin:0 0 10px; font-size:1.9rem; letter-spacing:-.02em; }}
-                    .hero p {{ margin:0 0 16px; color:#c7cdea; max-width:720px; }}
+                    .hero p {{ margin:0 0 16px; color:#bcd8cc; max-width:720px; }}
                     .hero-panel {{ display:flex; flex-wrap:wrap; justify-content:space-between; align-items:center; gap:18px; padding:28px; }}
                     .hero-panel h1 {{ margin:0 0 8px; font-size:clamp(1.5rem,2.6vw,2.1rem); line-height:1.1; letter-spacing:-.02em; }}
-                    .hero-panel p {{ margin:0; color:#c7cdea; max-width:680px; }}
+                    .hero-panel p {{ margin:0; color:#bcd8cc; max-width:680px; }}
                     .hero-panel .actions {{ display:flex; flex-wrap:wrap; gap:10px; }}
                     .auth-shell {{ display:grid; grid-template-columns:1.05fr .95fr; gap:20px; align-items:stretch; }}
                     .auth-hero {{ padding:26px; display:flex; flex-direction:column; justify-content:center; min-height:320px; }}
                     .auth-hero h2 {{ margin:0 0 10px; font-size:1.6rem; letter-spacing:-.02em; }}
-                    .auth-hero p {{ color:#c7cdea; }}
+                    .auth-hero p {{ color:#bcd8cc; }}
                     .auth-form {{ display:flex; flex-direction:column; gap:10px; }}
                     .auth-form .form-row {{ display:flex; flex-direction:column; gap:8px; }}
                     .form-hint {{ color:var(--muted); font-size:.88rem; margin-top:4px; }}
@@ -759,7 +815,7 @@ def render_page(title: str, body: str, nav_html: Optional[str] = None) -> HTMLRe
                     tbody tr:hover td {{ background:var(--surface-2); }}
                     form {{ margin-top:10px; margin-bottom:14px; }}
                     input, select, textarea {{ display:block; margin-bottom:10px; padding:10px 13px; width:100%; max-width:480px; border:1px solid var(--border-strong); border-radius:var(--radius-sm); background:var(--surface-2); color:var(--text); font-size:.9rem; font-family:inherit; transition:border-color .15s ease, box-shadow .15s ease; }}
-                    input:focus, select:focus, textarea:focus {{ outline:none; border-color:var(--primary); box-shadow:0 0 0 3px rgba(91,124,255,.18); }}
+                    input:focus, select:focus, textarea:focus {{ outline:none; border-color:var(--primary); box-shadow:0 0 0 3px rgba(16,185,129,.18); }}
                     input::placeholder, textarea::placeholder {{ color:var(--muted-2); }}
                     ul {{ margin-left:20px; }}
                     a {{ color:var(--primary-strong); }}
@@ -767,16 +823,16 @@ def render_page(title: str, body: str, nav_html: Optional[str] = None) -> HTMLRe
                     .stack {{ display:flex; flex-direction:column; gap:10px; }}
                     .pill {{ display:inline-block; padding:4px 10px; border-radius:999px; background:var(--surface-2); border:1px solid var(--border); color:var(--muted); font-size:.76rem; font-weight:600; margin-right:6px; }}
                     .form-group {{ margin-bottom:14px; }}
-                    .status-pill {{ display:inline-flex; align-items:center; padding:6px 12px; border-radius:999px; background:rgba(40,215,182,.12); border:1px solid rgba(40,215,182,.3); color:var(--accent); font-weight:600; font-size:.82rem; }}
+                    .status-pill {{ display:inline-flex; align-items:center; padding:6px 12px; border-radius:999px; background:rgba(52,211,153,.12); border:1px solid rgba(52,211,153,.3); color:var(--success); font-weight:600; font-size:.82rem; }}
                     label {{ display:inline-flex; align-items:center; gap:8px; font-weight:500; font-size:.9rem; cursor:pointer; color:var(--text); }}
                     input[type="checkbox"], input[type="radio"] {{ width:auto; display:inline-block; max-width:none; margin:0; }}
                     .plan-grid {{ display:grid; grid-template-columns:repeat(auto-fit, minmax(230px, 1fr)); gap:16px; margin:6px 0; }}
                     .plan-card {{ position:relative; display:flex; flex-direction:column; gap:8px; background:var(--surface); border:1px solid var(--border); border-radius:var(--radius-md); padding:22px; transition:border-color .15s ease, transform .15s ease; }}
                     .plan-card:hover {{ transform:translateY(-2px); border-color:var(--border-strong); }}
-                    .plan-card.active {{ border-color:var(--accent); box-shadow:0 0 0 1px var(--accent); }}
+                    .plan-card.active {{ border-color:var(--success); box-shadow:0 0 0 1px var(--success); }}
                     .plan-card h4 {{ margin:2px 0 0; font-size:1.15rem; }}
                     .plan-card .tag {{ align-self:flex-start; padding:3px 9px; border-radius:999px; background:var(--surface-2); color:var(--muted); font-size:.68rem; text-transform:uppercase; letter-spacing:.08em; font-weight:700; }}
-                    .plan-card.active .tag {{ background:rgba(40,215,182,.15); color:var(--accent); }}
+                    .plan-card.active .tag {{ background:rgba(52,211,153,.15); color:var(--success); }}
                     .plan-card .price {{ font-size:1.7rem; font-weight:800; letter-spacing:-.03em; color:var(--text); }}
                     .plan-card p {{ color:var(--muted); margin:0; font-size:.88rem; }}
                     .plan-card label {{ margin-top:6px; }}
@@ -864,10 +920,9 @@ def render_page(title: str, body: str, nav_html: Optional[str] = None) -> HTMLRe
       <body>
         <div class="shell">
           <aside class="sidebar">
-            <div class="brand">
-              <span class="brand-mark"></span>
-              <span class="brand-name">Recbot</span>
-            </div>
+            <a class="brand" href="/">
+              <img class="brand-logo" src="/static/img/logo-white.svg" alt="Collxct" />
+            </a>
             {nav_html}
           </aside>
           <div class="main-area">
@@ -2170,47 +2225,340 @@ async def webhook(request: Request) -> Response:
 
 
 @app.get("/", response_class=HTMLResponse)
-def homepage(request: Request) -> HTMLResponse:
-    body = """
-    <div class="hero">
-      <div class="eyebrow">Recbot CRM</div>
-      <h1>Run your business from a premium WhatsApp command center.</h1>
-      <p>Launch orders, manage branches, oversee menus, and keep your team aligned with one elegant, high-tech dashboard.</p>
-      <div class="stack">
-        <div>
-          <span class="pill">⚡ Live analytics</span>
-          <span class="pill">📦 Menu control</span>
-          <span class="pill">💬 Conversation flow</span>
+def homepage(request: Request, sent: Optional[str] = None) -> HTMLResponse:
+    db = SessionLocal()
+    try:
+        plans = db.query(Plan).order_by(Plan.price_ngn).all()
+    finally:
+        db.close()
+
+    plan_cards = ""
+    for i, plan in enumerate(plans):
+        featured = " featured" if i == len(plans) - 1 else ""
+        badge = "<span class='lp-plan-badge'>Most popular</span>" if featured else ""
+        cap_line = f"{plan.monthly_order_cap:,} orders/month included" if plan.monthly_order_cap else "Unlimited orders"
+        branch_line = "Multiple branches &amp; locations" if plan.branch_access == 1 else "Single location"
+        plan_cards += f"""
+        <div class="lp-plan{featured}">
+          {badge}
+          <h3>{escape(plan.name)}</h3>
+          <div class="lp-price">₦{plan.price_ngn:,}<span>/month</span></div>
+          <div class="lp-price-alt">or ₦{plan.price_ngn * ANNUAL_MONTHS_CHARGED:,}/year — 2 months free</div>
+          <ul>
+            <li>{cap_line}</li>
+            <li>{branch_line}</li>
+            <li>WhatsApp ordering bot, fully managed</li>
+            <li>Owner alerts &amp; payment confirmation</li>
+            <li>Web dashboard &amp; live order queue</li>
+          </ul>
+          <a class="lp-btn{' lp-btn-primary' if featured else ''}" href="#contact">Get started</a>
         </div>
-        <div>
-          <a class="btn primary" href="/login">Open portal</a>
-        </div>
-      </div>
-    </div>
-    <div class="grid">
-      <div class="card metric">
-        <span class="label">Operations</span>
-        <span class="value">Instant setup</span>
-      </div>
-      <div class="card metric">
-        <span class="label">Automation</span>
-        <span class="value">Smart workflows</span>
-      </div>
-      <div class="card metric">
-        <span class="label">Visibility</span>
-        <span class="value">Real-time overview</span>
-      </div>
-    </div>
-    <div class="card">
-      <h2>What makes this portal feel premium</h2>
-      <ul>
-        <li>Dark, modern dashboard styling with layered cards and glass surfaces</li>
-        <li>Dedicated admin and business-owner experiences</li>
-        <li>Fast onboarding for business owners through the admin console</li>
-      </ul>
-    </div>
+        """
+
+    if sent == "1":
+        contact_notice = "<div class='lp-notice ok'>✅ Thanks — we got your message! We'll reply within one business day.</div>"
+    elif sent == "0":
+        contact_notice = "<div class='lp-notice'>📬 Your message was saved — we'll get back to you shortly.</div>"
+    else:
+        contact_notice = ""
+
+    html = f"""
+    <!DOCTYPE html>
+    <html lang="en">
+      <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>Collxct — Turn WhatsApp into your ordering machine</title>
+        <meta name="description" content="Collxct gives Nigerian businesses a WhatsApp ordering bot: menus, carts, automatic delivery fees, instant Paystack payment links, and a live dashboard." />
+        <link rel="icon" type="image/svg+xml" href="/static/img/logo-icon.svg" />
+        <link rel="preconnect" href="https://fonts.googleapis.com" />
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+        <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet" />
+        <style>
+          :root {{
+            --bg:#090c0b; --surface:#101413; --surface-2:#161c1a; --text:#f1f5f3; --muted:#93a29b;
+            --green:#10b981; --green-strong:#34d399; --gold:#f59e0b;
+            --border:rgba(255,255,255,.08); --border-strong:rgba(255,255,255,.16);
+          }}
+          * {{ box-sizing:border-box; margin:0; }}
+          html {{ scroll-behavior:smooth; }}
+          body {{ font-family:'Inter',system-ui,sans-serif; background:var(--bg); color:var(--text); line-height:1.6; }}
+          .wrap {{ max-width:1100px; margin:0 auto; padding:0 22px; }}
+          .lp-nav {{ position:sticky; top:0; z-index:50; backdrop-filter:blur(12px); background:rgba(9,12,11,.8); border-bottom:1px solid var(--border); }}
+          .lp-nav .wrap {{ display:flex; align-items:center; gap:22px; height:64px; }}
+          .lp-nav img {{ height:30px; display:block; }}
+          .lp-nav a {{ color:var(--muted); text-decoration:none; font-size:.9rem; font-weight:600; }}
+          .lp-nav a:hover {{ color:var(--text); }}
+          .lp-nav .spacer {{ flex:1; }}
+          .lp-btn {{ display:inline-block; padding:11px 20px; border-radius:10px; font-weight:700; font-size:.92rem; text-decoration:none; border:1px solid var(--border-strong); color:var(--text); transition:transform .12s ease, background .15s ease; }}
+          .lp-btn:hover {{ transform:translateY(-1px); background:var(--surface-2); }}
+          .lp-btn-primary {{ background:linear-gradient(135deg,#34d399,#059669); border-color:transparent; color:#03130c; box-shadow:0 8px 24px rgba(16,185,129,.35); }}
+          .lp-hero {{ padding:88px 0 60px; background:radial-gradient(900px circle at 15% 0%, rgba(16,185,129,.16), transparent 55%), radial-gradient(700px circle at 95% 15%, rgba(245,158,11,.08), transparent 50%); }}
+          .lp-hero .wrap {{ display:grid; grid-template-columns:1.15fr .85fr; gap:48px; align-items:center; }}
+          .lp-eyebrow {{ display:inline-block; padding:6px 14px; border-radius:999px; border:1px solid rgba(52,211,153,.35); background:rgba(52,211,153,.1); color:var(--green-strong); font-size:.78rem; font-weight:700; letter-spacing:.06em; text-transform:uppercase; margin-bottom:18px; }}
+          h1 {{ font-size:clamp(2rem,4.6vw,3.3rem); line-height:1.08; letter-spacing:-.03em; font-weight:900; }}
+          h1 .grad {{ background:linear-gradient(90deg,#34d399,#f59e0b); -webkit-background-clip:text; background-clip:text; color:transparent; }}
+          .lp-hero p.sub {{ margin:20px 0 28px; color:var(--muted); font-size:1.08rem; max-width:520px; }}
+          .hero-ctas {{ display:flex; gap:12px; flex-wrap:wrap; }}
+          .hero-facts {{ display:flex; gap:26px; margin-top:34px; flex-wrap:wrap; }}
+          .hero-facts div strong {{ display:block; font-size:1.25rem; letter-spacing:-.02em; }}
+          .hero-facts div span {{ color:var(--muted); font-size:.82rem; }}
+          .phone {{ background:linear-gradient(160deg,#111815,#0b100e); border:1px solid var(--border-strong); border-radius:34px; padding:18px 14px; box-shadow:0 30px 70px rgba(0,0,0,.55), inset 0 1px 0 rgba(255,255,255,.06); max-width:360px; margin-left:auto; width:100%; }}
+          .phone-head {{ display:flex; align-items:center; gap:10px; padding:4px 8px 12px; border-bottom:1px solid var(--border); margin-bottom:12px; }}
+          .phone-avatar {{ width:34px; height:34px; border-radius:50%; background:linear-gradient(135deg,#34d399,#059669); display:flex; align-items:center; justify-content:center; font-weight:800; color:#03130c; }}
+          .phone-head b {{ font-size:.92rem; }} .phone-head small {{ color:var(--green-strong); font-size:.72rem; display:block; }}
+          .bubble {{ max-width:85%; padding:9px 13px; border-radius:14px; font-size:.84rem; margin-bottom:9px; line-height:1.45; }}
+          .them {{ background:var(--surface-2); border:1px solid var(--border); border-bottom-left-radius:4px; }}
+          .me {{ background:#0c3d2c; border:1px solid rgba(52,211,153,.25); margin-left:auto; border-bottom-right-radius:4px; }}
+          section {{ padding:72px 0; }}
+          .sec-head {{ text-align:center; max-width:640px; margin:0 auto 44px; }}
+          .sec-head h2 {{ font-size:clamp(1.5rem,3vw,2.2rem); letter-spacing:-.02em; font-weight:800; }}
+          .sec-head p {{ color:var(--muted); margin-top:10px; }}
+          .feat-grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:16px; }}
+          .feat {{ background:var(--surface); border:1px solid var(--border); border-radius:16px; padding:22px; transition:transform .15s ease, border-color .15s ease; }}
+          .feat:hover {{ transform:translateY(-3px); border-color:rgba(52,211,153,.35); }}
+          .feat .ico {{ font-size:1.5rem; }}
+          .feat h3 {{ font-size:1rem; margin:10px 0 6px; }}
+          .feat p {{ color:var(--muted); font-size:.88rem; }}
+          .steps {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:16px; counter-reset:step; margin-top:26px; }}
+          .step {{ background:var(--bg); border:1px solid var(--border); border-radius:16px; padding:24px; position:relative; }}
+          .step::before {{ counter-increment:step; content:counter(step); position:absolute; top:-14px; left:20px; width:30px; height:30px; border-radius:50%; background:linear-gradient(135deg,#34d399,#059669); color:#03130c; font-weight:800; display:flex; align-items:center; justify-content:center; font-size:.9rem; }}
+          .step h3 {{ font-size:.98rem; margin-bottom:6px; margin-top:4px; }}
+          .step p {{ color:var(--muted); font-size:.86rem; }}
+          .lp-plans {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(250px,1fr)); gap:18px; align-items:stretch; max-width:760px; margin:0 auto; }}
+          .lp-plan {{ background:var(--surface); border:1px solid var(--border); border-radius:18px; padding:28px; display:flex; flex-direction:column; position:relative; }}
+          .lp-plan.featured {{ border-color:rgba(52,211,153,.5); box-shadow:0 0 0 1px rgba(52,211,153,.35), 0 20px 50px rgba(0,0,0,.4); }}
+          .lp-plan-badge {{ position:absolute; top:-12px; right:20px; background:linear-gradient(135deg,#34d399,#059669); color:#03130c; font-size:.7rem; font-weight:800; padding:4px 12px; border-radius:999px; letter-spacing:.04em; }}
+          .lp-plan h3 {{ font-size:1.05rem; }}
+          .lp-price {{ font-size:2rem; font-weight:900; letter-spacing:-.03em; margin-top:8px; }}
+          .lp-price span {{ font-size:.9rem; font-weight:500; color:var(--muted); }}
+          .lp-price-alt {{ color:var(--gold); font-size:.82rem; font-weight:600; margin-bottom:14px; }}
+          .lp-plan ul {{ list-style:none; padding:0; margin:0 0 22px; flex:1; }}
+          .lp-plan li {{ padding:7px 0 7px 26px; position:relative; color:var(--muted); font-size:.88rem; border-bottom:1px solid var(--border); }}
+          .lp-plan li::before {{ content:"✓"; position:absolute; left:2px; color:var(--green-strong); font-weight:800; }}
+          .lp-plan .lp-btn {{ text-align:center; }}
+          .lp-setup {{ margin-top:18px; text-align:center; color:var(--muted); font-size:.9rem; max-width:640px; margin-left:auto; margin-right:auto; }}
+          .lp-setup strong {{ color:var(--gold); }}
+          .req-grid {{ display:grid; grid-template-columns:repeat(auto-fit,minmax(230px,1fr)); gap:14px; }}
+          .req {{ display:flex; gap:12px; align-items:flex-start; background:var(--surface); border:1px solid var(--border); border-radius:14px; padding:16px 18px; }}
+          .req .tick {{ color:var(--green-strong); font-weight:800; }}
+          .req div b {{ font-size:.92rem; display:block; }}
+          .req div span {{ color:var(--muted); font-size:.82rem; }}
+          .contact-grid {{ display:grid; grid-template-columns:1fr 1.1fr; gap:34px; align-items:start; }}
+          .contact-info h2 {{ font-size:1.7rem; letter-spacing:-.02em; margin-bottom:12px; }}
+          .contact-info p {{ color:var(--muted); margin-bottom:16px; }}
+          .contact-card {{ background:var(--bg); border:1px solid var(--border); border-radius:18px; padding:28px; }}
+          .contact-card input, .contact-card textarea {{ width:100%; padding:12px 14px; margin-bottom:12px; border-radius:10px; border:1px solid var(--border-strong); background:var(--surface-2); color:var(--text); font-family:inherit; font-size:.92rem; }}
+          .contact-card input:focus, .contact-card textarea:focus {{ outline:none; border-color:var(--green); box-shadow:0 0 0 3px rgba(16,185,129,.18); }}
+          .contact-card button {{ width:100%; padding:13px; border:none; border-radius:10px; background:linear-gradient(135deg,#34d399,#059669); color:#03130c; font-weight:800; font-size:.95rem; cursor:pointer; font-family:inherit; }}
+          .contact-card button:hover {{ filter:brightness(1.08); }}
+          .lp-notice {{ padding:13px 16px; border-radius:12px; border:1px solid rgba(245,158,11,.4); background:rgba(245,158,11,.08); color:#ffd866; font-size:.9rem; margin-bottom:16px; }}
+          .lp-notice.ok {{ border-color:rgba(52,211,153,.4); background:rgba(52,211,153,.08); color:var(--green-strong); }}
+          .hp-field {{ position:absolute; left:-9999px; opacity:0; height:0; }}
+          footer {{ border-top:1px solid var(--border); padding:34px 0; }}
+          footer .wrap {{ display:flex; align-items:center; gap:18px; flex-wrap:wrap; }}
+          footer img {{ height:26px; }}
+          footer span {{ color:var(--muted); font-size:.84rem; }}
+          footer .spacer {{ flex:1; }}
+          @media (max-width:860px) {{
+            .lp-hero .wrap {{ grid-template-columns:1fr; }}
+            .phone {{ margin:0 auto; }}
+            .contact-grid {{ grid-template-columns:1fr; }}
+            .lp-nav a.hide-sm {{ display:none; }}
+          }}
+        </style>
+      </head>
+      <body>
+        <nav class="lp-nav">
+          <div class="wrap">
+            <a href="/"><img src="/static/img/logo-white.svg" alt="Collxct" /></a>
+            <span class="spacer"></span>
+            <a class="hide-sm" href="#features">Features</a>
+            <a class="hide-sm" href="#how">How it works</a>
+            <a class="hide-sm" href="#pricing">Pricing</a>
+            <a class="hide-sm" href="#contact">Contact</a>
+            <a class="lp-btn" href="/login">Log in</a>
+            <a class="lp-btn lp-btn-primary" href="#contact">Get started</a>
+          </div>
+        </nav>
+
+        <header class="lp-hero">
+          <div class="wrap">
+            <div>
+              <span class="lp-eyebrow">WhatsApp ordering for Nigerian businesses</span>
+              <h1>Turn WhatsApp into your <span class="grad">ordering machine</span>.</h1>
+              <p class="sub">Your customers already live on WhatsApp. Collxct gives them a menu, a cart, automatic delivery fees, and instant payment — while you run everything from one dashboard that won't let an order slip.</p>
+              <div class="hero-ctas">
+                <a class="lp-btn lp-btn-primary" href="#contact">Set up my business</a>
+                <a class="lp-btn" href="#how">See how it works</a>
+              </div>
+              <div class="hero-facts">
+                <div><strong>24–48h</strong><span>to go live</span></div>
+                <div><strong>24/7</strong><span>orders taken for you</span></div>
+                <div><strong>0 missed</strong><span>orders — loud alerts</span></div>
+              </div>
+            </div>
+            <div class="phone">
+              <div class="phone-head">
+                <div class="phone-avatar">C</div>
+                <div><b>Mama Ada's Kitchen</b><small>online</small></div>
+              </div>
+              <div class="bubble me">Hi 👋</div>
+              <div class="bubble them">Hi! 👋 Welcome to <b>Mama Ada's Kitchen</b>.<br />Choose a category:<br /><b>1.</b> Meals&nbsp;&nbsp;<b>2.</b> Drinks</div>
+              <div class="bubble me">1</div>
+              <div class="bubble them"><b>1.</b> Jollof Rice — ₦1,500<br /><b>2.</b> Fried Chicken — ₦2,500</div>
+              <div class="bubble me">1, then checkout</div>
+              <div class="bubble them">Delivery to Lekki Phase 1 is <b>₦1,400</b> (4.2 km).<br />Total: <b>₦2,900</b> — 💳 pay securely: <span style="color:#34d399;">paystack.com/…</span></div>
+              <div class="bubble them">🎉 Payment confirmed! Your order is being prepared.</div>
+            </div>
+          </div>
+        </header>
+
+        <section id="features">
+          <div class="wrap">
+            <div class="sec-head">
+              <h2>Everything the bot does for you</h2>
+              <p>From "hi" to "delivered" — the whole ordering journey runs itself, and pulls you in only when you're truly needed.</p>
+            </div>
+            <div class="feat-grid">
+              <div class="feat"><div class="ico">🛍️</div><h3>Menu &amp; cart on WhatsApp</h3><p>Categories, item descriptions, quantities, and a running cart — customers order by replying with simple numbers.</p></div>
+              <div class="feat"><div class="ico">📍</div><h3>Automatic delivery fees</h3><p>Fees calculated from real distance to the customer's address, priced like ride apps: base fare + per-km. Unmappable address? You set the fee in one tap.</p></div>
+              <div class="feat"><div class="ico">💳</div><h3>Instant payment links</h3><p>Paystack checkout — card, transfer, USSD — confirmed automatically the second the money lands. Prefer bank transfer? That works too.</p></div>
+              <div class="feat"><div class="ico">🚨</div><h3>Alerts you can't miss</h3><p>New orders ring your dashboard with a loud chime until handled, plus WhatsApp pings and reminders every 10 minutes.</p></div>
+              <div class="feat"><div class="ico">⏰</div><h3>Opening hours</h3><p>The bot politely tells customers when you're closed and starts selling again the minute you open. Overnight hours supported.</p></div>
+              <div class="feat"><div class="ico">📦</div><h3>Live order tracking</h3><p>Customers check status anytime; you move orders through paid → out for delivery → delivered with one tap each.</p></div>
+              <div class="feat"><div class="ico">🏪</div><h3>Branches &amp; stock control</h3><p>Multiple locations, per-branch menus, and out-of-stock toggles that update the bot instantly.</p></div>
+              <div class="feat"><div class="ico">🔐</div><h3>Serious security</h3><p>Two-factor authentication, encrypted sessions, and payments that settle straight to your own account — we never hold your money.</p></div>
+            </div>
+          </div>
+        </section>
+
+        <section id="how" style="background:var(--surface); border-top:1px solid var(--border); border-bottom:1px solid var(--border);">
+          <div class="wrap">
+            <div class="sec-head">
+              <h2>Live in four simple steps</h2>
+              <p>No paperwork needed to start — we can launch on a trial while you finish your payment setup.</p>
+            </div>
+            <div class="steps">
+              <div class="step"><h3>Tell us about your business</h3><p>Your WhatsApp number, menu with prices, opening hours, and how you want to get paid.</p></div>
+              <div class="step"><h3>We build your bot</h3><p>Menu, categories, branches, delivery pricing, and payment details — all configured for you.</p></div>
+              <div class="step"><h3>Test it together</h3><p>You place a real order end-to-end and watch it land on your dashboard with the alert chime.</p></div>
+              <div class="step"><h3>Go live in 24–48 hours</h3><p>Share your WhatsApp number everywhere. Orders start flowing; you stay in control.</p></div>
+            </div>
+          </div>
+        </section>
+
+        <section id="pricing">
+          <div class="wrap">
+            <div class="sec-head">
+              <h2>Simple, honest pricing</h2>
+              <p>One-time setup, then a flat monthly plan. WhatsApp messaging costs included — no per-message surprises.</p>
+            </div>
+            <div class="lp-plans">
+              {plan_cards}
+            </div>
+            <p class="lp-setup">+ one-time onboarding &amp; setup fee: <strong>₦{ONBOARDING_FEE_NGN:,}</strong> — covers your menu build, payment setup, and a guided test launch. Order caps are soft: we never block your sales, we just talk about the right plan.</p>
+          </div>
+        </section>
+
+        <section id="requirements" style="padding-top:0;">
+          <div class="wrap">
+            <div class="sec-head">
+              <h2>What we need to onboard you</h2>
+              <p>Have these ready and setup takes a single afternoon.</p>
+            </div>
+            <div class="req-grid">
+              <div class="req"><span class="tick">✓</span><div><b>A WhatsApp number</b><span>The number customers will order from (we can help you set up a business number).</span></div></div>
+              <div class="req"><span class="tick">✓</span><div><b>Your menu &amp; prices</b><span>A simple list or photo is fine — we'll structure it into categories for the bot.</span></div></div>
+              <div class="req"><span class="tick">✓</span><div><b>How you get paid</b><span>Bank account details, or a free Paystack account for instant payment links.</span></div></div>
+              <div class="req"><span class="tick">✓</span><div><b>Opening hours &amp; delivery</b><span>When you sell, where you deliver from, and your delivery pricing (or let us auto-calculate it).</span></div></div>
+            </div>
+          </div>
+        </section>
+
+        <section id="contact" style="background:var(--surface); border-top:1px solid var(--border);">
+          <div class="wrap">
+            <div class="contact-grid">
+              <div class="contact-info">
+                <h2>Ready to stop missing orders?</h2>
+                <p>Tell us about your business and we'll reply within one business day — usually much faster. Prefer email? Write to <a href="mailto:{CONTACT_EMAIL}" style="color:var(--green-strong);">{CONTACT_EMAIL}</a>.</p>
+                <p>We'll walk you through setup, build your menu, and stay with you until your first live orders are flowing.</p>
+              </div>
+              <div class="contact-card">
+                {contact_notice}
+                <form method="post" action="/contact">
+                  <input name="name" placeholder="Your name" required />
+                  <input name="business_name" placeholder="Business name" />
+                  <input name="phone" placeholder="WhatsApp / phone number" required />
+                  <input name="email" type="email" placeholder="Email (optional)" />
+                  <textarea name="message" rows="4" placeholder="Tell us what you sell and where you are…" required></textarea>
+                  <input class="hp-field" type="text" name="website" tabindex="-1" autocomplete="off" />
+                  <button type="submit">Request my setup →</button>
+                </form>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <footer>
+          <div class="wrap">
+            <img src="/static/img/logo-white.svg" alt="Collxct" />
+            <span>WhatsApp ordering, done properly.</span>
+            <span class="spacer"></span>
+            <span><a href="mailto:{CONTACT_EMAIL}" style="color:var(--muted);">{CONTACT_EMAIL}</a> · <a href="/login" style="color:var(--muted);">Portal login</a></span>
+          </div>
+        </footer>
+      </body>
+    </html>
     """
-    return render_page("Recbot CRM", body, nav_html=make_nav(get_current_user(request)))
+    return HTMLResponse(html)
+
+
+@app.post("/contact")
+def contact_submit(
+    request: Request,
+    name: str = Form(...),
+    phone: str = Form(...),
+    message: str = Form(...),
+    business_name: str = Form(default=""),
+    email: str = Form(default=""),
+    website: str = Form(default=""),
+) -> RedirectResponse:
+    # Honeypot: real visitors never fill the invisible "website" field.
+    if website.strip():
+        return RedirectResponse(url="/?sent=1#contact", status_code=303)
+    throttle_key = f"contact|{client_ip(request)}"
+    if login_rate_limited(throttle_key):
+        return RedirectResponse(url="/?sent=0#contact", status_code=303)
+    record_login_failure(throttle_key)
+
+    emailed = False
+    db = SessionLocal()
+    try:
+        entry = ContactMessage(
+            name=name.strip()[:255],
+            business_name=business_name.strip()[:255] or None,
+            phone=phone.strip()[:50] or None,
+            email=email.strip()[:255] or None,
+            message=message.strip()[:4000],
+        )
+        db.add(entry)
+        db.commit()
+        emailed = send_email(
+            subject=f"New Collxct lead: {entry.name}" + (f" ({entry.business_name})" if entry.business_name else ""),
+            body=(
+                f"Name: {entry.name}\nBusiness: {entry.business_name or '-'}\n"
+                f"Phone/WhatsApp: {entry.phone or '-'}\nEmail: {entry.email or '-'}\n\n"
+                f"Message:\n{entry.message}\n\nSent from the Collxct landing page contact form."
+            ),
+            to_address=CONTACT_EMAIL,
+        )
+        if emailed:
+            entry.emailed = 1
+            db.commit()
+    finally:
+        db.close()
+    return RedirectResponse(url=f"/?sent={'1' if emailed else '0'}#contact", status_code=303)
 
 
 @app.get("/owner/portal", response_class=HTMLResponse)
@@ -4006,6 +4354,39 @@ def business_plans(request: Request, business_id: int) -> HTMLResponse:
     </form>
     """
     return render_page(f"{business.name} Plans", body, nav_html=make_nav(current_user))
+
+
+@app.get("/admin/messages", response_class=HTMLResponse)
+def admin_messages(request: Request) -> HTMLResponse:
+    current_user = get_current_user(request)
+    if not current_user or current_user.role != "admin":
+        return RedirectResponse(url="/login", status_code=303)
+    db = SessionLocal()
+    try:
+        messages = db.query(ContactMessage).order_by(ContactMessage.created_at.desc()).limit(200).all()
+        rows = "".join(
+            f"<tr><td>{escape(m.name)}</td><td>{escape(m.business_name or '—')}</td>"
+            f"<td>{escape(m.phone or '—')}</td><td>{escape(m.email or '—')}</td>"
+            f"<td>{escape(m.message[:200])}{'…' if len(m.message) > 200 else ''}</td>"
+            f"<td>{'✅' if m.emailed else '📥'}</td><td>{format_age(m.created_at)}</td></tr>"
+            for m in messages
+        )
+    finally:
+        db.close()
+    table = (
+        f"<div class='table-wrap'><table><tr><th>Name</th><th>Business</th><th>Phone</th><th>Email</th><th>Message</th><th>Emailed</th><th>When</th></tr>{rows}</table></div>"
+        if rows else "<div class='empty-state'>No contact messages yet — they'll appear here when someone uses the website form.</div>"
+    )
+    body = f"""
+    <div class="card">
+      <div class="section-head">
+        <h3>Website leads</h3>
+        <span class="status-pill">✅ = also emailed to {escape(CONTACT_EMAIL)}</span>
+      </div>
+      {table}
+    </div>
+    """
+    return render_page("Leads", body, nav_html=make_nav(current_user))
 
 
 @app.get("/admin/plans", response_class=HTMLResponse)

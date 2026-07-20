@@ -365,6 +365,43 @@ def test_annual_prepay_extends_expiry_a_year(tmp_path, monkeypatch):
     db.close()
 
 
+def test_landing_page_and_contact_form(tmp_path, monkeypatch):
+    db_path = tmp_path / "test_bot.db"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
+
+    import app.main as main
+    importlib.reload(main)
+    client = TestClient(main.app)
+
+    page = client.get("/")
+    assert page.status_code == 200
+    for needle in ["ordering machine", "Simple, honest pricing", "Starter", "Growth", "What we need to onboard you", "Request my setup", "logo-white.svg"]:
+        assert needle in page.text, f"missing: {needle}"
+
+    # Contact form stores the lead (SMTP unconfigured -> sent=0 notice).
+    response = client.post(
+        "/contact",
+        data={"name": "Bola", "phone": "+2348012345678", "message": "I run a suya spot in Yaba", "business_name": "Bola Suya"},
+        follow_redirects=False,
+    )
+    assert response.status_code == 303
+    assert "sent=0" in response.headers["location"]
+    db = main.SessionLocal()
+    lead = db.query(main.ContactMessage).one()
+    assert lead.name == "Bola" and lead.emailed == 0
+    db.close()
+
+    # Honeypot submissions are dropped silently.
+    client.post(
+        "/contact",
+        data={"name": "Bot", "phone": "1", "message": "spam", "website": "http://spam.example"},
+        follow_redirects=False,
+    )
+    db = main.SessionLocal()
+    assert db.query(main.ContactMessage).count() == 1
+    db.close()
+
+
 def test_login_rate_limiting(tmp_path, monkeypatch):
     db_path = tmp_path / "test_bot.db"
     monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")

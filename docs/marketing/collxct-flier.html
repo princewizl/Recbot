@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Collxct flier</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@500;700;800;900&display=swap" rel="stylesheet" />
+<style>
+  * { box-sizing: border-box; margin: 0; }
+  html, body { width: 1080px; height: 1350px; }
+  body {
+    font-family: 'Inter', system-ui, sans-serif; color: #f1f5f3;
+    background:
+      radial-gradient(700px circle at 8% -4%, rgba(16,185,129,.28), transparent 55%),
+      radial-gradient(600px circle at 100% 8%, rgba(245,158,11,.14), transparent 50%),
+      radial-gradient(700px circle at 50% 110%, rgba(16,185,129,.16), transparent 55%),
+      #080c0a;
+    padding: 44px 56px 40px; display: flex; flex-direction: column;
+  }
+  .top { display: flex; align-items: center; gap: 16px; margin-bottom: 24px; }
+  .top svg { height: 48px; width: auto; }
+  .top .tag { margin-left: auto; padding: 9px 18px; border-radius: 999px; border: 2px solid rgba(52,211,153,.45); background: rgba(52,211,153,.12); color: #34d399; font-weight: 800; font-size: 18px; letter-spacing: .04em; }
+  h1 { font-size: 62px; line-height: 1.05; letter-spacing: -.03em; font-weight: 900; margin-bottom: 12px; }
+  h1 .grad { background: linear-gradient(90deg, #34d399, #f59e0b); -webkit-background-clip: text; background-clip: text; color: transparent; }
+  .sub { font-size: 23px; color: #a9b8b0; font-weight: 500; margin-bottom: 24px; max-width: 880px; }
+  .cols { display: grid; grid-template-columns: 1.15fr .85fr; gap: 18px; flex: 1; min-height: 0; }
+  .panel { background: rgba(255,255,255,.035); border: 1.5px solid rgba(255,255,255,.1); border-radius: 22px; padding: 20px 24px; }
+  .panel h2 { font-size: 20px; letter-spacing: .05em; text-transform: uppercase; color: #34d399; margin-bottom: 10px; font-weight: 800; }
+  .panel.gold h2 { color: #f59e0b; }
+  ul { list-style: none; padding: 0; }
+  .does li { font-size: 22.5px; padding: 8px 0 8px 38px; position: relative; font-weight: 600; }
+  .does li::before { content: "✓"; position: absolute; left: 2px; top: 8px; color: #34d399; font-weight: 900; }
+  .does li small { display: block; font-size: 17.5px; color: #93a29b; font-weight: 500; }
+  .price-row { display: flex; align-items: baseline; gap: 10px; padding: 9px 0; border-bottom: 1.5px solid rgba(255,255,255,.09); }
+  .price-row:last-child { border-bottom: none; }
+  .price-row .label { font-size: 21px; font-weight: 700; }
+  .price-row .label small { display: block; font-size: 16px; color: #93a29b; font-weight: 500; }
+  .price-row .amt { margin-left: auto; font-size: 27px; font-weight: 900; letter-spacing: -.02em; color: #fff; white-space: nowrap; }
+  .price-row .amt span { font-size: 16px; color: #93a29b; font-weight: 600; }
+  .annual { margin-top: 8px; font-size: 17.5px; color: #f59e0b; font-weight: 700; }
+  .right-stack { display: flex; flex-direction: column; gap: 18px; }
+  .need li { font-size: 20px; padding: 6px 0 6px 32px; position: relative; font-weight: 600; }
+  .need li::before { content: "•"; position: absolute; left: 8px; color: #f59e0b; font-weight: 900; }
+  .timeline { display: flex; align-items: center; gap: 18px; background: linear-gradient(135deg, rgba(52,211,153,.16), rgba(5,150,105,.1)); border: 2px solid rgba(52,211,153,.4); border-radius: 20px; padding: 16px 24px; margin-top: 18px; }
+  .timeline .big { font-size: 36px; font-weight: 900; letter-spacing: -.02em; color: #34d399; white-space: nowrap; }
+  .timeline p { font-size: 19.5px; color: #cfe0d7; font-weight: 600; line-height: 1.3; }
+  .cta { display: flex; align-items: center; gap: 18px; margin-top: 18px; }
+  .cta .btn { background: linear-gradient(135deg, #34d399, #059669); color: #03130c; font-size: 24px; font-weight: 900; padding: 16px 32px; border-radius: 16px; box-shadow: 0 14px 40px rgba(16,185,129,.4); white-space: nowrap; }
+  .cta .mail { font-size: 21px; color: #cfe0d7; font-weight: 700; }
+  .cta .mail small { display: block; font-size: 16px; color: #93a29b; font-weight: 500; }
+</style>
+</head>
+<body>
+  <div class="top">
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 168 44" fill="none">
+      <defs>
+        <linearGradient id="xg" x1="0%" y1="0%" x2="100%" y2="100%">
+          <stop offset="0%" stop-color="#fcd34d"/><stop offset="100%" stop-color="#f59e0b"/>
+        </linearGradient>
+      </defs>
+      <rect width="44" height="44" rx="12" fill="rgba(255,255,255,0.12)" stroke="rgba(255,255,255,0.35)" stroke-width="1.5"/>
+      <path d="M32,9.5 A12.5,12.5 0 1,0 32,34.5" stroke="white" stroke-width="3.6" stroke-linecap="round" fill="none"/>
+      <path d="M29,6.5 L32,9.5 L35,6.5" stroke="white" stroke-width="2.7" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+      <line x1="7" y1="19.5" x2="31" y2="19.5" stroke="white" stroke-width="2.5" stroke-linecap="round"/>
+      <line x1="7" y1="25" x2="31" y2="25" stroke="white" stroke-width="2.5" stroke-linecap="round"/>
+      <text font-family="Inter,system-ui,sans-serif" font-weight="800" font-size="20" letter-spacing="-0.8">
+        <tspan x="56" y="28" fill="white">coll</tspan><tspan fill="url(#xg)">x</tspan><tspan fill="white">ct</tspan>
+      </text>
+    </svg>
+    <span class="tag">WHATSAPP ORDERING BOT</span>
+  </div>
+
+  <h1>Stop missing orders.<br />Sell on <span class="grad">WhatsApp, 24/7</span>.</h1>
+  <p class="sub">Collxct turns your WhatsApp number into a full ordering machine — menu, cart, delivery fees, and payment — while you get loud alerts the moment you're needed.</p>
+
+  <div class="cols">
+    <div class="panel">
+      <h2>What the bot does</h2>
+      <ul class="does">
+        <li>Takes orders round the clock <small>menu, cart &amp; checkout — customers just reply with numbers</small></li>
+        <li>Calculates delivery fees automatically <small>real distance to the customer, priced like ride apps</small></li>
+        <li>Collects payment instantly <small>Paystack link (card/transfer/USSD) or your bank details</small></li>
+        <li>Alerts you loudly until you respond <small>dashboard chime + WhatsApp reminders — zero missed orders</small></li>
+        <li>Respects your opening hours <small>tells customers when you're closed, sells when you open</small></li>
+        <li>Tracks every order to delivery <small>customers get live status updates automatically</small></li>
+      </ul>
+    </div>
+    <div class="right-stack">
+      <div class="panel gold">
+        <h2>Pricing</h2>
+        <div class="price-row"><div class="label">Setup &amp; onboarding<small>one-time</small></div><div class="amt">₦100,000</div></div>
+        <div class="price-row"><div class="label">Starter<small>1 location · 300 orders/mo</small></div><div class="amt">₦7,500<span>/mo</span></div></div>
+        <div class="price-row"><div class="label">Growth<small>multi-branch · 1,000 orders/mo</small></div><div class="amt">₦20,000<span>/mo</span></div></div>
+        <div class="annual">★ Pay yearly — get 2 months FREE</div>
+      </div>
+      <div class="panel">
+        <h2>To get started, just bring</h2>
+        <ul class="need">
+          <li>Your WhatsApp number</li>
+          <li>Your menu &amp; prices (a photo is fine)</li>
+          <li>Bank account or free Paystack account</li>
+          <li>Your opening hours &amp; delivery area</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+
+  <div class="timeline">
+    <div class="big">24–48 hrs</div>
+    <p>from "hello" to your first live order — no documents or paperwork needed to start. We set everything up and test it with you.</p>
+  </div>
+
+  <div class="cta">
+    <div class="btn">DM us to get started →</div>
+    <div class="mail">support@collxct.com.ng<small>or message the number on this post</small></div>
+  </div>
+</body>
+</html>
