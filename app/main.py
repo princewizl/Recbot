@@ -457,7 +457,8 @@ async def enforce_same_origin_posts(request: Request, call_next):
 
 
 CONTACT_EMAIL = os.getenv("CONTACT_EMAIL", "support@collxct.com.ng")
-ONBOARDING_FEE_NGN = int(os.getenv("ONBOARDING_FEE_NGN", "100000"))
+ONBOARDING_FEE_NGN = int(os.getenv("ONBOARDING_FEE_NGN", "30000"))
+ONBOARDING_FEE_PREMIUM_NGN = int(os.getenv("ONBOARDING_FEE_PREMIUM_NGN", "100000"))
 
 
 def send_email(subject: str, body: str, to_address: str) -> bool:
@@ -2475,7 +2476,7 @@ def homepage(request: Request, sent: Optional[str] = None) -> HTMLResponse:
             <div class="lp-plans">
               {plan_cards}
             </div>
-            <p class="lp-setup">+ one-time onboarding &amp; setup fee: <strong>₦{ONBOARDING_FEE_NGN:,}</strong> — covers your menu build, payment setup, and a guided test launch. Order caps are soft: we never block your sales, we just talk about the right plan.</p>
+            <p class="lp-setup">+ one-time setup: <strong>from ₦{ONBOARDING_FEE_NGN:,}</strong> — covers your menu build, payment setup, and a guided test launch. Established or multi-branch businesses can opt for a fully managed setup (₦{ONBOARDING_FEE_PREMIUM_NGN:,}) where we handle Meta &amp; Paystack registration end to end. Order caps are soft: we never block your sales, we just talk about the right plan.</p>
           </div>
         </section>
 
