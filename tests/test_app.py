@@ -418,3 +418,246 @@ def test_login_rate_limiting(tmp_path, monkeypatch):
     locked = client.post("/login", data={"email": "admin@example.com", "password": "test-admin-password"}, follow_redirects=False)
     assert locked.status_code == 200
     assert "Too many login attempts" in locked.text
+
+
+def _place_demo_order(client):
+    """Drive the seeded demo shop to an order waiting on the business."""
+    phone = "2348012345678"
+    client.post("/webhook", json={"from": phone, "message": "hi"})
+    client.post("/webhook", json={"from": phone, "message": "1"})
+    client.post("/webhook", json={"from": phone, "message": "1"})
+    client.post("/webhook", json={"from": phone, "message": "checkout"})
+    client.post("/webhook", json={"from": phone, "message": "Ada"})
+    client.post("/webhook", json={"from": phone, "message": "12 Marina Road, Lagos"})
+
+
+def test_mobile_api_login_and_order_lifecycle(tmp_path, monkeypatch):
+    db_path = tmp_path / "test_bot.db"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
+    monkeypatch.setenv("ADMIN_EMAIL", "admin@example.com")
+    monkeypatch.setenv("ADMIN_PASSWORD", "test-admin-password")
+
+    import app.main as main
+    importlib.reload(main)
+    client = TestClient(main.app)
+
+    _place_demo_order(client)
+
+    # Wrong password is rejected with a JSON error, not a redirect.
+    bad = client.post("/api/login", json={"email": "admin@example.com", "password": "nope"})
+    assert bad.status_code == 401
+    assert bad.json()["error"] == "invalid_credentials"
+
+    # Correct login hands back a bearer token.
+    login = client.post("/api/login", json={"email": "admin@example.com", "password": "test-admin-password"})
+    assert login.status_code == 200
+    token = login.json()["token"]
+    assert token
+    assert login.json()["user"]["role"] == "admin"
+
+    # No token -> unauthorized; the token authenticates just like the cookie.
+    assert client.get("/api/orders").status_code == 401
+    auth = {"Authorization": f"Bearer {token}"}
+
+    action_required = client.get("/api/action-required", headers=auth).json()
+    assert action_required["count"] == 1
+    order_id = action_required["orders"][0]["id"]
+
+    detail = client.get(f"/api/orders/{order_id}", headers=auth).json()
+    assert detail["status"] == "awaiting_delivery_fee"
+    assert detail["available_actions"] == ["set_delivery_fee"]
+    assert detail["items"] and detail["items"][0]["qty"] >= 1
+
+    # Walk the order all the way through the fulfilment actions.
+    fee = client.post(
+        f"/api/orders/{order_id}/action",
+        headers=auth,
+        json={"action": "set_delivery_fee", "delivery_fee": 500},
+    ).json()
+    assert fee["status"] == "awaiting_payment"
+    assert fee["delivery_fee"] == 500
+    assert fee["available_actions"] == ["mark_paid"]
+
+    # Setting the fee clears the action-required queue.
+    assert client.get("/api/action-required", headers=auth).json()["count"] == 0
+
+    paid = client.post(f"/api/orders/{order_id}/action", headers=auth, json={"action": "mark_paid"}).json()
+    assert paid["status"] == "paid"
+    assert paid["available_actions"] == ["dispatch"]
+
+    dispatched = client.post(f"/api/orders/{order_id}/action", headers=auth, json={"action": "dispatch"}).json()
+    assert dispatched["status"] == "out_for_delivery"
+    assert dispatched["available_actions"] == ["mark_delivered"]
+
+    delivered = client.post(f"/api/orders/{order_id}/action", headers=auth, json={"action": "mark_delivered"}).json()
+    assert delivered["status"] == "delivered"
+    assert delivered["available_actions"] == []
+
+    # A fee action needs a fee; unknown actions are rejected.
+    assert client.post(f"/api/orders/{order_id}/action", headers=auth, json={"action": "teleport"}).status_code == 400
+
+
+def test_mobile_api_device_registration(tmp_path, monkeypatch):
+    db_path = tmp_path / "test_bot.db"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
+    monkeypatch.setenv("ADMIN_EMAIL", "admin@example.com")
+    monkeypatch.setenv("ADMIN_PASSWORD", "test-admin-password")
+
+    import app.main as main
+    importlib.reload(main)
+    client = TestClient(main.app)
+
+    # Registration requires auth.
+    assert client.post("/api/devices", json={"token": "abc"}).status_code == 401
+
+    token = client.post("/api/login", json={"email": "admin@example.com", "password": "test-admin-password"}).json()["token"]
+    auth = {"Authorization": f"Bearer {token}"}
+
+    assert client.post("/api/devices", json={"token": "fcm-token-123"}, headers=auth).json()["ok"] is True
+
+    db = main.SessionLocal()
+    assert db.query(main.DeviceToken).filter(main.DeviceToken.token == "fcm-token-123").count() == 1
+    db.close()
+
+    # Re-registering the same token is idempotent (upsert, not a duplicate row).
+    client.post("/api/devices", json={"token": "fcm-token-123"}, headers=auth)
+    db = main.SessionLocal()
+    assert db.query(main.DeviceToken).count() == 1
+    db.close()
+
+    # Unregister removes it.
+    client.request("DELETE", "/api/devices", json={"token": "fcm-token-123"}, headers=auth)
+    db = main.SessionLocal()
+    assert db.query(main.DeviceToken).count() == 0
+    db.close()
+
+
+def test_push_to_business_is_noop_without_credentials(tmp_path, monkeypatch):
+    db_path = tmp_path / "test_bot.db"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
+    monkeypatch.delenv("FCM_CREDENTIALS_FILE", raising=False)
+
+    import app.main as main
+    importlib.reload(main)
+
+    # With no FCM credentials configured, pushing must be a safe no-op.
+    assert main.push_to_business(1, "hi", "there") == 0
+
+
+def test_legal_pages_render(tmp_path, monkeypatch):
+    db_path = tmp_path / "test_bot.db"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
+
+    import app.main as main
+    importlib.reload(main)
+    client = TestClient(main.app)
+
+    for path, needle in [("/terms", "Terms of Use"), ("/privacy", "Privacy Policy")]:
+        r = client.get(path)
+        assert r.status_code == 200
+        assert needle in r.text
+        assert "not legal advice" in r.text
+
+
+def test_password_reset_flow(tmp_path, monkeypatch):
+    db_path = tmp_path / "test_bot.db"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
+
+    import app.main as main
+    importlib.reload(main)
+    client = TestClient(main.app)
+
+    db = main.SessionLocal()
+    db.add(main.User(email="owner@example.com", password_hash=main.hash_password("old-pass"), role="business_owner"))
+    db.commit()
+    token = main.create_reset_token(main.get_user_by_email(db, "owner@example.com"))
+    db.close()
+
+    # Valid token shows the reset form.
+    page = client.get(f"/reset-password?token={token}")
+    assert page.status_code == 200 and "New password" in page.text
+
+    # Setting a new password succeeds.
+    done = client.post("/reset-password", data={"token": token, "password": "brand-new-pass", "confirm": "brand-new-pass"})
+    assert done.status_code == 200 and "Password updated" in done.text
+
+    # The token is single-use: changing the password invalidates it.
+    assert "Link expired" in client.get(f"/reset-password?token={token}").text
+
+    # The new password works.
+    assert client.post("/api/login", json={"email": "owner@example.com", "password": "brand-new-pass"}).status_code == 200
+
+    # forgot-password never reveals whether an email exists.
+    assert client.post("/api/forgot-password", json={"email": "nobody@example.com"}).json()["ok"] is True
+    assert client.post("/api/forgot-password", json={"email": "owner@example.com"}).json()["ok"] is True
+
+
+def test_paused_business_blocks_new_orders(tmp_path, monkeypatch):
+    db_path = tmp_path / "test_bot.db"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
+    monkeypatch.setenv("ADMIN_EMAIL", "admin@example.com")
+    monkeypatch.setenv("ADMIN_PASSWORD", "test-admin-password")
+
+    import app.main as main
+    importlib.reload(main)
+    client = TestClient(main.app)
+
+    # Open by default: greeting shows the menu.
+    assert "category" in client.post("/webhook", json={"from": "2348012345678", "message": "hi"}).json()["reply"].lower()
+
+    # Pause the business.
+    db = main.SessionLocal()
+    for b in db.query(main.Business).all():
+        b.accepting_orders = 0
+    db.commit()
+    db.close()
+
+    # A new customer is turned away with the paused message.
+    reply = client.post("/webhook", json={"from": "2348019998888", "message": "hi"}).json()["reply"].lower()
+    assert "paused" in reply
+
+    # Resume: ordering works again.
+    db = main.SessionLocal()
+    for b in db.query(main.Business).all():
+        b.accepting_orders = 1
+    db.commit()
+    db.close()
+    assert "category" in client.post("/webhook", json={"from": "2348017776666", "message": "hi"}).json()["reply"].lower()
+
+
+def test_open_close_toggle_web_and_mobile(tmp_path, monkeypatch):
+    db_path = tmp_path / "test_bot.db"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
+    monkeypatch.setenv("ADMIN_EMAIL", "admin@example.com")
+    monkeypatch.setenv("ADMIN_PASSWORD", "test-admin-password")
+
+    import app.main as main
+    importlib.reload(main)
+
+    # Attach a business-owner account to the seeded business.
+    db = main.SessionLocal()
+    business_id = db.query(main.Business).first().id
+    db.add(main.User(email="owner@example.com", password_hash=main.hash_password("owner-pass"),
+                     role="business_owner", business_id=business_id))
+    db.commit()
+    db.close()
+
+    # Mobile API client authenticates by bearer token only (no cookies).
+    api = TestClient(main.app)
+    login = api.post("/api/login", json={"email": "owner@example.com", "password": "owner-pass"})
+    assert login.status_code == 200
+    assert login.json()["user"]["accepting_orders"] is True
+    auth = {"Authorization": f"Bearer {login.json()['token']}"}
+
+    assert api.get("/api/business", headers=auth).json()["accepting_orders"] is True
+
+    # Pause from the app.
+    paused = api.post("/api/business/accepting-orders", headers=auth, json={"accepting_orders": False})
+    assert paused.status_code == 200 and paused.json()["accepting_orders"] is False
+    assert "paused" in api.post("/webhook", json={"from": "2348012345678", "message": "hi"}).json()["reply"].lower()
+
+    # Resume from the web dashboard (separate client so cookies don't clash).
+    web = TestClient(main.app)
+    web.post("/login", data={"email": "admin@example.com", "password": "test-admin-password"}, follow_redirects=False)
+    assert web.post(f"/business/{business_id}/toggle-orders", follow_redirects=False).status_code == 303
+    assert api.get("/api/business", headers=auth).json()["accepting_orders"] is True

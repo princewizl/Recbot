@@ -5,3 +5,7 @@ pytest>=8.0.0
 httpx>=0.27.0
 python-multipart>=0.0.9
 twilio>=9.0.0
+# Optional: push notifications to the Recbot mobile app (Firebase Cloud
+# Messaging). Only loaded at runtime when FCM_CREDENTIALS_FILE is set, so the
+# web app runs fine without it configured.
+firebase-admin>=6.5.0

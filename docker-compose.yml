@@ -10,6 +10,10 @@ services:
       - .env
     volumes:
       - recbot_data:/data
+      # Firebase push key. Copy the key to ./secrets/ on the server (it is
+      # git-ignored and never baked into the image), then set
+      # FCM_CREDENTIALS_FILE=/secrets/firebase-service-account.json in .env.
+      - ./secrets/firebase-service-account.json:/secrets/firebase-service-account.json:ro
     healthcheck:
       test: ["CMD", "curl", "-f", "http://127.0.0.1:8000/health"]
       interval: 30s

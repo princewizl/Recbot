@@ -10,6 +10,11 @@ receipts/
 .env.*
 !.env.example
 
+# Secrets — Firebase service-account keys, never commit
+secrets/
+*firebase-adminsdk*.json
+firebase-service-account.json
+
 # Word temp/lock files
 ~$*
 *-UPDATED.docx

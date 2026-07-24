@@ -1,0 +1,44 @@
+# Flutter/Dart
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+build/
+**/doc/api/
+.pub-cache/
+.pub/
+
+# Machine-specific generated config (paths to the local SDK)
+android/local.properties
+**/ios/Flutter/Generated.xcconfig
+**/ios/Flutter/flutter_export_environment.sh
+**/ios/Flutter/ephemeral/
+**/ios/Flutter/.last_build_id
+
+# Android build junk / signing
+.gradle/
+**/android/captures/
+**/android/**/GeneratedPluginRegistrant.java
+**/android/key.properties
+*.jks
+*.keystore
+
+# iOS build junk
+**/ios/Pods/
+**/ios/.symlinks/
+**/ios/**/xcuserdata/
+**/ios/**/DerivedData/
+**/ios/**/*.pbxuser
+**/ios/Runner/GeneratedPluginRegistrant.*
+
+# Firebase config — each environment supplies its own (not secrets, but
+# per-project); the backend service-account key must NEVER be committed.
+**/google-services.json
+**/GoogleService-Info.plist
+*firebase-adminsdk*.json
+lib/firebase_options.dart
+
+# IDE
+.idea/
+*.iml
+.vscode/

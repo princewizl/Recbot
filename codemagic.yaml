@@ -1,0 +1,76 @@
+# Codemagic CI/CD — builds the Recbot Flutter app in the cloud.
+#
+# Why this exists: iOS apps can only be compiled/signed on macOS. This config
+# lets you build + sign iOS on Codemagic's Mac machines and ship to TestFlight
+# WITHOUT owning a Mac. There's also an Android workflow for convenience.
+#
+# One-time setup in the Codemagic UI (app settings):
+#   1. Connect this git repo.
+#   2. Team integrations → App Store Connect: add an API key (Issuer ID, Key ID,
+#      .p8). This also needs a paid Apple Developer account.
+#   3. Upload the iOS Firebase config as an environment variable:
+#      - var name GOOGLE_SERVICE_INFO_PLIST, "Secure", value = base64 of
+#        GoogleService-Info.plist  (group: firebase)
+#   4. (Android) upload google-services.json similarly if you build Android here.
+#   5. In the Apple Developer portal, enable the "Push Notifications" capability
+#      for App ID com.collxct.recbot, and upload an APNs Auth Key (.p8) to the
+#      Firebase console (Project settings → Cloud Messaging → Apple app config).
+
+workflows:
+  ios-testflight:
+    name: iOS → TestFlight
+    working_directory: mobile
+    instance_type: mac_mini_m2
+    max_build_duration: 60
+    integrations:
+      app_store_connect: Recbot ASC key   # name of the key you added in the UI
+    environment:
+      groups:
+        - firebase
+      flutter: stable
+      xcode: latest
+      cocoapods: default
+      ios_signing:
+        distribution_type: app_store
+        bundle_identifier: com.collxct.recbot
+    scripts:
+      - name: Restore Firebase iOS config
+        script: |
+          echo "$GOOGLE_SERVICE_INFO_PLIST" | base64 --decode > ios/Runner/GoogleService-Info.plist
+      - name: Flutter dependencies
+        script: flutter pub get
+      - name: Set up code signing
+        script: xcode-project use-profiles
+      - name: Build IPA
+        script: |
+          flutter build ipa --release \
+            --export-options-plist=/Users/builder/export_options.plist
+    artifacts:
+      - build/ios/ipa/*.ipa
+    publishing:
+      app_store_connect:
+        auth: integration
+        submit_to_testflight: true
+
+  android-apk:
+    name: Android APK/AAB
+    working_directory: mobile
+    instance_type: mac_mini_m2
+    max_build_duration: 60
+    environment:
+      groups:
+        - firebase
+      flutter: stable
+    scripts:
+      - name: Restore Firebase Android config
+        script: |
+          echo "$GOOGLE_SERVICES_JSON" | base64 --decode > android/app/google-services.json
+      - name: Flutter dependencies
+        script: flutter pub get
+      - name: Build APK (sideload) + AAB (Play Store)
+        script: |
+          flutter build apk --release
+          flutter build appbundle --release
+    artifacts:
+      - build/app/outputs/flutter-apk/*.apk
+      - build/app/outputs/bundle/release/*.aab

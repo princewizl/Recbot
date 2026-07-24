@@ -67,6 +67,10 @@ class Business(Base):
     delivery_autocalc = Column(Integer, nullable=False, default=0)
     delivery_base_fee = Column(Integer, nullable=False, default=0)
     delivery_per_km = Column(Integer, nullable=False, default=0)
+    # Manual open/closed switch owners flip from the dashboard or mobile app.
+    # 1 = accepting orders; 0 = paused (customers can't start new orders). This
+    # is independent of scheduled opening hours (open_time/close_time).
+    accepting_orders = Column(Integer, nullable=False, default=1)
 
 
 class Category(Base):
@@ -172,6 +176,19 @@ class Payment(Base):
     updated_at = Column(DateTime, default=datetime.utcnow)
 
 
+class DeviceToken(Base):
+    """A mobile device registered for push notifications. One row per FCM token;
+    re-registering the same token just refreshes its owner/business/timestamp."""
+    __tablename__ = "device_tokens"
+    id = Column(Integer, primary_key=True, index=True)
+    token = Column(String(512), nullable=False, unique=True, index=True)
+    user_email = Column(String(255), nullable=False, index=True)
+    business_id = Column(Integer, nullable=True, index=True)
+    platform = Column(String(20), nullable=False, default="android")
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow)
+
+
 class ContactMessage(Base):
     __tablename__ = "contact_messages"
     id = Column(Integer, primary_key=True, index=True)
@@ -260,6 +277,8 @@ def ensure_schema() -> None:
             conn.execute(text("ALTER TABLE businesses ADD COLUMN delivery_base_fee INTEGER NOT NULL DEFAULT 0"))
         if not has_column("businesses", "delivery_per_km"):
             conn.execute(text("ALTER TABLE businesses ADD COLUMN delivery_per_km INTEGER NOT NULL DEFAULT 0"))
+        if not has_column("businesses", "accepting_orders"):
+            conn.execute(text("ALTER TABLE businesses ADD COLUMN accepting_orders INTEGER NOT NULL DEFAULT 1"))
         if not has_column("users", "totp_secret"):
             conn.execute(text("ALTER TABLE users ADD COLUMN totp_secret VARCHAR(64)"))
         if not has_column("users", "totp_enabled"):
@@ -413,6 +432,56 @@ def verify_pending_2fa_token(token: str) -> Optional[str]:
         return None
 
 
+# --- Password reset tokens ---
+# Signed with SECRET_KEY + the user's CURRENT password hash, so the link stops
+# working the moment the password changes (single-use) — no server-side state.
+PASSWORD_RESET_TTL_SECONDS = 1800  # 30 minutes
+
+
+def create_reset_token(user: "User") -> str:
+    expires = int(time.time()) + PASSWORD_RESET_TTL_SECONDS
+    payload = f"reset|{user.email}|{expires}"
+    secret = (SECRET_KEY + user.password_hash).encode()
+    signature = hmac.new(secret, payload.encode(), hashlib.sha256).hexdigest()
+    return base64.urlsafe_b64encode(f"{payload}|{signature}".encode()).decode()
+
+
+def verify_reset_token(token: str, db) -> "Optional[User]":
+    try:
+        decoded = base64.urlsafe_b64decode(token.encode()).decode()
+        payload, signature = decoded.rsplit("|", 1)
+        prefix, email, expires = payload.split("|")
+        if prefix != "reset" or int(expires) < time.time():
+            return None
+        user = get_user_by_email(db, email)
+        if not user:
+            return None
+        secret = (SECRET_KEY + user.password_hash).encode()
+        expected = hmac.new(secret, payload.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(signature, expected):
+            return None
+        return user
+    except Exception:
+        return None
+
+
+def send_password_reset_email(user: "User") -> None:
+    """Generate a reset link and email it. No-op-safe when SMTP is unconfigured."""
+    base = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+    token = create_reset_token(user)
+    link = f"{base}/reset-password?token={token}" if base else f"/reset-password?token={token}"
+    send_email(
+        "Reset your Recbot password",
+        (
+            "We received a request to reset your Recbot password.\n\n"
+            f"Reset it here (valid for 30 minutes):\n{link}\n\n"
+            "If you didn't request this, you can safely ignore this email — your "
+            "password won't change."
+        ),
+        user.email,
+    )
+
+
 # Login brute-force throttle: max attempts per (ip, email) inside the window.
 # In-memory is fine for a single-process deployment.
 LOGIN_MAX_ATTEMPTS = 5
@@ -503,6 +572,11 @@ def get_user_by_email(db, email: str) -> Optional[User]:
 
 def get_current_user(request: Request) -> Optional[User]:
     token = request.cookies.get("auth_token")
+    if not token:
+        # Mobile clients authenticate with a bearer token instead of the cookie.
+        auth_header = request.headers.get("authorization", "")
+        if auth_header.lower().startswith("bearer "):
+            token = auth_header[7:].strip()
     if not token:
         return None
     email = verify_auth_token(token)
@@ -1035,6 +1109,15 @@ def format_closed_reply(business: Business) -> str:
     )
 
 
+def format_paused_reply(business: Business) -> str:
+    """Shown when the owner has manually paused orders (accepting_orders = 0)."""
+    return (
+        f"🔕 *{business.name}* has paused new orders for the moment. "
+        f"Please check back a little later — we'd love to serve you!\n\n"
+        f"(You can still reply 'status' to check an existing order.)" + COLLXCT_FOOTER
+    )
+
+
 def plan_is_blocked(business: Business) -> bool:
     """A lapsed paid plan blocks new ordering after a grace period. Businesses
     without an expiry date (trial / admin-managed) are never blocked."""
@@ -1407,11 +1490,96 @@ def order_link(order_id: int) -> str:
 
 
 def notify_owner_action(business: Business, order_id: int, headline: str) -> None:
-    if not business or not business.owner_notify_number:
+    if not business:
+        return
+    # Push to the mobile app first — it reaches the owner even with the phone
+    # locked and the app closed, and doesn't depend on a WhatsApp notify number.
+    push_to_business(
+        business.id,
+        "🚨 Order needs action",
+        _push_body_from_headline(headline),
+        {"type": "action_required", "order_id": str(order_id), "business_id": str(business.id)},
+    )
+    if not business.owner_notify_number:
         return
     link = order_link(order_id)
     link_line = f"\n\nOpen: {link}" if link else "\n\nOpen your Recbot dashboard to respond."
     send_whatsapp_message(business.owner_notify_number, headline + link_line, from_number=business.whatsapp_number)
+
+
+# --- Push notifications (Firebase Cloud Messaging, HTTP v1 via firebase-admin) ---
+# The whole subsystem is optional: when FCM_CREDENTIALS_FILE is unset or the
+# firebase-admin package isn't installed, every push call is a silent no-op so
+# the web app and tests run unchanged.
+_fcm_app = None
+_fcm_init_attempted = False
+
+
+def _get_fcm_app():
+    global _fcm_app, _fcm_init_attempted
+    if _fcm_init_attempted:
+        return _fcm_app
+    _fcm_init_attempted = True
+    cred_path = os.getenv("FCM_CREDENTIALS_FILE", "").strip()
+    if not cred_path or not os.path.exists(cred_path):
+        logger.info("Push disabled: FCM_CREDENTIALS_FILE unset or file missing (%s)", cred_path or "unset")
+        return None
+    try:
+        import firebase_admin
+        from firebase_admin import credentials
+        _fcm_app = firebase_admin.initialize_app(credentials.Certificate(cred_path))
+        logger.info("Push enabled: firebase-admin initialised from %s", cred_path)
+    except Exception as exc:  # pragma: no cover - depends on optional package
+        logger.error("Push init failed: %s", exc)
+        _fcm_app = None
+    return _fcm_app
+
+
+def _push_body_from_headline(headline: str) -> str:
+    """Turn a multi-line, markdown-ish WhatsApp headline into a short push body."""
+    first_line = (headline or "").replace("*", "").strip().splitlines()
+    text = first_line[0] if first_line else "Open Recbot to respond."
+    return text[:180]
+
+
+def push_to_business(business_id: Optional[int], title: str, body: str, data: Optional[Dict[str, str]] = None) -> int:
+    """Send a push to every device registered for a business. Returns the number
+    of devices reached. No-op (returns 0) when push is not configured."""
+    if business_id is None or _get_fcm_app() is None:
+        return 0
+    db = SessionLocal()
+    try:
+        tokens = [d.token for d in db.query(DeviceToken).filter(DeviceToken.business_id == business_id).all()]
+        if not tokens:
+            return 0
+        try:
+            from firebase_admin import messaging
+            message = messaging.MulticastMessage(
+                tokens=tokens,
+                notification=messaging.Notification(title=title, body=body),
+                data={k: str(v) for k, v in (data or {}).items()},
+                android=messaging.AndroidConfig(
+                    priority="high",
+                    notification=messaging.AndroidNotification(channel_id="orders", sound="default"),
+                ),
+            )
+            resp = messaging.send_each_for_multicast(message)
+        except Exception as exc:  # pragma: no cover - depends on optional package
+            logger.error("push_to_business send failed (business=%s): %s", business_id, exc)
+            return 0
+        # Prune tokens FCM reports as permanently dead so the table stays clean.
+        stale = []
+        for tok, r in zip(tokens, resp.responses):
+            if not r.success:
+                code = getattr(getattr(r, "exception", None), "code", "") or ""
+                if "not-registered" in str(code) or "invalid-argument" in str(code):
+                    stale.append(tok)
+        if stale:
+            db.query(DeviceToken).filter(DeviceToken.token.in_(stale)).delete(synchronize_session=False)
+            db.commit()
+        return resp.success_count
+    finally:
+        db.close()
 
 
 def month_start_utc() -> datetime:
@@ -1912,6 +2080,9 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
                 f"Sorry, *{business.name}* isn't taking WhatsApp orders right now. "
                 f"Please check back later.{COLLXCT_FOOTER}"
             )
+        if not business.accepting_orders:
+            db.commit()
+            return format_paused_reply(business)
         if not business_is_open(business):
             db.commit()
             return format_closed_reply(business)
@@ -2100,6 +2271,13 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
             if business.payment_method == "paystack":
                 create_paystack_order_link(business, order)
                 db.commit()
+            push_to_business(
+                business.id,
+                "🆕 New order",
+                f"Order #{order.id} from {conversation.customer_name or conversation.phone_number} "
+                f"— auto-priced ₦{auto['fee']}. Waiting on the customer to pay.",
+                {"type": "new_order", "order_id": str(order.id), "business_id": str(business.id)},
+            )
             if business.owner_notify_number:
                 link = order_link(order.id)
                 link_line = f"\nOpen: {link}" if link else ""
@@ -2571,7 +2749,7 @@ def homepage(request: Request, sent: Optional[str] = None) -> HTMLResponse:
             <img src="/static/img/logo-white.svg" alt="Collxct" />
             <span>WhatsApp ordering, done properly.</span>
             <span class="spacer"></span>
-            <span><a href="mailto:{CONTACT_EMAIL}" style="color:var(--muted);">{CONTACT_EMAIL}</a> · <a href="/login" style="color:var(--muted);">Portal login</a></span>
+            <span><a href="mailto:{CONTACT_EMAIL}" style="color:var(--muted);">{CONTACT_EMAIL}</a> · <a href="/login" style="color:var(--muted);">Portal login</a> · <a href="/terms" style="color:var(--muted);">Terms</a> · <a href="/privacy" style="color:var(--muted);">Privacy</a></span>
           </div>
         </footer>
       </body>
@@ -2643,6 +2821,302 @@ def owner_portal(request: Request) -> HTMLResponse:
     return render_page("Owner Portal", body, nav_html=make_nav(current_user))
 
 
+LEGAL_LAST_UPDATED = "24 July 2026"
+
+
+def _legal_note() -> str:
+    return (
+        "<div class='notice-banner'>These documents are provided as a starting template for "
+        "Collxct / Recbot and are <strong>not legal advice</strong>. Please have them reviewed "
+        "by a qualified lawyer before you rely on them, and tailor them to your final data flows.</div>"
+    )
+
+
+@app.get("/terms", response_class=HTMLResponse)
+def terms_page(request: Request) -> HTMLResponse:
+    body = f"""
+    <div class="card" style="max-width:820px;margin:0 auto;">
+      <h1>Terms of Use</h1>
+      <p class="form-hint">Last updated: {LEGAL_LAST_UPDATED}</p>
+      {_legal_note()}
+
+      <h3>1. Agreement</h3>
+      <p>These Terms govern your access to and use of Recbot, the WhatsApp ordering and order-management
+      service operated by Collxct (“Collxct”, “we”, “us”), including the web portal and the mobile app.
+      By creating an account or using the service you agree to these Terms. If you do not agree, do not use the service.</p>
+
+      <h3>2. The service</h3>
+      <p>Recbot lets a business receive and manage customer orders placed over WhatsApp, price deliveries,
+      collect payments through third-party providers, and receive order alerts. Features may change over time.</p>
+
+      <h3>3. Accounts &amp; eligibility</h3>
+      <p>You must be at least 18 and authorised to act for your business. You are responsible for your login
+      credentials and for all activity under your account. Tell us immediately of any unauthorised use.</p>
+
+      <h3>4. Your responsibilities</h3>
+      <p>You are the business selling to your customers. You are responsible for: the accuracy of your menu,
+      prices and delivery fees; fulfilling orders; only selling lawful goods and services; and complying with all
+      laws that apply to you, including consumer-protection and data-protection law. In relation to your customers'
+      personal data, you are the data controller and Collxct acts as your processor for order handling.</p>
+
+      <h3>5. Acceptable use</h3>
+      <p>You must not use Recbot for anything illegal, deceptive, or abusive; to send spam; to sell prohibited
+      goods; or to attempt to disrupt, reverse-engineer, or gain unauthorised access to the service.</p>
+
+      <h3>6. Fees, subscriptions &amp; payments</h3>
+      <p>Onboarding/setup fees and subscription plan prices are shown before you buy. Subscription billing is
+      recurring for the cycle you choose and is processed by our payment partner (Paystack). Except where the law
+      requires otherwise, fees are non-refundable. We may change pricing on reasonable notice.</p>
+
+      <h3>7. Third-party services</h3>
+      <p>Recbot relies on third parties including Meta/WhatsApp, Twilio, Paystack, Google Firebase and
+      OpenStreetMap. Your use of features that depend on them is also subject to their terms, and we are not
+      responsible for their acts or omissions.</p>
+
+      <h3>8. Intellectual property</h3>
+      <p>Collxct owns the service, its software, and its branding. We grant you a limited, non-exclusive,
+      non-transferable licence to use it while your account is active. Your business content remains yours.</p>
+
+      <h3>9. Availability &amp; “as is”</h3>
+      <p>The service is provided “as is” and “as available” without warranties of any kind. We do not
+      guarantee uninterrupted or error-free operation, or that every message or notification will be delivered.</p>
+
+      <h3>10. Limitation of liability</h3>
+      <p>To the maximum extent permitted by law, Collxct is not liable for indirect, incidental, or
+      consequential losses, or for lost profits, revenue, goodwill, or data. Our total liability for any claim is
+      limited to the fees you paid us in the 3 months before the claim.</p>
+
+      <h3>11. Indemnity</h3>
+      <p>You agree to indemnify Collxct against claims arising from your use of the service, your goods or
+      services, or your breach of these Terms or of the law.</p>
+
+      <h3>12. Suspension &amp; termination</h3>
+      <p>We may suspend or terminate access for breach of these Terms or non-payment. You may stop using the
+      service at any time; certain terms survive termination.</p>
+
+      <h3>13. Governing law</h3>
+      <p>These Terms are governed by the laws of the Federal Republic of Nigeria, and disputes are subject to the
+      jurisdiction of the courts of Lagos State, without prejudice to any mandatory consumer rights you have where
+      you live.</p>
+
+      <h3>14. Changes</h3>
+      <p>We may update these Terms; the “last updated” date will change and continued use means acceptance.</p>
+
+      <h3>15. Contact</h3>
+      <p>Questions? Email <a href="mailto:{CONTACT_EMAIL}">{CONTACT_EMAIL}</a>. See also our
+      <a href="/privacy">Privacy Policy</a>.</p>
+    </div>
+    """
+    return render_page("Terms of Use", body, nav_html=make_nav(get_current_user(request)))
+
+
+@app.get("/privacy", response_class=HTMLResponse)
+def privacy_page(request: Request) -> HTMLResponse:
+    body = f"""
+    <div class="card" style="max-width:820px;margin:0 auto;">
+      <h1>Privacy Policy</h1>
+      <p class="form-hint">Last updated: {LEGAL_LAST_UPDATED}</p>
+      {_legal_note()}
+
+      <h3>1. Scope</h3>
+      <p>This policy explains how Collxct (“we”) handles personal data through Recbot's web portal and mobile
+      app. We aim to comply with the Nigeria Data Protection Act 2023 (NDPA) and, where it applies, the EU/UK GDPR.</p>
+
+      <h3>2. Who we are</h3>
+      <p>Collxct is the data controller for business-account data and the processor for the customer order data
+      your business handles through Recbot. Contact: <a href="mailto:{CONTACT_EMAIL}">{CONTACT_EMAIL}</a>.</p>
+
+      <h3>3. Information we collect</h3>
+      <ul>
+        <li><strong>Account &amp; business data:</strong> your name, email, password (hashed), business name,
+        WhatsApp number, bank/payout details, opening hours and location.</li>
+        <li><strong>Customer order data:</strong> customer phone number, name, delivery address, and order
+        contents that pass through the ordering flow.</li>
+        <li><strong>Payment data:</strong> payment references and status from our payment partner (we do not
+        store full card details).</li>
+        <li><strong>Mobile device data:</strong> a push-notification token so we can alert you to orders.</li>
+        <li><strong>Technical data:</strong> logs, IP address, and basic usage needed to run and secure the service.</li>
+      </ul>
+
+      <h3>4. How and why we use it</h3>
+      <p>To provide and operate the ordering service; to route and price orders; to send you order alerts
+      (including push notifications); to process subscriptions and payments; to provide support; to keep the
+      service secure; and to meet legal obligations.</p>
+
+      <h3>5. Legal bases</h3>
+      <p>Depending on the case: performance of our contract with you; your consent (e.g. push notifications, which
+      you can withdraw); our legitimate interests in running and securing the service; and compliance with legal
+      obligations.</p>
+
+      <h3>6. Sharing &amp; processors</h3>
+      <p>We share data only as needed with service providers who process it on our behalf, including: Twilio
+      (WhatsApp messaging), Paystack (payments), Google Firebase (push notifications), OpenStreetMap/Nominatim
+      (address geocoding), our email provider, and our hosting provider. We do not sell personal data.</p>
+
+      <h3>7. International transfers</h3>
+      <p>Some processors are outside Nigeria. Where data is transferred abroad, we rely on appropriate safeguards
+      as required by the NDPA/GDPR.</p>
+
+      <h3>8. Retention</h3>
+      <p>We keep personal data only as long as needed for the purposes above or as the law requires, then delete
+      or anonymise it.</p>
+
+      <h3>9. Security</h3>
+      <p>We use measures such as encryption in transit, hashed passwords, access controls and optional two-factor
+      authentication. No system is perfectly secure, but we work to protect your data.</p>
+
+      <h3>10. Your rights</h3>
+      <p>Subject to law, you may request access to, correction of, or deletion of your personal data; object to or
+      restrict certain processing; withdraw consent; and request portability. You may also complain to the Nigeria
+      Data Protection Commission (NDPC), or your local regulator.</p>
+
+      <h3>11. Deleting your account &amp; data</h3>
+      <p>You can ask us to delete your account and associated personal data by emailing
+      <a href="mailto:{CONTACT_EMAIL}">{CONTACT_EMAIL}</a>; in-app account deletion is also being added. We will
+      action requests within the timelines the law requires, subject to any records we must keep.</p>
+
+      <h3>12. Push notifications</h3>
+      <p>The mobile app sends order alerts via push. You can turn these off in your device settings or by signing
+      out, which removes the device from alerting.</p>
+
+      <h3>13. Cookies</h3>
+      <p>The web portal uses a strictly necessary session cookie to keep you signed in. We do not use advertising
+      cookies.</p>
+
+      <h3>14. Children</h3>
+      <p>Recbot is for businesses and is not directed to children under 18.</p>
+
+      <h3>15. Changes</h3>
+      <p>We may update this policy; the “last updated” date will change.</p>
+
+      <h3>16. Contact</h3>
+      <p>For any privacy request, email <a href="mailto:{CONTACT_EMAIL}">{CONTACT_EMAIL}</a>. See also our
+      <a href="/terms">Terms of Use</a>.</p>
+    </div>
+    """
+    return render_page("Privacy Policy", body, nav_html=make_nav(get_current_user(request)))
+
+
+@app.get("/forgot-password", response_class=HTMLResponse)
+def forgot_password_page(request: Request) -> HTMLResponse:
+    body = """
+    <div class="auth-shell">
+      <div class="auth-hero">
+        <div class="eyebrow">Recbot CRM</div>
+        <h2>Forgot your password?</h2>
+        <p>Enter your email and we'll send you a link to reset it.</p>
+      </div>
+      <div class="card auth-form">
+        <h2>Reset password</h2>
+        <form method="post" action="/forgot-password">
+          <div class="form-row">
+            <input name="email" type="email" placeholder="Email" required />
+          </div>
+          <div class="form-actions">
+            <button type="submit">Send reset link</button>
+            <a class="btn" href="/login">Back to login</a>
+          </div>
+        </form>
+      </div>
+    </div>
+    """
+    return render_page("Forgot Password", body, nav_html=make_nav(None))
+
+
+@app.post("/forgot-password")
+def forgot_password_submit(request: Request, email: str = Form(...)):
+    throttle_key = f"reset|{client_ip(request)}|{email.strip().lower()}"
+    if not login_rate_limited(throttle_key):
+        record_login_failure(throttle_key)
+        db = SessionLocal()
+        try:
+            user = get_user_by_email(db, email)
+            if user:
+                send_password_reset_email(user)
+        finally:
+            db.close()
+    # Always the same confirmation — never reveal whether the email has an account.
+    body = """
+    <div class="card">
+      <h3>Check your email</h3>
+      <p class="form-hint">If an account exists for that address, we've sent a link to reset your password. It expires in 30 minutes.</p>
+      <div class="form-actions"><a class="btn" href="/login">Back to login</a></div>
+    </div>
+    """
+    return render_page("Check your email", body, nav_html=make_nav(None))
+
+
+@app.get("/reset-password", response_class=HTMLResponse)
+def reset_password_page(request: Request, token: str = "") -> HTMLResponse:
+    db = SessionLocal()
+    try:
+        user = verify_reset_token(token, db)
+    finally:
+        db.close()
+    if not user:
+        body = """
+        <div class="card">
+          <h3>Link expired</h3>
+          <p class="form-hint">This reset link is invalid or has expired. Please request a new one.</p>
+          <div class="form-actions"><a class="btn" href="/forgot-password">Request new link</a></div>
+        </div>
+        """
+        return render_page("Link expired", body, nav_html=make_nav(None))
+    body = f"""
+    <div class="auth-shell">
+      <div class="auth-hero">
+        <div class="eyebrow">Recbot CRM</div>
+        <h2>Set a new password</h2>
+        <p>Choose a strong password you don't use elsewhere.</p>
+      </div>
+      <div class="card auth-form">
+        <h2>New password</h2>
+        <form method="post" action="/reset-password">
+          <input type="hidden" name="token" value="{escape(token)}" />
+          <div class="form-row">
+            <input name="password" type="password" placeholder="New password" minlength="8" required />
+            <input name="confirm" type="password" placeholder="Confirm new password" minlength="8" required />
+          </div>
+          <div class="form-actions">
+            <button type="submit">Update password</button>
+          </div>
+        </form>
+      </div>
+    </div>
+    """
+    return render_page("Reset Password", body, nav_html=make_nav(None))
+
+
+@app.post("/reset-password")
+def reset_password_submit(request: Request, token: str = Form(...), password: str = Form(...), confirm: str = Form(...)):
+    db = SessionLocal()
+    try:
+        user = verify_reset_token(token, db)
+        if not user:
+            return RedirectResponse(url="/forgot-password", status_code=303)
+        if password != confirm or len(password) < 8:
+            body = f"""
+            <div class="card">
+              <h3>Please try again</h3>
+              <p class="form-hint">Use at least 8 characters and make sure both fields match.</p>
+              <div class="form-actions"><a class="btn" href="/reset-password?token={escape(token)}">Back</a></div>
+            </div>
+            """
+            return render_page("Try again", body, nav_html=make_nav(None))
+        user.password_hash = hash_password(password)
+        db.commit()
+    finally:
+        db.close()
+    body = """
+    <div class="card">
+      <h3>Password updated ✅</h3>
+      <p class="form-hint">You can now sign in with your new password.</p>
+      <div class="form-actions"><a class="btn primary" href="/login">Go to login</a></div>
+    </div>
+    """
+    return render_page("Password updated", body, nav_html=make_nav(None))
+
+
 @app.get("/login", response_class=HTMLResponse)
 def login_page(request: Request) -> HTMLResponse:
     body = """
@@ -2664,6 +3138,7 @@ def login_page(request: Request) -> HTMLResponse:
             <button type="submit">Login</button>
           </div>
         </form>
+        <p class="form-hint" style="margin-top:14px;"><a href="/forgot-password">Forgot your password?</a></p>
       </div>
     </div>
     """
@@ -3752,17 +4227,14 @@ def render_action_queue(orders: List[Order], business_names: Optional[Dict[int, 
     return f"<div class='queue-list'>{''.join(rows)}</div>"
 
 
-@app.post("/orders/{order_id}/delivery-fee")
-def set_order_delivery_fee(request: Request, order_id: int, delivery_fee: int = Form(...)) -> RedirectResponse:
-    current_user = get_current_user(request)
-    db = SessionLocal()
-    try:
-        order = db.query(Order).filter(Order.id == order_id).one_or_none()
-        if not order:
-            return RedirectResponse(url="/admin/orders", status_code=303)
-        if not current_user or (current_user.role != "admin" and current_user.business_id != order.business_id):
-            return RedirectResponse(url="/login", status_code=303)
-        business = get_business(db, order.business_id)
+# Order actions shared by the web dashboard (form-post handlers below) and the
+# mobile JSON API (/api/orders/{id}/action). Each mutates the order, commits,
+# and fires the customer-facing WhatsApp message. Returns (ok, error_code).
+def apply_order_action(db, order: Order, business: Optional[Business], action: str,
+                       delivery_fee: Optional[int] = None) -> "tuple[bool, str]":
+    if action == "set_delivery_fee":
+        if delivery_fee is None:
+            return False, "missing_delivery_fee"
         items_subtotal = cart_total(load_cart(order.items_json))
         order.delivery_fee = delivery_fee
         order.total = items_subtotal + delivery_fee
@@ -3780,18 +4252,64 @@ def set_order_delivery_fee(request: Request, order_id: int, delivery_fee: int = 
         if conversation and conversation.stage in (CONV_NEW, CONV_CATEGORY):
             conversation.stage = CONV_AWAITING_PAYMENT
         db.commit()
-
         send_whatsapp_message(
             order.customer_phone,
             format_payment_request(order, business) + COLLXCT_FOOTER,
             from_number=business.whatsapp_number if business else None,
         )
-        business_id = order.business_id
-    finally:
-        db.close()
+        return True, ""
+    if action == "mark_paid":
+        set_order_status(order, "paid")
+        db.commit()
+        send_whatsapp_message(
+            order.customer_phone,
+            f"🎉 Payment confirmed for order *#{order.id}*! *{business.name if business else 'The business'}* is preparing your order now.{COLLXCT_FOOTER}",
+            from_number=business.whatsapp_number if business else None,
+        )
+        return True, ""
+    if action == "dispatch":
+        set_order_status(order, "out_for_delivery")
+        db.commit()
+        send_whatsapp_message(
+            order.customer_phone,
+            f"🚴 Your order *#{order.id}* is on its way!",
+            from_number=business.whatsapp_number if business else None,
+        )
+        return True, ""
+    if action == "mark_delivered":
+        set_order_status(order, "delivered")
+        db.commit()
+        send_whatsapp_message(
+            order.customer_phone,
+            f"✅ Order *#{order.id}* delivered. Thanks for ordering from *{business.name if business else 'us'}*!{COLLXCT_FOOTER}",
+            from_number=business.whatsapp_number if business else None,
+        )
+        return True, ""
+    return False, "unknown_action"
+
+
+def _order_action_dashboard_redirect(current_user: User, business_id: int) -> RedirectResponse:
     if current_user.role == "admin":
         return RedirectResponse(url="/admin/orders", status_code=303)
     return RedirectResponse(url=f"/business/{business_id}/dashboard", status_code=303)
+
+
+@app.post("/orders/{order_id}/delivery-fee")
+def set_order_delivery_fee(request: Request, order_id: int, delivery_fee: int = Form(...)) -> RedirectResponse:
+    current_user = get_current_user(request)
+    db = SessionLocal()
+    try:
+        order = db.query(Order).filter(Order.id == order_id).one_or_none()
+        if not order:
+            return RedirectResponse(url="/admin/orders", status_code=303)
+        if not current_user or (current_user.role != "admin" and current_user.business_id != order.business_id):
+            return RedirectResponse(url="/login", status_code=303)
+        business = get_business(db, order.business_id)
+        apply_order_action(db, order, business, "set_delivery_fee", delivery_fee=delivery_fee)
+        business_id = order.business_id
+    finally:
+        db.close()
+    return _order_action_dashboard_redirect(current_user, business_id)
 
 
 @app.post("/orders/{order_id}/mark-paid")
@@ -3804,20 +4322,12 @@ def mark_order_paid(request: Request, order_id: int) -> RedirectResponse:
             return RedirectResponse(url="/admin/orders", status_code=303)
         if not current_user or (current_user.role != "admin" and current_user.business_id != order.business_id):
             return RedirectResponse(url="/login", status_code=303)
-        set_order_status(order, "paid")
-        db.commit()
         business = get_business(db, order.business_id)
-        send_whatsapp_message(
-            order.customer_phone,
-            f"🎉 Payment confirmed for order *#{order.id}*! *{business.name if business else 'The business'}* is preparing your order now.{COLLXCT_FOOTER}",
-            from_number=business.whatsapp_number if business else None,
-        )
+        apply_order_action(db, order, business, "mark_paid")
         business_id = order.business_id
     finally:
         db.close()
-    if current_user.role == "admin":
-        return RedirectResponse(url="/admin/orders", status_code=303)
-    return RedirectResponse(url=f"/business/{business_id}/dashboard", status_code=303)
+    return _order_action_dashboard_redirect(current_user, business_id)
 
 
 @app.post("/orders/{order_id}/dispatch")
@@ -3830,20 +4340,12 @@ def dispatch_order(request: Request, order_id: int) -> RedirectResponse:
             return RedirectResponse(url="/admin/orders", status_code=303)
         if not current_user or (current_user.role != "admin" and current_user.business_id != order.business_id):
             return RedirectResponse(url="/login", status_code=303)
-        set_order_status(order, "out_for_delivery")
-        db.commit()
         business = get_business(db, order.business_id)
-        send_whatsapp_message(
-            order.customer_phone,
-            f"🚴 Your order *#{order.id}* is on its way!",
-            from_number=business.whatsapp_number if business else None,
-        )
+        apply_order_action(db, order, business, "dispatch")
         business_id = order.business_id
     finally:
         db.close()
-    if current_user.role == "admin":
-        return RedirectResponse(url="/admin/orders", status_code=303)
-    return RedirectResponse(url=f"/business/{business_id}/dashboard", status_code=303)
+    return _order_action_dashboard_redirect(current_user, business_id)
 
 
 @app.post("/orders/{order_id}/mark-delivered")
@@ -3856,20 +4358,12 @@ def mark_order_delivered(request: Request, order_id: int) -> RedirectResponse:
             return RedirectResponse(url="/admin/orders", status_code=303)
         if not current_user or (current_user.role != "admin" and current_user.business_id != order.business_id):
             return RedirectResponse(url="/login", status_code=303)
-        set_order_status(order, "delivered")
-        db.commit()
         business = get_business(db, order.business_id)
-        send_whatsapp_message(
-            order.customer_phone,
-            f"✅ Order *#{order.id}* delivered. Thanks for ordering from *{business.name if business else 'us'}*!{COLLXCT_FOOTER}",
-            from_number=business.whatsapp_number if business else None,
-        )
+        apply_order_action(db, order, business, "mark_delivered")
         business_id = order.business_id
     finally:
         db.close()
-    if current_user.role == "admin":
-        return RedirectResponse(url="/admin/orders", status_code=303)
-    return RedirectResponse(url=f"/business/{business_id}/dashboard", status_code=303)
+    return _order_action_dashboard_redirect(current_user, business_id)
 
 
 @app.post("/orders/{order_id}/verify-payment")
@@ -3956,6 +4450,285 @@ def api_action_required(request: Request) -> JSONResponse:
     finally:
         db.close()
     return JSONResponse({"count": len(items), "orders": items})
+
+
+# --- Mobile JSON API -------------------------------------------------------
+# Consumed by the Recbot Android app. Auth is the same HMAC token as the web
+# session, passed as `Authorization: Bearer <token>` instead of a cookie.
+
+def order_to_json(order: Order, business: Optional[Business]) -> dict:
+    cart = load_cart(order.items_json)
+    items = [
+        {"name": e.get("name", "Item"), "qty": int(e.get("qty", 1) or 1), "price": int(e.get("price", 0) or 0)}
+        for e in cart
+    ]
+    waiting_since = order.status_changed_at or order.created_at
+    available = []
+    if order.status == "awaiting_delivery_fee":
+        available.append("set_delivery_fee")
+    if order.status in ("awaiting_payment", "payment_claimed"):
+        available.append("mark_paid")
+    if order.status == "paid":
+        available.append("dispatch")
+    if order.status == "out_for_delivery":
+        available.append("mark_delivered")
+    return {
+        "id": order.id,
+        "business_id": order.business_id,
+        "business": business.name if business else "",
+        "customer": order.customer_name or order.customer_phone,
+        "customer_phone": order.customer_phone,
+        "address": order.address,
+        "items": items,
+        "subtotal": order.total - order.delivery_fee,
+        "delivery_fee": order.delivery_fee,
+        "total": order.total,
+        "status": order.status,
+        "status_label": ORDER_STATUS_LABELS.get(order.status, order.status),
+        "action": ACTION_LABELS.get(order.status, ""),
+        "available_actions": available,
+        "age": format_age(waiting_since),
+        "created_at": order.created_at.isoformat() if order.created_at else None,
+    }
+
+
+@app.post("/api/login")
+async def api_login(request: Request) -> JSONResponse:
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid_json"}, status_code=400)
+    email = (data.get("email") or "").strip()
+    password = data.get("password") or ""
+    code = (data.get("code") or "").strip()
+    throttle_key = f"api|{client_ip(request)}|{email.lower()}"
+    if login_rate_limited(throttle_key):
+        return JSONResponse({"error": "rate_limited"}, status_code=429)
+    db = SessionLocal()
+    try:
+        user = get_user_by_email(db, email)
+        if not user or not verify_password(password, user.password_hash):
+            record_login_failure(throttle_key)
+            return JSONResponse({"error": "invalid_credentials"}, status_code=401)
+        if user.role not in STAFF_ROLES:
+            return JSONResponse({"error": "forbidden"}, status_code=403)
+        if user.totp_enabled and user.totp_secret:
+            if not code or not verify_totp(user.totp_secret, code):
+                return JSONResponse({"error": "totp_required"}, status_code=401)
+        _login_attempts.pop(throttle_key, None)
+        business = get_business(db, user.business_id) if user.business_id else None
+        token = create_auth_token(user.email)
+        return JSONResponse({
+            "token": token,
+            "user": {
+                "email": user.email,
+                "role": user.role,
+                "business_id": user.business_id,
+                "business_name": business.name if business else None,
+                "accepting_orders": bool(business.accepting_orders) if business else None,
+            },
+        })
+    finally:
+        db.close()
+
+
+@app.post("/api/forgot-password")
+async def api_forgot_password(request: Request) -> JSONResponse:
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid_json"}, status_code=400)
+    email = (data.get("email") or "").strip()
+    throttle_key = f"reset|{client_ip(request)}|{email.lower()}"
+    if email and not login_rate_limited(throttle_key):
+        record_login_failure(throttle_key)
+        db = SessionLocal()
+        try:
+            user = get_user_by_email(db, email)
+            if user:
+                send_password_reset_email(user)
+        finally:
+            db.close()
+    # Generic response — never reveal whether the email has an account.
+    return JSONResponse({"ok": True})
+
+
+@app.post("/api/devices")
+async def api_register_device(request: Request) -> JSONResponse:
+    user = get_current_user(request)
+    if not user or user.role not in STAFF_ROLES:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid_json"}, status_code=400)
+    token = (data.get("token") or "").strip()
+    platform = (data.get("platform") or "android").strip()[:20]
+    if not token:
+        return JSONResponse({"error": "missing_token"}, status_code=400)
+    db = SessionLocal()
+    try:
+        now = datetime.utcnow()
+        existing = db.query(DeviceToken).filter(DeviceToken.token == token).one_or_none()
+        if existing:
+            existing.user_email = user.email
+            existing.business_id = user.business_id
+            existing.platform = platform
+            existing.updated_at = now
+        else:
+            db.add(DeviceToken(
+                token=token, user_email=user.email, business_id=user.business_id,
+                platform=platform, created_at=now, updated_at=now,
+            ))
+        db.commit()
+    finally:
+        db.close()
+    return JSONResponse({"ok": True})
+
+
+@app.delete("/api/devices")
+async def api_unregister_device(request: Request) -> JSONResponse:
+    user = get_current_user(request)
+    if not user or user.role not in STAFF_ROLES:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    try:
+        data = await request.json()
+    except Exception:
+        data = {}
+    token = (data.get("token") or "").strip()
+    if token:
+        db = SessionLocal()
+        try:
+            db.query(DeviceToken).filter(DeviceToken.token == token).delete()
+            db.commit()
+        finally:
+            db.close()
+    return JSONResponse({"ok": True})
+
+
+@app.get("/api/orders")
+def api_orders(request: Request) -> JSONResponse:
+    user = get_current_user(request)
+    if not user or user.role not in STAFF_ROLES:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    db = SessionLocal()
+    try:
+        query = db.query(Order)
+        if user.role != "admin":
+            if not user.business_id:
+                return JSONResponse({"count": 0, "orders": []})
+            query = query.filter(Order.business_id == user.business_id)
+        orders = query.order_by(Order.id.desc()).limit(50).all()
+        businesses = {b.id: b for b in db.query(Business).all()} if orders else {}
+        items = [order_to_json(o, businesses.get(o.business_id)) for o in orders]
+    finally:
+        db.close()
+    return JSONResponse({"count": len(items), "orders": items})
+
+
+@app.get("/api/orders/{order_id}")
+def api_order_detail(request: Request, order_id: int) -> JSONResponse:
+    user = get_current_user(request)
+    if not user or user.role not in STAFF_ROLES:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    db = SessionLocal()
+    try:
+        order = db.query(Order).filter(Order.id == order_id).one_or_none()
+        if not order:
+            return JSONResponse({"error": "not_found"}, status_code=404)
+        if user.role != "admin" and user.business_id != order.business_id:
+            return JSONResponse({"error": "forbidden"}, status_code=403)
+        business = get_business(db, order.business_id)
+        result = order_to_json(order, business)
+    finally:
+        db.close()
+    return JSONResponse(result)
+
+
+@app.post("/api/orders/{order_id}/action")
+async def api_order_action(request: Request, order_id: int) -> JSONResponse:
+    user = get_current_user(request)
+    if not user or user.role not in STAFF_ROLES:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid_json"}, status_code=400)
+    action = (data.get("action") or "").strip()
+    if action not in {"set_delivery_fee", "mark_paid", "dispatch", "mark_delivered"}:
+        return JSONResponse({"error": "unknown_action"}, status_code=400)
+    delivery_fee = None
+    if action == "set_delivery_fee":
+        try:
+            delivery_fee = int(data.get("delivery_fee"))
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "missing_delivery_fee"}, status_code=400)
+    db = SessionLocal()
+    try:
+        order = db.query(Order).filter(Order.id == order_id).one_or_none()
+        if not order:
+            return JSONResponse({"error": "not_found"}, status_code=404)
+        if user.role != "admin" and user.business_id != order.business_id:
+            return JSONResponse({"error": "forbidden"}, status_code=403)
+        business = get_business(db, order.business_id)
+        ok, err = apply_order_action(db, order, business, action, delivery_fee=delivery_fee)
+        if not ok:
+            return JSONResponse({"error": err}, status_code=400)
+        result = order_to_json(order, business)
+    finally:
+        db.close()
+    return JSONResponse(result)
+
+
+def _business_status_json(business: Business) -> dict:
+    return {
+        "id": business.id,
+        "name": business.name,
+        "accepting_orders": bool(business.accepting_orders),
+    }
+
+
+@app.get("/api/business")
+def api_business(request: Request) -> JSONResponse:
+    user = get_current_user(request)
+    if not user or user.role not in STAFF_ROLES:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    if not user.business_id:
+        return JSONResponse({"error": "no_business"}, status_code=404)
+    db = SessionLocal()
+    try:
+        business = get_business(db, user.business_id)
+        if not business:
+            return JSONResponse({"error": "no_business"}, status_code=404)
+        return JSONResponse(_business_status_json(business))
+    finally:
+        db.close()
+
+
+@app.post("/api/business/accepting-orders")
+async def api_set_accepting_orders(request: Request) -> JSONResponse:
+    user = get_current_user(request)
+    if not user or user.role not in STAFF_ROLES:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    if not user.business_id:
+        return JSONResponse({"error": "no_business"}, status_code=404)
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid_json"}, status_code=400)
+    accepting = data.get("accepting_orders")
+    if not isinstance(accepting, bool):
+        return JSONResponse({"error": "invalid_value"}, status_code=400)
+    db = SessionLocal()
+    try:
+        business = get_business(db, user.business_id)
+        if not business:
+            return JSONResponse({"error": "no_business"}, status_code=404)
+        business.accepting_orders = 1 if accepting else 0
+        db.commit()
+        return JSONResponse(_business_status_json(business))
+    finally:
+        db.close()
 
 
 @app.get("/orders/{order_id}", response_class=HTMLResponse)
@@ -4313,7 +5086,28 @@ def business_dashboard(request: Request, business_id: int) -> HTMLResponse:
                 hours_pill = f"<span class='status-pill' style='background:rgba(255,94,122,.12);border-color:rgba(255,94,122,.3);color:var(--danger);'>🔴 Closed now · opens {escape(business.open_time)}</span>"
         else:
             hours_pill = "<span class='status-pill'>🟢 Open 24/7</span>"
+        if business.accepting_orders:
+            orders_pill = "<span class='status-pill'>🟢 Accepting orders</span>"
+            toggle_btn = (
+                f"<form method='post' action='/business/{business.id}/toggle-orders' style='display:inline'>"
+                f"<button class='btn' type='submit'>⏸ Pause orders</button></form>"
+            )
+            paused_banner = ""
+        else:
+            orders_pill = (
+                "<span class='status-pill' style='background:rgba(255,94,122,.12);"
+                "border-color:rgba(255,94,122,.3);color:var(--danger);'>🔴 Orders paused</span>"
+            )
+            toggle_btn = (
+                f"<form method='post' action='/business/{business.id}/toggle-orders' style='display:inline'>"
+                f"<button class='btn primary' type='submit'>▶ Resume orders</button></form>"
+            )
+            paused_banner = (
+                "<div class='notice-banner'>🔕 Orders are <strong>paused</strong> — customers can't place new "
+                "WhatsApp orders until you resume. Existing orders are unaffected.</div>"
+            )
         body = f"""
+        {paused_banner}
         {plan_banner}
         {cap_banner}
         <div class="hero-panel">
@@ -4324,6 +5118,8 @@ def business_dashboard(request: Request, business_id: int) -> HTMLResponse:
           </div>
           <div class="actions">
             {hours_pill}
+            {orders_pill}
+            {toggle_btn}
             <a class="btn primary" href="/business/{business.id}/config">Manage setup</a>
             <a class="btn" href="/business/{business.id}/plans">Plans</a>
           </div>
@@ -4367,6 +5163,22 @@ def business_dashboard(request: Request, business_id: int) -> HTMLResponse:
     finally:
         db.close()
     return render_page(f"{business.name} Dashboard", body, nav_html=make_nav(current_user))
+
+
+@app.post("/business/{business_id}/toggle-orders")
+def toggle_business_orders(request: Request, business_id: int) -> RedirectResponse:
+    current_user = get_current_user(request)
+    if not current_user or (current_user.role != "admin" and current_user.business_id != business_id):
+        return RedirectResponse(url="/login", status_code=303)
+    db = SessionLocal()
+    try:
+        business = get_business(db, business_id)
+        if business:
+            business.accepting_orders = 0 if business.accepting_orders else 1
+            db.commit()
+    finally:
+        db.close()
+    return RedirectResponse(url=f"/business/{business_id}/dashboard", status_code=303)
 
 
 @app.get("/business/{business_id}/plans", response_class=HTMLResponse)
