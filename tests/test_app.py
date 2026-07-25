@@ -675,8 +675,8 @@ def test_message_count_and_platform_charge(tmp_path, monkeypatch):
 
     # The browse + checkout round-trips were tallied onto the order.
     assert mc >= 10
-    # Charge = commission % of the order + per-message cost recovery.
-    expected = round(total * main.PLATFORM_COMMISSION_PERCENT / 100) + \
+    # Charge = flat service buffer + commission % of the order + per-message recovery.
+    expected = main.PLATFORM_SERVICE_CHARGE_NGN + round(total * main.PLATFORM_COMMISSION_PERCENT / 100) + \
         main.PLATFORM_PER_MESSAGE_NGN * min(mc, main.PLATFORM_MAX_BILLED_MESSAGES)
     assert charge == expected
     # The conversation counter reset when the order was placed (fresh for next).
@@ -689,7 +689,7 @@ def test_message_count_and_platform_charge(tmp_path, monkeypatch):
     db.commit()
     capped = main.order_platform_charge(o)
     db.close()
-    assert capped == round(total * main.PLATFORM_COMMISSION_PERCENT / 100) + \
+    assert capped == main.PLATFORM_SERVICE_CHARGE_NGN + round(total * main.PLATFORM_COMMISSION_PERCENT / 100) + \
         main.PLATFORM_PER_MESSAGE_NGN * main.PLATFORM_MAX_BILLED_MESSAGES
 
 

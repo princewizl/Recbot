@@ -1189,6 +1189,36 @@ def central_paystack_key() -> str:
     return (os.getenv("PAYSTACK_SECRET_KEY") or "").strip()
 
 
+_paystack_banks_cache: Dict[str, object] = {"at": 0.0, "banks": []}
+
+
+def list_paystack_banks() -> "List[tuple]":
+    """(name, code) for Nigerian banks from Paystack, cached for a day so config
+    can offer a dropdown instead of asking owners for a numeric code. Empty when
+    the central key isn't set or the call fails (caller falls back to a text box)."""
+    key = central_paystack_key()
+    if not key:
+        return []
+    now = time.time()
+    if _paystack_banks_cache["banks"] and now - float(_paystack_banks_cache["at"]) < 86400:
+        return _paystack_banks_cache["banks"]  # type: ignore[return-value]
+    try:
+        resp = httpx.get(
+            "https://api.paystack.co/bank?currency=NGN&perPage=200",
+            headers={"Authorization": f"Bearer {key}"}, timeout=15.0,
+        )
+        data = resp.json()
+        if data.get("status"):
+            banks = sorted({(b["name"], b["code"]) for b in data.get("data", [])}, key=lambda x: x[0])
+            _paystack_banks_cache["banks"] = banks
+            _paystack_banks_cache["at"] = now
+            return banks
+        logger.error("paystack bank list rejected: %s", data.get("message"))
+    except Exception as exc:
+        logger.error("paystack bank list failed: %s", exc)
+    return _paystack_banks_cache["banks"]  # type: ignore[return-value]
+
+
 def ensure_paystack_subaccount(business: Business) -> Optional[str]:
     """Create (once) a Paystack subaccount for the business from its bank details,
     so each order can be split — Collxct's commission to the main account, the rest
@@ -1557,11 +1587,13 @@ def send_item_catalogue_images(business: Business, to_number: str, items: List[M
     return sent
 
 
-# Platform charge (per order) — commission-only model, no subscriptions:
-#   commission %  of the order value  (Collxct's margin, taken via a Paystack split)
-# + per-message   WhatsApp cost recovery (a pure % is underwater on small orders,
-#                 so a small per-message floor keeps every order profitable).
+# Platform charge (per PAID order) — commission-only model, no subscriptions:
+#   flat service fee (a buffer: paid orders chip in toward the messaging cost of
+#                 abandoned chats, which never reach payment)
+# + commission %  of the order value  (Collxct's margin, taken via a Paystack split)
+# + per-message   WhatsApp cost recovery (a pure % is underwater on small orders).
 # Billed messages are capped so a long/fumbled chat can't run the fee away.
+PLATFORM_SERVICE_CHARGE_NGN = int(os.getenv("PLATFORM_SERVICE_CHARGE_NGN", "50"))
 PLATFORM_COMMISSION_PERCENT = float(os.getenv("PLATFORM_COMMISSION_PERCENT", "2.0"))
 PLATFORM_PER_MESSAGE_NGN = int(os.getenv("PLATFORM_PER_MESSAGE_NGN", "10"))
 PLATFORM_MAX_BILLED_MESSAGES = int(os.getenv("PLATFORM_MAX_BILLED_MESSAGES", "25"))
@@ -1570,7 +1602,7 @@ PLATFORM_MAX_BILLED_MESSAGES = int(os.getenv("PLATFORM_MAX_BILLED_MESSAGES", "25
 def order_platform_charge(order: Order) -> int:
     billed = min(order.message_count or 0, PLATFORM_MAX_BILLED_MESSAGES)
     commission = round((order.total or 0) * PLATFORM_COMMISSION_PERCENT / 100)
-    return commission + PLATFORM_PER_MESSAGE_NGN * billed
+    return PLATFORM_SERVICE_CHARGE_NGN + commission + PLATFORM_PER_MESSAGE_NGN * billed
 
 
 # Orders in these statuses are blocked on the business/admin, not the customer.
@@ -2293,9 +2325,9 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
         items = active_items_for_category(db, business.id, category.id)
         conversation.category_id = category.id
         conversation.stage = CONV_ITEM
-        photos_sent = send_item_catalogue_images(business, conversation.phone_number, items)
-        conversation.message_count = (conversation.message_count or 0) + photos_sent
         db.commit()
+        # Photos are sent "on tap" when a customer selects an item, not blasted for
+        # the whole category — so window-shoppers who never buy don't cost messages.
         return format_item_menu(items, category.name)
 
     if conversation.stage == CONV_ITEM:
@@ -2343,6 +2375,18 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
         else:
             cart.append({"item_id": item.id, "name": item.name, "description": item.description or "", "price": item.price, "qty": 1})
         conversation.cart_json = json.dumps(cart)
+        # "On tap": send the photo of the item the customer actually chose (one
+        # message), instead of blasting the whole category to window-shoppers.
+        item_url = public_media_url(getattr(item, "image_url", None))
+        if item_url:
+            send_whatsapp_message(
+                conversation.phone_number,
+                f"✅ Added *{item.name}* — N{item.price}",
+                from_number=business.whatsapp_number, media_url=item_url,
+            )
+            conversation.message_count = (conversation.message_count or 0) + 1
+            db.commit()
+            return "Reply with another number to add more, 'cart' to view your cart, or 'checkout' to place your order."
         db.commit()
         return f"✅ Added *{item.name}* to your cart. Reply with another number to add more, 'cart' to view your cart, or 'checkout' to place your order."
 
@@ -3894,6 +3938,23 @@ def business_detail(request: Request, business_id: int, notice: Optional[str] = 
         if notice in NOTICE_MESSAGES else ""
     )
     method = business.payment_method or "bank_transfer"
+    # Payout bank: a dropdown from Paystack's bank list when the central key is
+    # set, otherwise a plain code box so config still works offline.
+    banks = list_paystack_banks()
+    if banks:
+        bank_options = "".join(
+            f"<option value='{escape(code)}' {'selected' if business.bank_code == code else ''}>{escape(name)}</option>"
+            for name, code in banks
+        )
+        bank_field = (
+            "<label>Payout bank <select name='bank_code'>"
+            f"<option value=''>Select your bank…</option>{bank_options}</select></label>"
+        )
+    else:
+        bank_field = (
+            f"<input name='bank_code' value='{escape(business.bank_code or '')}' "
+            "placeholder='Bank code for payouts (e.g. 058 = GTBank, 044 = Access)' />"
+        )
     key_mode = paystack_key_mode(business.paystack_secret_key)
     key_badges = {
         "live": "<span class='status-pill'>✅ Live Paystack key saved</span>",
@@ -3946,7 +4007,7 @@ def business_detail(request: Request, business_id: int, notice: Optional[str] = 
                 <option value="paystack" {"selected" if method == "paystack" else ""}>Paystack payment link — confirmed automatically</option>
               </select>
             </label>
-            <input name="bank_code" value="{escape(business.bank_code or '')}" placeholder="Bank code for payouts (e.g. 058 = GTBank, 044 = Access)" />
+            {bank_field}
             {"<span class='status-pill'>✅ Payout account linked</span>" if business.paystack_subaccount_code else ""}
             <p class="form-hint">With Paystack, customers pay by card, transfer, or USSD and it's confirmed automatically. Recbot runs Paystack <em>centrally</em> and takes its commission as a split, settling the rest straight to the bank account above — <strong>you don't need your own Paystack key</strong>. The bank code is Paystack's numeric code for your bank (we'll set it for you if unsure).</p>
             <hr style="border:none;border-top:1px solid var(--border);margin:14px 0;" />
