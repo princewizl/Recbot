@@ -381,7 +381,7 @@ def test_landing_page_and_contact_form(tmp_path, monkeypatch):
 
     page = client.get("/")
     assert page.status_code == 200
-    for needle in ["ordering machine", "Simple, honest pricing", "Starter", "Growth", "What we need to onboard you", "Request my setup", "logo-white.svg"]:
+    for needle in ["ordering machine", "Pay only when you sell", "per order", "no Paystack account needed", "What we need to onboard you", "Request my setup", "logo-white.svg"]:
         assert needle in page.text, f"missing: {needle}"
 
     # Contact form stores the lead (SMTP unconfigured -> sent=0 notice).
@@ -691,6 +691,42 @@ def test_message_count_and_platform_charge(tmp_path, monkeypatch):
     db.close()
     assert capped == round(total * main.PLATFORM_COMMISSION_PERCENT / 100) + \
         main.PLATFORM_PER_MESSAGE_NGN * main.PLATFORM_MAX_BILLED_MESSAGES
+
+
+def test_commission_model_no_gating_and_bank_code(tmp_path, monkeypatch):
+    db_path = tmp_path / "test_bot.db"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
+    monkeypatch.setenv("ADMIN_EMAIL", "admin@example.com")
+    monkeypatch.setenv("ADMIN_PASSWORD", "test-admin-password")
+
+    import app.main as main
+    importlib.reload(main)
+    client = TestClient(main.app)
+
+    db = main.SessionLocal()
+    business = db.query(main.Business).first()
+    bid = business.id
+    business.plan_expiry = main.datetime.utcnow() - main.timedelta(days=400)
+    db.commit()
+    # Commission-only: an expired plan never blocks ordering.
+    assert main.plan_is_blocked(business) is False
+    # Subaccount creation is a safe no-op when central Paystack isn't configured.
+    assert main.ensure_paystack_subaccount(business) is None
+    db.close()
+
+    assert "category" in client.post("/webhook", json={"from": "2348012345678", "message": "hi"}).json()["reply"].lower()
+
+    # Admin saves the payout bank code used for the Paystack subaccount split.
+    client.post("/login", data={"email": "admin@example.com", "password": "test-admin-password"}, follow_redirects=False)
+    r = client.post(
+        f"/admin/businesses/{bid}",
+        data={"name": "Demo Shop", "whatsapp_number": "+2348000000000", "bank_code": "058", "bank_account_number": "0123456789"},
+        follow_redirects=False,
+    )
+    assert r.status_code == 303
+    db = main.SessionLocal()
+    assert main.get_business(db, bid).bank_code == "058"
+    db.close()
 
 
 def test_paused_business_blocks_new_orders(tmp_path, monkeypatch):

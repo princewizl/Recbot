@@ -60,6 +60,10 @@ class Business(Base):
     bank_name = Column(String(255), nullable=True)
     bank_account_number = Column(String(50), nullable=True)
     bank_account_name = Column(String(255), nullable=True)
+    # Central-Paystack commission model: the business settles through a Paystack
+    # subaccount created from its bank details (no per-business Paystack key).
+    bank_code = Column(String(10), nullable=True)
+    paystack_subaccount_code = Column(String(64), nullable=True)
     open_time = Column(String(5), nullable=True)
     close_time = Column(String(5), nullable=True)
     utc_offset_minutes = Column(Integer, nullable=True)
@@ -293,6 +297,10 @@ def ensure_schema() -> None:
             conn.execute(text("ALTER TABLE conversations ADD COLUMN message_count INTEGER NOT NULL DEFAULT 0"))
         if not has_column("orders", "message_count"):
             conn.execute(text("ALTER TABLE orders ADD COLUMN message_count INTEGER NOT NULL DEFAULT 0"))
+        if not has_column("businesses", "bank_code"):
+            conn.execute(text("ALTER TABLE businesses ADD COLUMN bank_code VARCHAR(10)"))
+        if not has_column("businesses", "paystack_subaccount_code"):
+            conn.execute(text("ALTER TABLE businesses ADD COLUMN paystack_subaccount_code VARCHAR(64)"))
         if not has_column("users", "totp_secret"):
             conn.execute(text("ALTER TABLE users ADD COLUMN totp_secret VARCHAR(64)"))
         if not has_column("users", "totp_enabled"):
@@ -613,7 +621,6 @@ def make_nav(current_user: Optional[User] = None) -> str:
             links.append("<a class='nav-link' href='/admin/orders'>Orders</a>")
             links.append("<a class='nav-link' href='/admin/conversations'>Conversations</a>")
             links.append("<a class='nav-link' href='/admin/businesses'>Businesses</a>")
-            links.append("<a class='nav-link' href='/admin/plans'>Plans & Pricing</a>")
             links.append("<a class='nav-link' href='/admin/messages'>Leads</a>")
             links.append("<a class='nav-link' href='/admin/users'>Users</a>")
             links.append("<a class='nav-link' href='/register'>Create Owners</a>")
@@ -623,7 +630,6 @@ def make_nav(current_user: Optional[User] = None) -> str:
             if current_user.business_id:
                 links.append(f"<a class='nav-link' href='/business/{current_user.business_id}/dashboard'>Operations</a>")
                 links.append(f"<a class='nav-link' href='/business/{current_user.business_id}/config'>Config</a>")
-                links.append(f"<a class='nav-link' href='/business/{current_user.business_id}/plans'>Plans</a>")
         if current_user.role == "admin" or is_business_owner:
             links.append("<a class='nav-link' href='/account/security'>Security</a>")
     else:
@@ -1135,11 +1141,9 @@ def format_paused_reply(business: Business) -> str:
 
 
 def plan_is_blocked(business: Business) -> bool:
-    """A lapsed paid plan blocks new ordering after a grace period. Businesses
-    without an expiry date (trial / admin-managed) are never blocked."""
-    if not business.plan_expiry:
-        return False
-    return datetime.utcnow() > business.plan_expiry + timedelta(days=PLAN_GRACE_DAYS)
+    """Retained as a no-op: Recbot is commission-only (no subscriptions), so
+    ordering is never blocked by a lapsed plan. Kept so existing callers work."""
+    return False
 
 
 def initialize_paystack_transaction(email: str, amount_ngn: int, callback_url: str, reference: str) -> Optional[str]:
@@ -1179,13 +1183,53 @@ def paystack_key_mode(key: Optional[str]) -> str:
     return "unknown" if key else "missing"
 
 
+def central_paystack_key() -> str:
+    """Collxct's single Paystack secret key — the whole platform settles through
+    it, taking a commission split. Businesses no longer need their own key."""
+    return (os.getenv("PAYSTACK_SECRET_KEY") or "").strip()
+
+
+def ensure_paystack_subaccount(business: Business) -> Optional[str]:
+    """Create (once) a Paystack subaccount for the business from its bank details,
+    so each order can be split — Collxct's commission to the main account, the rest
+    settled straight to the business. Returns the subaccount code, or None when it
+    can't be made (no central key / bank details), so callers fall back to bank
+    transfer. The caller is responsible for committing the stored code."""
+    if business.paystack_subaccount_code:
+        return business.paystack_subaccount_code
+    key = central_paystack_key()
+    if not key or not business.bank_code or not business.bank_account_number:
+        return None
+    try:
+        response = httpx.post(
+            "https://api.paystack.co/subaccount",
+            json={
+                "business_name": business.name,
+                "settlement_bank": business.bank_code,
+                "account_number": business.bank_account_number,
+                "percentage_charge": PLATFORM_COMMISSION_PERCENT,
+            },
+            headers={"Authorization": f"Bearer {key}"}, timeout=15.0,
+        )
+        data = response.json()
+        if data.get("status"):
+            business.paystack_subaccount_code = data["data"]["subaccount_code"]
+            return business.paystack_subaccount_code
+        logger.error("paystack subaccount rejected (business=%s): %s", business.id, data.get("message"))
+    except Exception as exc:
+        logger.error("paystack subaccount failed (business=%s): %s", business.id, exc)
+    return None
+
+
 def create_paystack_order_link(business: Business, order: Order) -> Optional[str]:
-    """Create a hosted Paystack checkout link for an order, using the business's
-    own secret key — the same key later verifies it, so test keys stay test and
-    live keys stay live end to end."""
-    key = (business.paystack_secret_key or "").strip()
+    """Hosted Paystack checkout for an order via Collxct's central account, split so
+    the platform charge goes to Collxct and the rest settles to the business's
+    subaccount. Returns None (→ bank-transfer fallback) when central Paystack or the
+    subaccount isn't set up."""
+    key = central_paystack_key()
     if not key:
         return None
+    subaccount = ensure_paystack_subaccount(business)
     reference = f"RBORD-{order.id}-{int(datetime.utcnow().timestamp())}"
     digits = re.sub(r"[^0-9]", "", order.customer_phone) or "customer"
     payload = {
@@ -1195,6 +1239,13 @@ def create_paystack_order_link(business: Business, order: Order) -> Optional[str
         "currency": "NGN",
         "metadata": {"order_id": order.id, "business_id": business.id, "customer_phone": order.customer_phone},
     }
+    if subaccount:
+        # transaction_charge (kobo) is Collxct's flat cut for this order; the
+        # remainder settles to the business subaccount. bearer=subaccount means the
+        # business bears Paystack's own processing fee.
+        payload["subaccount"] = subaccount
+        payload["transaction_charge"] = order_platform_charge(order) * 100
+        payload["bearer"] = "subaccount"
     base = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
     if base:
         payload["callback_url"] = f"{base}/pay/thanks"
@@ -1208,7 +1259,7 @@ def create_paystack_order_link(business: Business, order: Order) -> Optional[str
             order.payment_reference = reference
             order.payment_link = data["data"]["authorization_url"]
             return order.payment_link
-        logger.error("paystack init rejected (order=%s, mode=%s): %s", order.id, paystack_key_mode(key), data.get("message"))
+        logger.error("paystack init rejected (order=%s): %s", order.id, data.get("message"))
     except Exception as exc:
         logger.error("paystack init failed (order=%s): %s", order.id, exc)
     return None
@@ -1216,7 +1267,7 @@ def create_paystack_order_link(business: Business, order: Order) -> Optional[str
 
 def verify_paystack_order_payment(business: Business, order: Order) -> Optional[bool]:
     """True = confirmed paid, False = definitely not paid yet, None = couldn't check."""
-    key = (business.paystack_secret_key or "").strip()
+    key = central_paystack_key()
     if not key or not order.payment_reference:
         return None
     try:
@@ -2749,13 +2800,14 @@ def homepage(request: Request, sent: Optional[str] = None) -> HTMLResponse:
         <section id="pricing">
           <div class="wrap">
             <div class="sec-head">
-              <h2>Simple, honest pricing</h2>
-              <p>One-time setup, then a flat monthly plan. WhatsApp messaging costs included — no per-message surprises.</p>
+              <h2>Pay only when you sell</h2>
+              <p>No subscriptions. No monthly fees. Recbot takes a small commission on each order — so it only ever costs you when it's making you money.</p>
             </div>
-            <div class="lp-plans">
-              {plan_cards}
+            <div style="max-width:560px;margin:0 auto;text-align:center;background:var(--surface);border:1px solid rgba(52,211,153,.5);border-radius:22px;padding:36px 28px;box-shadow:0 20px 50px rgba(0,0,0,.4);">
+              <div style="font-size:3.2rem;font-weight:800;line-height:1;color:var(--green-strong);">{PLATFORM_COMMISSION_PERCENT:g}%<span style="font-size:1rem;color:var(--muted);font-weight:600;"> per order</span></div>
+              <p style="color:var(--muted);margin:16px 0 0;">Plus a small WhatsApp messaging fee per order. Your money settles <strong style="color:var(--text);">straight to your bank</strong> automatically — no monthly plans, no order limits, and <strong style="color:var(--text);">no Paystack account needed on your side.</strong></p>
             </div>
-            <p class="lp-setup">+ one-time setup: <strong>from ₦{ONBOARDING_FEE_NGN:,}</strong> — covers your menu build, payment setup, and a guided test launch. Established or multi-branch businesses can opt for a fully managed setup (₦{ONBOARDING_FEE_PREMIUM_NGN:,}) where we handle Meta &amp; Paystack registration end to end. Order caps are soft: we never block your sales, we just talk about the right plan.</p>
+            <p class="lp-setup">Optional one-time setup from <strong>₦{ONBOARDING_FEE_NGN:,}</strong> covers your catalogue build, payment setup, and a guided test launch. No order caps, ever.</p>
           </div>
         </section>
 
@@ -2768,7 +2820,7 @@ def homepage(request: Request, sent: Optional[str] = None) -> HTMLResponse:
             <div class="req-grid">
               <div class="req"><span class="tick">✓</span><div><b>A WhatsApp number</b><span>Your own dedicated number for the bot (each business gets its own — we help you set one up).</span></div></div>
               <div class="req"><span class="tick">✓</span><div><b>Your menu &amp; prices</b><span>A simple list or photo is fine — we'll structure it into categories for the bot.</span></div></div>
-              <div class="req"><span class="tick">✓</span><div><b>How you get paid</b><span>Your bank account details, or your own Paystack account for instant payment links.</span></div></div>
+              <div class="req"><span class="tick">✓</span><div><b>How you get paid</b><span>Just your bank account details — card &amp; transfer payments settle straight to your bank automatically. No Paystack account needed on your side.</span></div></div>
               <div class="req"><span class="tick">✓</span><div><b>Opening hours &amp; delivery</b><span>When you sell, where you deliver from, and your delivery pricing (or let us auto-calculate it).</span></div></div>
             </div>
           </div>
@@ -3894,9 +3946,9 @@ def business_detail(request: Request, business_id: int, notice: Optional[str] = 
                 <option value="paystack" {"selected" if method == "paystack" else ""}>Paystack payment link — confirmed automatically</option>
               </select>
             </label>
-            <input name="paystack_secret_key" type="password" value="{escape(business.paystack_secret_key or '')}" placeholder="Paystack secret key (sk_live_… — required for payment links)" autocomplete="off" />
-            {key_badge}
-            <p class="form-hint">With Paystack, customers get a secure checkout link (card, transfer, USSD) and payment is confirmed automatically — no bank-alert checking. Use the secret key from <em>your own</em> Paystack dashboard: an sk_live_ key takes real payments; an sk_test_ key only works with test cards.</p>
+            <input name="bank_code" value="{escape(business.bank_code or '')}" placeholder="Bank code for payouts (e.g. 058 = GTBank, 044 = Access)" />
+            {"<span class='status-pill'>✅ Payout account linked</span>" if business.paystack_subaccount_code else ""}
+            <p class="form-hint">With Paystack, customers pay by card, transfer, or USSD and it's confirmed automatically. Recbot runs Paystack <em>centrally</em> and takes its commission as a split, settling the rest straight to the bank account above — <strong>you don't need your own Paystack key</strong>. The bank code is Paystack's numeric code for your bank (we'll set it for you if unsure).</p>
             <hr style="border:none;border-top:1px solid var(--border);margin:14px 0;" />
             <label><input type="checkbox" name="delivery_autocalc" {"checked" if business.delivery_autocalc else ""} /> Auto-calculate delivery fees by distance</label>
             <textarea name="location_address" placeholder="Pickup address — where deliveries leave from (defaults to your first branch's address)">{escape(business.location_address or '')}</textarea>
@@ -4077,7 +4129,7 @@ def update_business(
     open_time: str = Form(default=""),
     close_time: str = Form(default=""),
     payment_method: str = Form(default="bank_transfer"),
-    paystack_secret_key: str = Form(default=""),
+    bank_code: str = Form(default=""),
     delivery_autocalc: Optional[str] = Form(default=None),
     location_address: str = Form(default=""),
     delivery_base_fee: int = Form(default=0),
@@ -4090,12 +4142,14 @@ def update_business(
     try:
         business = get_business(db, business_id)
         if business:
+            prev_acct, prev_code = business.bank_account_number, business.bank_code
             business.name = name
             business.whatsapp_number = whatsapp_number
             business.owner_notify_number = owner_notify_number or None
             business.bank_name = bank_name or None
             business.bank_account_number = bank_account_number or None
             business.bank_account_name = bank_account_name or None
+            business.bank_code = bank_code.strip() or None
             # Hours only stick when both parse as HH:MM; anything else means 24/7.
             if parse_hhmm(open_time) and parse_hhmm(close_time):
                 business.open_time = open_time.strip()
@@ -4105,7 +4159,11 @@ def update_business(
                 business.close_time = None
             if payment_method in PAYMENT_METHOD_LABELS:
                 business.payment_method = payment_method
-            business.paystack_secret_key = paystack_secret_key.strip() or None
+            # If the payout account changed, the old Paystack subaccount is stale;
+            # drop it and (re)create from the new details for the commission split.
+            if business.bank_account_number != prev_acct or business.bank_code != prev_code:
+                business.paystack_subaccount_code = None
+            ensure_paystack_subaccount(business)
             business.delivery_autocalc = 1 if delivery_autocalc else 0
             business.delivery_base_fee = max(0, delivery_base_fee)
             business.delivery_per_km = max(0, delivery_per_km)

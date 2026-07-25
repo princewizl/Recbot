@@ -36,6 +36,20 @@ WhatsApp — visual products need visuals.
 
 ## 2. Platform fee per transaction (instead of / alongside subscriptions)
 
+**✅ Shipped (2026-07-24) — commission-only, subscriptions removed.** Model:
+**2% per order + ₦10/message** (cost recovery; capped at 25 msgs) — see
+`order_platform_charge()` and `PLATFORM_COMMISSION_PERCENT` / `PLATFORM_PER_MESSAGE_NGN`.
+Per-order messages are counted through the conversation and snapshotted onto the
+order. Payments moved to **one central Paystack account with a subaccount per
+business** (`ensure_paystack_subaccount()` from the business's bank code +
+account) and a **transaction split** taking the platform charge — so businesses
+no longer need their own Paystack key. Landing page reworked to "pay only when
+you sell"; plan gating (`plan_is_blocked`) is now a no-op; order caps removed.
+**Still to verify with live Paystack:** subaccount creation + split settlement on
+real transactions (needs a live secret key + bank-code lookup); the dormant
+subscription routes (`/admin/plans`, `/business/{id}/plans`, purchase-plan) are
+unlinked but not yet deleted.
+
 **Goal:** take a small cut of every order payment that covers WhatsApp/messaging
 costs plus profit — the Chowdeck / Glovo commission model — so businesses can
 join with no subscription.
