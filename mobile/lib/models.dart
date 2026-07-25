@@ -83,3 +83,44 @@ const Map<String, String> actionLabels = {
   'dispatch': 'Mark dispatched',
   'mark_delivered': 'Mark delivered',
 };
+
+class CatalogueCategory {
+  final int id;
+  final String name;
+  CatalogueCategory({required this.id, required this.name});
+  factory CatalogueCategory.fromJson(Map<String, dynamic> j) =>
+      CatalogueCategory(id: j['id'] as int, name: (j['name'] ?? '').toString());
+}
+
+class CatalogueItem {
+  final int id;
+  final String name;
+  final int price;
+  final String description;
+  final int? categoryId;
+  final bool isActive;
+  final bool isOutOfStock;
+  final String? imageUrl;
+
+  CatalogueItem({
+    required this.id,
+    required this.name,
+    required this.price,
+    required this.description,
+    required this.categoryId,
+    required this.isActive,
+    required this.isOutOfStock,
+    required this.imageUrl,
+  });
+
+  factory CatalogueItem.fromJson(Map<String, dynamic> j) => CatalogueItem(
+        id: j['id'] as int,
+        name: (j['name'] ?? '').toString(),
+        price: (j['price'] ?? 0) as int,
+        description: (j['description'] ?? '').toString(),
+        categoryId: j['category_id'] as int?,
+        isActive: j['is_active'] == true,
+        isOutOfStock: j['is_out_of_stock'] == true,
+        imageUrl: j['image_url'] as String?,
+      );
+}

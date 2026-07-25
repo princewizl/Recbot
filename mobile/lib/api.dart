@@ -1,6 +1,7 @@
 import 'dart:convert';
 
 import 'package:http/http.dart' as http;
+import 'package:http_parser/http_parser.dart';
 
 import 'config.dart';
 import 'models.dart';
@@ -161,6 +162,78 @@ class ApiClient {
     if (res.statusCode != 200) _raise(res);
     final body = jsonDecode(res.body) as Map<String, dynamic>;
     return body['accepting_orders'] == true;
+  }
+
+  // --- Catalogue ---
+
+  Future<({List<CatalogueCategory> categories, List<CatalogueItem> items})> getCatalogue() async {
+    final res = await http.get(_uri('/api/catalogue'), headers: _headers);
+    if (res.statusCode != 200) _raise(res);
+    final body = jsonDecode(res.body) as Map<String, dynamic>;
+    return (
+      categories: ((body['categories'] ?? []) as List).map((e) => CatalogueCategory.fromJson(e)).toList(),
+      items: ((body['items'] ?? []) as List).map((e) => CatalogueItem.fromJson(e)).toList(),
+    );
+  }
+
+  Future<CatalogueCategory> createCategory(String name) async {
+    final res = await http.post(_uri('/api/categories'), headers: _headers, body: jsonEncode({'name': name}));
+    if (res.statusCode != 200) _raise(res);
+    return CatalogueCategory.fromJson(jsonDecode(res.body));
+  }
+
+  /// Create (id == null) or update an item. imagePath sends a new photo; leave
+  /// null to keep the current one.
+  Future<CatalogueItem> saveItem({
+    int? id,
+    required String name,
+    required int price,
+    String description = '',
+    int? categoryId,
+    required bool isActive,
+    required bool isOutOfStock,
+    String? imagePath,
+  }) async {
+    final req = http.MultipartRequest('POST', _uri(id == null ? '/api/items' : '/api/items/$id'));
+    if (token != null) req.headers['Authorization'] = 'Bearer $token';
+    req.fields['name'] = name;
+    req.fields['price'] = price.toString();
+    req.fields['description'] = description;
+    if (categoryId != null) req.fields['category_id'] = categoryId.toString();
+    req.fields['is_active'] = isActive ? '1' : '0';
+    req.fields['is_out_of_stock'] = isOutOfStock ? '1' : '0';
+    if (imagePath != null) {
+      final ext = imagePath.split('.').last.toLowerCase();
+      final sub = ext == 'png' ? 'png' : (ext == 'webp' ? 'webp' : 'jpeg');
+      req.files.add(await http.MultipartFile.fromPath('image', imagePath, contentType: MediaType('image', sub)));
+    }
+    final res = await http.Response.fromStream(await req.send());
+    if (res.statusCode != 200) _raise(res);
+    return CatalogueItem.fromJson(jsonDecode(res.body));
+  }
+
+  Future<void> setItemStock(int id, bool outOfStock) async {
+    final res = await http.post(_uri('/api/items/$id/stock'), headers: _headers, body: jsonEncode({'is_out_of_stock': outOfStock}));
+    if (res.statusCode != 200) _raise(res);
+  }
+
+  Future<void> deleteItem(int id) async {
+    final res = await http.delete(_uri('/api/items/$id'), headers: _headers);
+    if (res.statusCode != 200) _raise(res);
+  }
+
+  // --- Business config ---
+
+  Future<Map<String, dynamic>> getBusinessConfig() async {
+    final res = await http.get(_uri('/api/business/config'), headers: _headers);
+    if (res.statusCode != 200) _raise(res);
+    return jsonDecode(res.body) as Map<String, dynamic>;
+  }
+
+  Future<Map<String, dynamic>> saveBusinessConfig(Map<String, dynamic> data) async {
+    final res = await http.post(_uri('/api/business/config'), headers: _headers, body: jsonEncode(data));
+    if (res.statusCode != 200) _raise(res);
+    return jsonDecode(res.body) as Map<String, dynamic>;
   }
 
   Future<void> registerDevice(String fcmToken) async {

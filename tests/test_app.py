@@ -721,6 +721,61 @@ def test_see_and_remove_cart_commands(tmp_path, monkeypatch):
     assert "removed" in removed and "empty" in removed
 
 
+def test_catalogue_and_business_config_api(tmp_path, monkeypatch):
+    db_path = tmp_path / "test_bot.db"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
+
+    import app.main as main
+    importlib.reload(main)
+
+    db = main.SessionLocal()
+    business_id = db.query(main.Business).first().id
+    db.add(main.User(email="owner@example.com", password_hash=main.hash_password("pw"),
+                     role="business_owner", business_id=business_id))
+    db.commit()
+    db.close()
+
+    client = TestClient(main.app)
+    token = client.post("/api/login", json={"email": "owner@example.com", "password": "pw"}).json()["token"]
+    auth = {"Authorization": f"Bearer {token}"}
+
+    # Create a category and an item with a photo (multipart).
+    cat = client.post("/api/categories", json={"name": "Dresses"}, headers=auth).json()
+    created = client.post(
+        "/api/items",
+        data={"name": "Red Dress", "price": "15000", "category_id": str(cat["id"]), "is_active": "1", "is_out_of_stock": "0"},
+        files={"image": ("d.png", _TINY_PNG, "image/png")},
+        headers=auth,
+    )
+    assert created.status_code == 200
+    item = created.json()
+    assert item["name"] == "Red Dress" and item["price"] == 15000 and item["image_url"]
+    item_id = item["id"]
+
+    # Catalogue lists the category and item.
+    catalogue = client.get("/api/catalogue", headers=auth).json()
+    assert any(c["name"] == "Dresses" for c in catalogue["categories"])
+    assert any(i["id"] == item_id for i in catalogue["items"])
+
+    # Quick out-of-stock toggle.
+    assert client.post(f"/api/items/{item_id}/stock", json={"is_out_of_stock": True}, headers=auth).json()["is_out_of_stock"] is True
+
+    # Update without a new image keeps the old photo.
+    upd = client.post(f"/api/items/{item_id}", data={"name": "Blue Dress", "price": "16000", "is_active": "1", "is_out_of_stock": "0"}, headers=auth)
+    assert upd.status_code == 200 and upd.json()["name"] == "Blue Dress" and upd.json()["image_url"]
+
+    # Delete removes it.
+    assert client.request("DELETE", f"/api/items/{item_id}", headers=auth).json()["ok"] is True
+    assert not any(i["id"] == item_id for i in client.get("/api/catalogue", headers=auth).json()["items"])
+
+    # Business config round-trips.
+    assert "whatsapp_number" in client.get("/api/business/config", headers=auth).json()
+    saved = client.post("/api/business/config", json={"name": "My Shop", "bank_code": "058", "open_time": "09:00", "close_time": "18:00"}, headers=auth)
+    assert saved.status_code == 200
+    got = client.get("/api/business/config", headers=auth).json()
+    assert got["name"] == "My Shop" and got["bank_code"] == "058" and got["open_time"] == "09:00"
+
+
 def test_commission_model_no_gating_and_bank_code(tmp_path, monkeypatch):
     db_path = tmp_path / "test_bot.db"
     monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")

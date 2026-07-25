@@ -5032,6 +5032,275 @@ async def api_set_accepting_orders(request: Request) -> JSONResponse:
         db.close()
 
 
+# --- Catalogue management (business-owner, from the mobile app) ---
+
+def item_to_json(item: MenuItem) -> dict:
+    return {
+        "id": item.id,
+        "name": item.name,
+        "price": item.price,
+        "description": item.description or "",
+        "category_id": item.category_id,
+        "is_active": bool(item.is_active),
+        "is_out_of_stock": bool(item.is_out_of_stock),
+        "image_url": public_media_url(item.image_url),
+    }
+
+
+def _form_bool(v: Optional[str]) -> int:
+    return 1 if str(v).strip().lower() in ("1", "true", "on", "yes") else 0
+
+
+def _api_owner(request: Request) -> Optional[User]:
+    user = get_current_user(request)
+    if not user or user.role not in STAFF_ROLES or not user.business_id:
+        return None
+    return user
+
+
+@app.get("/api/catalogue")
+def api_catalogue(request: Request) -> JSONResponse:
+    user = _api_owner(request)
+    if not user:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    db = SessionLocal()
+    try:
+        cats = db.query(Category).filter(Category.business_id == user.business_id).order_by(Category.id).all()
+        items = db.query(MenuItem).filter(MenuItem.business_id == user.business_id).order_by(MenuItem.id).all()
+        return JSONResponse({
+            "categories": [{"id": c.id, "name": c.name} for c in cats],
+            "items": [item_to_json(i) for i in items],
+        })
+    finally:
+        db.close()
+
+
+@app.post("/api/categories")
+async def api_create_category(request: Request) -> JSONResponse:
+    user = _api_owner(request)
+    if not user:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid_json"}, status_code=400)
+    name = (data.get("name") or "").strip()
+    if not name:
+        return JSONResponse({"error": "missing_name"}, status_code=400)
+    db = SessionLocal()
+    try:
+        cat = Category(business_id=user.business_id, name=name)
+        db.add(cat)
+        db.commit()
+        return JSONResponse({"id": cat.id, "name": cat.name})
+    finally:
+        db.close()
+
+
+@app.post("/api/items")
+async def api_create_item(
+    request: Request,
+    name: str = Form(...),
+    price: int = Form(...),
+    description: str = Form(default=""),
+    category_id: Optional[int] = Form(default=None),
+    is_active: str = Form(default="1"),
+    is_out_of_stock: str = Form(default="0"),
+    image: Optional[UploadFile] = File(default=None),
+) -> JSONResponse:
+    user = _api_owner(request)
+    if not user:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    db = SessionLocal()
+    try:
+        item = MenuItem(
+            business_id=user.business_id,
+            category_id=category_id or None,
+            name=name.strip(),
+            description=description.strip() or None,
+            price=max(0, price),
+            is_active=_form_bool(is_active),
+            is_out_of_stock=_form_bool(is_out_of_stock),
+            image_url=save_item_image(image),
+        )
+        db.add(item)
+        db.commit()
+        return JSONResponse(item_to_json(item))
+    finally:
+        db.close()
+
+
+@app.post("/api/items/{item_id}")
+async def api_update_item(
+    request: Request,
+    item_id: int,
+    name: str = Form(...),
+    price: int = Form(...),
+    description: str = Form(default=""),
+    category_id: Optional[int] = Form(default=None),
+    is_active: str = Form(default="1"),
+    is_out_of_stock: str = Form(default="0"),
+    image: Optional[UploadFile] = File(default=None),
+) -> JSONResponse:
+    user = _api_owner(request)
+    if not user:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    db = SessionLocal()
+    try:
+        item = db.query(MenuItem).filter(MenuItem.id == item_id, MenuItem.business_id == user.business_id).one_or_none()
+        if not item:
+            return JSONResponse({"error": "not_found"}, status_code=404)
+        item.name = name.strip()
+        item.price = max(0, price)
+        item.description = description.strip() or None
+        item.category_id = category_id or None
+        item.is_active = _form_bool(is_active)
+        item.is_out_of_stock = _form_bool(is_out_of_stock)
+        new_image = save_item_image(image)
+        if new_image:
+            item.image_url = new_image
+        db.commit()
+        return JSONResponse(item_to_json(item))
+    finally:
+        db.close()
+
+
+@app.post("/api/items/{item_id}/stock")
+async def api_item_stock(request: Request, item_id: int) -> JSONResponse:
+    user = _api_owner(request)
+    if not user:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid_json"}, status_code=400)
+    out = data.get("is_out_of_stock")
+    if not isinstance(out, bool):
+        return JSONResponse({"error": "invalid_value"}, status_code=400)
+    db = SessionLocal()
+    try:
+        item = db.query(MenuItem).filter(MenuItem.id == item_id, MenuItem.business_id == user.business_id).one_or_none()
+        if not item:
+            return JSONResponse({"error": "not_found"}, status_code=404)
+        item.is_out_of_stock = 1 if out else 0
+        db.commit()
+        return JSONResponse(item_to_json(item))
+    finally:
+        db.close()
+
+
+@app.delete("/api/items/{item_id}")
+def api_delete_item(request: Request, item_id: int) -> JSONResponse:
+    user = _api_owner(request)
+    if not user:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    db = SessionLocal()
+    try:
+        item = db.query(MenuItem).filter(MenuItem.id == item_id, MenuItem.business_id == user.business_id).one_or_none()
+        if item:
+            db.delete(item)
+            db.commit()
+        return JSONResponse({"ok": True})
+    finally:
+        db.close()
+
+
+# --- Business config (business-owner, from the mobile app) ---
+
+def _business_config_json(business: Business) -> dict:
+    return {
+        "id": business.id,
+        "name": business.name,
+        "whatsapp_number": business.whatsapp_number,
+        "owner_notify_number": business.owner_notify_number or "",
+        "bank_name": business.bank_name or "",
+        "bank_account_number": business.bank_account_number or "",
+        "bank_account_name": business.bank_account_name or "",
+        "bank_code": business.bank_code or "",
+        "open_time": business.open_time or "",
+        "close_time": business.close_time or "",
+        "payment_method": business.payment_method or "bank_transfer",
+        "delivery_autocalc": bool(business.delivery_autocalc),
+        "delivery_base_fee": business.delivery_base_fee or 0,
+        "delivery_per_km": business.delivery_per_km or 0,
+        "location_address": business.location_address or "",
+        "accepting_orders": bool(business.accepting_orders),
+        "subaccount_linked": bool(business.paystack_subaccount_code),
+    }
+
+
+@app.get("/api/business/config")
+def api_business_config(request: Request) -> JSONResponse:
+    user = _api_owner(request)
+    if not user:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    db = SessionLocal()
+    try:
+        business = get_business(db, user.business_id)
+        if not business:
+            return JSONResponse({"error": "no_business"}, status_code=404)
+        return JSONResponse(_business_config_json(business))
+    finally:
+        db.close()
+
+
+@app.post("/api/business/config")
+async def api_update_business_config(request: Request) -> JSONResponse:
+    user = _api_owner(request)
+    if not user:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid_json"}, status_code=400)
+    db = SessionLocal()
+    try:
+        business = get_business(db, user.business_id)
+        if not business:
+            return JSONResponse({"error": "no_business"}, status_code=404)
+
+        def val(key, current):
+            return data[key] if key in data else current
+
+        prev_acct, prev_code = business.bank_account_number, business.bank_code
+        business.name = (val("name", business.name) or business.name).strip()
+        business.whatsapp_number = (val("whatsapp_number", business.whatsapp_number) or business.whatsapp_number).strip()
+        business.owner_notify_number = (val("owner_notify_number", "") or "").strip() or None
+        business.bank_name = (val("bank_name", "") or "").strip() or None
+        business.bank_account_number = (val("bank_account_number", "") or "").strip() or None
+        business.bank_account_name = (val("bank_account_name", "") or "").strip() or None
+        business.bank_code = (val("bank_code", "") or "").strip() or None
+
+        open_time = (val("open_time", "") or "").strip()
+        close_time = (val("close_time", "") or "").strip()
+        if parse_hhmm(open_time) and parse_hhmm(close_time):
+            business.open_time, business.close_time = open_time, close_time
+        else:
+            business.open_time = business.close_time = None
+
+        pm = val("payment_method", business.payment_method)
+        if pm in PAYMENT_METHOD_LABELS:
+            business.payment_method = pm
+        business.delivery_autocalc = 1 if val("delivery_autocalc", bool(business.delivery_autocalc)) else 0
+        business.delivery_base_fee = max(0, int(val("delivery_base_fee", business.delivery_base_fee) or 0))
+        business.delivery_per_km = max(0, int(val("delivery_per_km", business.delivery_per_km) or 0))
+
+        new_location = (val("location_address", business.location_address or "") or "").strip() or None
+        if new_location != (business.location_address or None) or (new_location and business.geo_lat is None):
+            business.location_address = new_location
+            coords = geocode_address(new_location) if new_location else None
+            business.geo_lat = coords[0] if coords else None
+            business.geo_lng = coords[1] if coords else None
+
+        if business.bank_account_number != prev_acct or business.bank_code != prev_code:
+            business.paystack_subaccount_code = None
+        ensure_paystack_subaccount(business)
+        db.commit()
+        return JSONResponse(_business_config_json(business))
+    finally:
+        db.close()
+
+
 @app.get("/orders/{order_id}", response_class=HTMLResponse)
 def order_detail(request: Request, order_id: int) -> HTMLResponse:
     current_user = get_current_user(request)

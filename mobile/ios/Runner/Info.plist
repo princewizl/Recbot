@@ -74,5 +74,10 @@
 		<string>fetch</string>
 		<string>remote-notification</string>
 	</array>
+	<!-- Catalogue item photos (image_picker). -->
+	<key>NSCameraUsageDescription</key>
+	<string>Recbot uses the camera to add photos of your catalogue items.</string>
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>Recbot uses your photo library to add photos of your catalogue items.</string>
 </dict>
 </plist>

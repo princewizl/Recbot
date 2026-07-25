@@ -5,6 +5,8 @@ import '../models.dart';
 import '../push.dart';
 import '../storage.dart';
 import '../theme.dart';
+import 'business_config_screen.dart';
+import 'catalogue_screen.dart';
 import 'login_screen.dart';
 import 'order_detail_screen.dart';
 
@@ -126,9 +128,27 @@ class _OrdersScreenState extends State<OrdersScreen> with WidgetsBindingObserver
         ),
         actions: [
           IconButton(
-            tooltip: 'Sign out',
-            icon: const Icon(Icons.logout_rounded, color: AppColors.muted),
-            onPressed: _logout,
+            tooltip: 'Catalogue',
+            icon: const Icon(Icons.inventory_2_outlined, color: AppColors.muted),
+            onPressed: () async {
+              await Navigator.of(context).push(MaterialPageRoute(builder: (_) => const CatalogueScreen()));
+            },
+          ),
+          PopupMenuButton<String>(
+            icon: const Icon(Icons.more_vert, color: AppColors.muted),
+            color: AppColors.surface2,
+            onSelected: (v) async {
+              if (v == 'settings') {
+                await Navigator.of(context).push(MaterialPageRoute(builder: (_) => const BusinessConfigScreen()));
+                _loadOpenState();
+              } else if (v == 'logout') {
+                _logout();
+              }
+            },
+            itemBuilder: (_) => const [
+              PopupMenuItem(value: 'settings', child: Text('Business settings', style: TextStyle(color: AppColors.text))),
+              PopupMenuItem(value: 'logout', child: Text('Sign out', style: TextStyle(color: AppColors.text))),
+            ],
           ),
           const SizedBox(width: 4),
         ],
