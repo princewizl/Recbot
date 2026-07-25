@@ -120,6 +120,9 @@ class Conversation(Base):
     customer_name = Column(String(255), nullable=True)
     address = Column(Text, nullable=True)
     updated_at = Column(DateTime, default=datetime.utcnow)
+    # Running count of WhatsApp messages in the current order's conversation
+    # (reset to 0 when an order is placed); snapshotted onto the order for billing.
+    message_count = Column(Integer, nullable=False, default=0)
 
 
 class Order(Base):
@@ -143,6 +146,8 @@ class Order(Base):
     payment_link = Column(Text, nullable=True)
     address_unverified = Column(Integer, nullable=False, default=0)
     created_at = Column(DateTime, default=datetime.utcnow)
+    # Messages exchanged while placing this order — drives the platform charge.
+    message_count = Column(Integer, nullable=False, default=0)
 
 
 class User(Base):
@@ -284,6 +289,10 @@ def ensure_schema() -> None:
             conn.execute(text("ALTER TABLE businesses ADD COLUMN delivery_per_km INTEGER NOT NULL DEFAULT 0"))
         if not has_column("businesses", "accepting_orders"):
             conn.execute(text("ALTER TABLE businesses ADD COLUMN accepting_orders INTEGER NOT NULL DEFAULT 1"))
+        if not has_column("conversations", "message_count"):
+            conn.execute(text("ALTER TABLE conversations ADD COLUMN message_count INTEGER NOT NULL DEFAULT 0"))
+        if not has_column("orders", "message_count"):
+            conn.execute(text("ALTER TABLE orders ADD COLUMN message_count INTEGER NOT NULL DEFAULT 0"))
         if not has_column("users", "totp_secret"):
             conn.execute(text("ALTER TABLE users ADD COLUMN totp_secret VARCHAR(64)"))
         if not has_column("users", "totp_enabled"):
@@ -315,7 +324,8 @@ def ensure_schema() -> None:
                 "CREATE TABLE conversations_new ("
                 "id INTEGER PRIMARY KEY, phone_number VARCHAR(50) NOT NULL, business_id INTEGER NOT NULL, "
                 "branch_id INTEGER, category_id INTEGER, stage VARCHAR(50) NOT NULL DEFAULT 'new', "
-                "cart_json TEXT DEFAULT '[]', customer_name VARCHAR(255), address TEXT, updated_at DATETIME)"
+                "cart_json TEXT DEFAULT '[]', customer_name VARCHAR(255), address TEXT, updated_at DATETIME, "
+                "message_count INTEGER NOT NULL DEFAULT 0)"
             ))
             conn.execute(text(
                 "INSERT INTO conversations_new (id, phone_number, business_id, branch_id, category_id, stage, cart_json, address, updated_at) "
@@ -1302,8 +1312,8 @@ def verify_paystack_signature(request: Request, payload: bytes) -> bool:
 def create_plan_seed_data(db) -> None:
     if db.query(Plan).count() == 0:
         plans = [
-            Plan(name="Starter", price_ngn=7500, branch_access=0, monthly_order_cap=300, description="Single-location plan with menu and order management. Includes 300 orders/month."),
-            Plan(name="Growth", price_ngn=20000, branch_access=1, monthly_order_cap=1000, description="Full branch access, advanced menus, and premium workflows. Includes 1,000 orders/month."),
+            Plan(name="Starter", price_ngn=6000, branch_access=0, monthly_order_cap=0, description="Single-location plan with catalogue and order management. Unlimited orders; WhatsApp messaging is billed per message."),
+            Plan(name="Growth", price_ngn=15000, branch_access=1, monthly_order_cap=0, description="Multi-branch access, advanced catalogue, and premium workflows. Unlimited orders; WhatsApp messaging is billed per message."),
         ]
         db.add_all(plans)
         db.commit()
@@ -1475,10 +1485,11 @@ def send_whatsapp_message(to_number: str, body: str, from_number: Optional[str] 
         return False
 
 
-def send_item_catalogue_images(business: Business, to_number: str, items: List[MenuItem], limit: int = 8) -> None:
+def send_item_catalogue_images(business: Business, to_number: str, items: List[MenuItem], limit: int = 8) -> int:
     """Send a photo message for each item that has an image (fashion/retail
     browse). No-op when Twilio isn't configured. Text menu is still the reply,
-    so this only enriches the experience for items that have pictures."""
+    so this only enriches the experience for items that have pictures. Returns
+    the number of photo messages sent (each is a billable WhatsApp message)."""
     sent = 0
     for i, item in enumerate(items, start=1):
         if sent >= limit:
@@ -1492,6 +1503,23 @@ def send_item_catalogue_images(business: Business, to_number: str, items: List[M
             caption += f"\n{item.description}"
         send_whatsapp_message(to_number, caption, from_number=business.whatsapp_number, media_url=url)
         sent += 1
+    return sent
+
+
+# Platform charge (per order) — commission-only model, no subscriptions:
+#   commission %  of the order value  (Collxct's margin, taken via a Paystack split)
+# + per-message   WhatsApp cost recovery (a pure % is underwater on small orders,
+#                 so a small per-message floor keeps every order profitable).
+# Billed messages are capped so a long/fumbled chat can't run the fee away.
+PLATFORM_COMMISSION_PERCENT = float(os.getenv("PLATFORM_COMMISSION_PERCENT", "2.0"))
+PLATFORM_PER_MESSAGE_NGN = int(os.getenv("PLATFORM_PER_MESSAGE_NGN", "10"))
+PLATFORM_MAX_BILLED_MESSAGES = int(os.getenv("PLATFORM_MAX_BILLED_MESSAGES", "25"))
+
+
+def order_platform_charge(order: Order) -> int:
+    billed = min(order.message_count or 0, PLATFORM_MAX_BILLED_MESSAGES)
+    commission = round((order.total or 0) * PLATFORM_COMMISSION_PERCENT / 100)
+    return commission + PLATFORM_PER_MESSAGE_NGN * billed
 
 
 # Orders in these statuses are blocked on the business/admin, not the customer.
@@ -2214,8 +2242,9 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
         items = active_items_for_category(db, business.id, category.id)
         conversation.category_id = category.id
         conversation.stage = CONV_ITEM
+        photos_sent = send_item_catalogue_images(business, conversation.phone_number, items)
+        conversation.message_count = (conversation.message_count or 0) + photos_sent
         db.commit()
-        send_item_catalogue_images(business, conversation.phone_number, items)
         return format_item_menu(items, category.name)
 
     if conversation.stage == CONV_ITEM:
@@ -2323,12 +2352,15 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
             status="awaiting_payment" if auto else "awaiting_delivery_fee",
             status_changed_at=datetime.utcnow(),
             address_unverified=1 if (business.delivery_autocalc and not auto) else 0,
+            # Browse+checkout messages so far, plus this round-trip; drives billing.
+            message_count=(conversation.message_count or 0) + 2,
         )
         db.add(order)
         conversation.cart_json = "[]"
         conversation.address = address
         conversation.category_id = None
         conversation.stage = CONV_AWAITING_PAYMENT
+        conversation.message_count = 0  # start a fresh count for the next order
         db.commit()
         name_prefix = f"Thanks, {conversation.customer_name}! " if conversation.customer_name else "Thanks! "
         notify_order_cap_usage(db, business)
@@ -2459,6 +2491,10 @@ async def webhook(request: Request) -> Response:
             else:
                 conversation = get_or_create_conversation(db, from_number, business.id)
                 reply = handle_webhook_message(db, business, conversation, message, media_url)
+                # Count this round-trip (1 inbound + 1 outbound reply) toward the
+                # current order's message tally used for the platform charge.
+                conversation.message_count = (conversation.message_count or 0) + 2
+                db.commit()
         finally:
             db.close()
 
@@ -4574,6 +4610,8 @@ def order_to_json(order: Order, business: Optional[Business]) -> dict:
         "available_actions": available,
         "age": format_age(waiting_since),
         "created_at": order.created_at.isoformat() if order.created_at else None,
+        "message_count": order.message_count or 0,
+        "platform_charge": order_platform_charge(order),
     }
 
 

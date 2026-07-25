@@ -652,6 +652,47 @@ def test_item_image_upload_serve_and_catalogue(tmp_path, monkeypatch):
     db.close()
 
 
+def test_message_count_and_platform_charge(tmp_path, monkeypatch):
+    db_path = tmp_path / "test_bot.db"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
+
+    import app.main as main
+    importlib.reload(main)
+    client = TestClient(main.app)
+
+    phone = "2348012345678"
+    for msg in ["hi", "1", "1", "checkout", "Ada", "12 Marina Road, Lagos"]:
+        client.post("/webhook", json={"from": phone, "message": msg})
+
+    db = main.SessionLocal()
+    order = db.query(main.Order).order_by(main.Order.id.desc()).first()
+    mc = order.message_count
+    total = order.total
+    charge = main.order_platform_charge(order)
+    conv = db.query(main.Conversation).filter(main.Conversation.phone_number == phone).first()
+    conv_count = conv.message_count
+    db.close()
+
+    # The browse + checkout round-trips were tallied onto the order.
+    assert mc >= 10
+    # Charge = commission % of the order + per-message cost recovery.
+    expected = round(total * main.PLATFORM_COMMISSION_PERCENT / 100) + \
+        main.PLATFORM_PER_MESSAGE_NGN * min(mc, main.PLATFORM_MAX_BILLED_MESSAGES)
+    assert charge == expected
+    # The conversation counter reset when the order was placed (fresh for next).
+    assert conv_count < mc
+
+    # A very long chat is billed only up to the message cap.
+    db = main.SessionLocal()
+    o = db.query(main.Order).order_by(main.Order.id.desc()).first()
+    o.message_count = 999
+    db.commit()
+    capped = main.order_platform_charge(o)
+    db.close()
+    assert capped == round(total * main.PLATFORM_COMMISSION_PERCENT / 100) + \
+        main.PLATFORM_PER_MESSAGE_NGN * main.PLATFORM_MAX_BILLED_MESSAGES
+
+
 def test_paused_business_blocks_new_orders(tmp_path, monkeypatch):
     db_path = tmp_path / "test_bot.db"
     monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
