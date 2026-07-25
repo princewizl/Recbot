@@ -1,7 +1,13 @@
+import base64
 import os
 import importlib
 
 from fastapi.testclient import TestClient
+
+# 1x1 red PNG used to exercise image upload.
+_TINY_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+)
 
 
 def test_category_selection_flow(tmp_path, monkeypatch):
@@ -590,6 +596,60 @@ def test_password_reset_flow(tmp_path, monkeypatch):
     # forgot-password never reveals whether an email exists.
     assert client.post("/api/forgot-password", json={"email": "nobody@example.com"}).json()["ok"] is True
     assert client.post("/api/forgot-password", json={"email": "owner@example.com"}).json()["ok"] is True
+
+
+def test_item_image_upload_serve_and_catalogue(tmp_path, monkeypatch):
+    db_path = tmp_path / "test_bot.db"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
+    monkeypatch.setenv("ADMIN_EMAIL", "admin@example.com")
+    monkeypatch.setenv("ADMIN_PASSWORD", "test-admin-password")
+
+    import app.main as main
+    importlib.reload(main)
+    client = TestClient(main.app)
+    client.post("/login", data={"email": "admin@example.com", "password": "test-admin-password"}, follow_redirects=False)
+    biz = client.post(
+        "/admin/businesses",
+        data={"name": "Fashion House", "whatsapp_number": "+2348000000000"},
+        follow_redirects=False,
+    )
+    business_id = int(biz.headers["location"].split("/")[-1])
+
+    # Upload an item with a photo.
+    created = client.post(
+        f"/admin/businesses/{business_id}/items",
+        data={"name": "Red Dress", "price": "15000", "is_active": "on"},
+        files={"image": ("dress.png", _TINY_PNG, "image/png")},
+        follow_redirects=False,
+    )
+    assert created.status_code == 303
+
+    db = main.SessionLocal()
+    item = db.query(main.MenuItem).filter(main.MenuItem.business_id == business_id).first()
+    image_url = item.image_url
+    business = main.get_business(db, business_id)
+    items = db.query(main.MenuItem).filter(main.MenuItem.business_id == business_id).all()
+    db.close()
+    assert image_url and image_url.startswith("/media/")
+
+    # The image is served publicly.
+    served = client.get(image_url)
+    assert served.status_code == 200 and served.headers["content-type"].startswith("image/")
+
+    # Sending catalogue images is a safe no-op without Twilio configured.
+    main.send_item_catalogue_images(business, "2348011112222", items)
+
+    # A non-image upload is rejected (no image_url stored).
+    client.post(
+        f"/admin/businesses/{business_id}/items",
+        data={"name": "No Pic", "price": "100", "is_active": "on"},
+        files={"image": ("notes.txt", b"hello", "text/plain")},
+        follow_redirects=False,
+    )
+    db = main.SessionLocal()
+    nopic = db.query(main.MenuItem).filter(main.MenuItem.name == "No Pic").first()
+    assert nopic.image_url is None
+    db.close()
 
 
 def test_paused_business_blocks_new_orders(tmp_path, monkeypatch):

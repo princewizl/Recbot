@@ -16,7 +16,7 @@ from html import escape
 from typing import Dict, List, Optional
 
 import httpx
-from fastapi import FastAPI, Form, Request, Response
+from fastapi import FastAPI, File, Form, Request, Response, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import Column, DateTime, Float, Integer, String, Text, UniqueConstraint, create_engine, text
@@ -32,10 +32,15 @@ STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite:///{os.path.join(BASE_DIR, 'bot.db')}")
 
 if DATABASE_URL.startswith("sqlite:///"):
-    RECEIPTS_DIR = os.path.join(os.path.dirname(DATABASE_URL[len("sqlite:///"):]) or ".", "receipts")
+    _DATA_DIR = os.path.dirname(DATABASE_URL[len("sqlite:///"):]) or "."
+    RECEIPTS_DIR = os.path.join(_DATA_DIR, "receipts")
 else:
+    _DATA_DIR = BASE_DIR
     RECEIPTS_DIR = os.path.join(BASE_DIR, "receipts")
 os.makedirs(RECEIPTS_DIR, exist_ok=True)
+# Public item/catalogue images (served over /media, unlike private receipts).
+MEDIA_DIR = os.path.join(_DATA_DIR, "media")
+os.makedirs(MEDIA_DIR, exist_ok=True)
 
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
@@ -330,6 +335,7 @@ ensure_schema()
 
 app = FastAPI(title="Collxct")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+app.mount("/media", StaticFiles(directory=MEDIA_DIR), name="media")
 SECRET_KEY = os.getenv("SECRET_KEY", "supersecret-key")
 if SECRET_KEY == "supersecret-key":
     logger.warning("SECRET_KEY is the built-in default — set a random SECRET_KEY in .env before going live.")
@@ -1443,7 +1449,8 @@ def normalize_whatsapp_number(value: Optional[str]) -> str:
     return value.replace("whatsapp:", "").strip()
 
 
-def send_whatsapp_message(to_number: str, body: str, from_number: Optional[str] = None) -> bool:
+def send_whatsapp_message(to_number: str, body: str, from_number: Optional[str] = None,
+                          media_url: Optional[str] = None) -> bool:
     account_sid = os.getenv("TWILIO_ACCOUNT_SID")
     auth_token = os.getenv("TWILIO_AUTH_TOKEN")
     from_number = from_number or os.getenv("TWILIO_WHATSAPP_NUMBER")
@@ -1457,12 +1464,34 @@ def send_whatsapp_message(to_number: str, body: str, from_number: Optional[str] 
     from_ = from_number if from_number.startswith("whatsapp:") else f"whatsapp:{from_number}"
     try:
         client = TwilioClient(account_sid, auth_token)
-        message = client.messages.create(from_=from_, to=to, body=body)
-        logger.info("send_whatsapp_message sent (sid=%s to=%s from=%s)", message.sid, to, from_)
+        kwargs = {"from_": from_, "to": to, "body": body}
+        if media_url:
+            kwargs["media_url"] = [media_url]
+        message = client.messages.create(**kwargs)
+        logger.info("send_whatsapp_message sent (sid=%s to=%s from=%s media=%s)", message.sid, to, from_, bool(media_url))
         return True
     except Exception as exc:
         logger.error("send_whatsapp_message failed (to=%s from=%s): %s", to, from_, exc)
         return False
+
+
+def send_item_catalogue_images(business: Business, to_number: str, items: List[MenuItem], limit: int = 8) -> None:
+    """Send a photo message for each item that has an image (fashion/retail
+    browse). No-op when Twilio isn't configured. Text menu is still the reply,
+    so this only enriches the experience for items that have pictures."""
+    sent = 0
+    for i, item in enumerate(items, start=1):
+        if sent >= limit:
+            break
+        url = public_media_url(getattr(item, "image_url", None))
+        if not url:
+            continue
+        stock = " (out of stock)" if item.is_out_of_stock else ""
+        caption = f"*{i}. {item.name}* — N{item.price}{stock}"
+        if item.description:
+            caption += f"\n{item.description}"
+        send_whatsapp_message(to_number, caption, from_number=business.whatsapp_number, media_url=url)
+        sent += 1
 
 
 # Orders in these statuses are blocked on the business/admin, not the customer.
@@ -1749,6 +1778,41 @@ def save_payment_receipt(order_id: int, media_url: str) -> Optional[str]:
         return None
 
 
+ITEM_IMAGE_EXTENSIONS = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp"}
+MAX_ITEM_IMAGE_BYTES = 5 * 1024 * 1024  # 5 MB
+
+
+def save_item_image(upload: Optional[UploadFile]) -> Optional[str]:
+    """Save an uploaded catalogue image and return its public path (/media/...).
+    Returns None when there's no file, or the type/size is invalid."""
+    if not upload or not upload.filename:
+        return None
+    content_type = (upload.content_type or "").split(";")[0].strip().lower()
+    ext = ITEM_IMAGE_EXTENSIONS.get(content_type)
+    if not ext:
+        return None
+    data = upload.file.read(MAX_ITEM_IMAGE_BYTES + 1)
+    if not data or len(data) > MAX_ITEM_IMAGE_BYTES:
+        return None
+    filename = f"item_{secrets.token_hex(8)}.{ext}"
+    try:
+        with open(os.path.join(MEDIA_DIR, filename), "wb") as image_file:
+            image_file.write(data)
+    except Exception:
+        return None
+    return f"/media/{filename}"
+
+
+def public_media_url(path: Optional[str]) -> Optional[str]:
+    """Absolute URL for a stored /media/... path (for Twilio outbound media)."""
+    if not path:
+        return None
+    if path.startswith("http://") or path.startswith("https://"):
+        return path
+    base = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+    return f"{base}{path}" if base else path
+
+
 def verify_twilio_signature(request: Request, form_params: Dict[str, str]) -> bool:
     auth_token = os.getenv("TWILIO_AUTH_TOKEN")
     if not auth_token:
@@ -1849,7 +1913,7 @@ def format_item_menu(items: List[MenuItem], category_name: str) -> str:
         if item.description:
             lines.append(f"_{item.description}_")
     return (
-        f"*{category_name}* menu:\n\n" + "\n".join(lines) + "\n\n"
+        f"*{category_name}*\n\n" + "\n".join(lines) + "\n\n"
         "Reply with a number to add an item to your cart, 'cart' to view your cart, "
         "'back' to see other categories, or 'checkout' when you're ready to order."
     )
@@ -2151,6 +2215,7 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
         conversation.category_id = category.id
         conversation.stage = CONV_ITEM
         db.commit()
+        send_item_catalogue_images(business, conversation.phone_number, items)
         return format_item_menu(items, category.name)
 
     if conversation.stage == CONV_ITEM:
@@ -3723,8 +3788,12 @@ def business_detail(request: Request, business_id: int, notice: Optional[str] = 
     plan_expiry_label = plan_due_label(business)
     categories_rows = "".join(f"<tr><td>{escape(category.name)}</td></tr>" for category in context["categories"])
     branches_rows = "".join(f"<tr><td>{escape(branch.name)}</td><td>{escape(branch.address or '')}</td></tr>" for branch in context["branches"])
+    def _thumb(item):
+        if item.image_url:
+            return f"<img src='{escape(item.image_url)}' alt='' style='width:44px;height:44px;object-fit:cover;border-radius:8px;' />"
+        return "<span class='status-pill'>—</span>"
     items_rows = "".join(
-        f"<tr><td>{escape(item.name)}</td><td>{escape(item.description or '')}</td><td>₦{item.price}</td><td>{'Yes' if item.is_active == 1 else 'No'}</td><td>{'Yes' if item.is_out_of_stock == 1 else 'No'}</td><td><a href='/admin/businesses/{business.id}/items/{item.id}'>Edit</a></td></tr>" for item in context["items"]
+        f"<tr><td>{_thumb(item)}</td><td>{escape(item.name)}</td><td>{escape(item.description or '')}</td><td>₦{item.price}</td><td>{'Yes' if item.is_active == 1 else 'No'}</td><td>{'Yes' if item.is_out_of_stock == 1 else 'No'}</td><td><a href='/admin/businesses/{business.id}/items/{item.id}'>Edit</a></td></tr>" for item in context["items"]
     )
     orders_rows = "".join(render_order_row(order) for order in context["orders"])
     plan_options = "".join(
@@ -3847,12 +3916,14 @@ def business_detail(request: Request, business_id: int, notice: Optional[str] = 
     <div class="panel-grid">
       <div class="card">
         <div class="section-head">
-          <h3>Menu Items</h3>
+          <h3>Catalogue</h3>
         </div>
-        <form method="post" action="/admin/businesses/{business.id}/items">
+        <form method="post" action="/admin/businesses/{business.id}/items" enctype="multipart/form-data">
           <input name="name" placeholder="Item Name" required />
           <textarea name="description" placeholder="Short item description"></textarea>
           <input name="price" type="number" placeholder="Price" required />
+          <label class="form-hint">Item photo (optional — great for fashion, shoes, wigs)</label>
+          <input name="image" type="file" accept="image/*" />
           <select name="category_id">
             <option value="">No Category</option>
             {category_options}
@@ -3867,7 +3938,7 @@ def business_detail(request: Request, business_id: int, notice: Optional[str] = 
             <button type="submit">Add Item</button>
           </div>
         </form>
-        <div class="table-wrap"><table><tr><th>Name</th><th>Description</th><th>Price</th><th>Active</th><th>Out of Stock</th><th>Actions</th></tr>{items_rows}</table></div>
+        <div class="table-wrap"><table><tr><th>Photo</th><th>Name</th><th>Description</th><th>Price</th><th>Active</th><th>Out of Stock</th><th>Actions</th></tr>{items_rows}</table></div>
       </div>
       <div class="card">
         <div class="section-head">
@@ -4068,6 +4139,7 @@ def create_menu_item(
     branch_id: Optional[int] = Form(default=None),
     is_active: Optional[str] = Form(default=None),
     is_out_of_stock: Optional[str] = Form(default=None),
+    image: Optional[UploadFile] = File(default=None),
 ) -> RedirectResponse:
     current_user = get_current_user(request)
     if not current_user or (current_user.role != "admin" and current_user.business_id != business_id):
@@ -4084,6 +4156,7 @@ def create_menu_item(
                 price=price,
                 is_active=1 if is_active else 0,
                 is_out_of_stock=1 if is_out_of_stock else 0,
+                image_url=save_item_image(image),
             )
         )
         db.commit()
@@ -4115,13 +4188,21 @@ def edit_menu_item_page(request: Request, business_id: int, item_id: int) -> HTM
         )
         active_checked = "checked" if item.is_active == 1 else ""
         stock_checked = "checked" if item.is_out_of_stock == 1 else ""
+        current_image = (
+            f"<div style='margin:8px 0;'><img src='{escape(item.image_url)}' alt='' "
+            f"style='width:120px;height:120px;object-fit:cover;border-radius:12px;' /></div>"
+            if item.image_url else ""
+        )
         body = f"""
         <div class="card">
           <h3>Edit Item</h3>
-          <form method="post" action="/admin/businesses/{business_id}/items/{item_id}">
+          <form method="post" action="/admin/businesses/{business_id}/items/{item_id}" enctype="multipart/form-data">
             <input name="name" value="{escape(item.name)}" required />
             <textarea name="description" placeholder="Short item description">{escape(item.description or '')}</textarea>
             <input name="price" type="number" value="{item.price}" required />
+            {current_image}
+            <label class="form-hint">Replace photo (leave empty to keep current)</label>
+            <input name="image" type="file" accept="image/*" />
             <select name="category_id">
               <option value="">No Category</option>
               {category_options}
@@ -4153,6 +4234,7 @@ def update_menu_item(
     branch_id: Optional[int] = Form(default=None),
     is_active: Optional[str] = Form(default=None),
     is_out_of_stock: Optional[str] = Form(default=None),
+    image: Optional[UploadFile] = File(default=None),
 ) -> RedirectResponse:
     current_user = get_current_user(request)
     if not current_user or (current_user.role != "admin" and current_user.business_id != business_id):
@@ -4168,6 +4250,9 @@ def update_menu_item(
             item.branch_id = branch_id or None
             item.is_active = 1 if is_active else 0
             item.is_out_of_stock = 1 if is_out_of_stock else 0
+            new_image = save_item_image(image)
+            if new_image:
+                item.image_url = new_image
             db.commit()
     finally:
         db.close()
