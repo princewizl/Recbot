@@ -693,6 +693,34 @@ def test_message_count_and_platform_charge(tmp_path, monkeypatch):
         main.PLATFORM_PER_MESSAGE_NGN * main.PLATFORM_MAX_BILLED_MESSAGES
 
 
+def test_see_and_remove_cart_commands(tmp_path, monkeypatch):
+    db_path = tmp_path / "test_bot.db"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
+
+    import app.main as main
+    importlib.reload(main)
+    client = TestClient(main.app)
+
+    phone = "2348012345678"
+    client.post("/webhook", json={"from": phone, "message": "hi"})
+    client.post("/webhook", json={"from": phone, "message": "1"})  # open a category
+
+    # "see 1" previews the item without adding it to the cart.
+    seen = client.post("/webhook", json={"from": phone, "message": "see 1"}).json()["reply"].lower()
+    assert "add it to your cart" in seen
+    empty = client.post("/webhook", json={"from": phone, "message": "cart"}).json()["reply"].lower()
+    assert "empty" in empty
+
+    # Add an item, then the cart shows numbered lines with a remove hint.
+    client.post("/webhook", json={"from": phone, "message": "1"})
+    cart = client.post("/webhook", json={"from": phone, "message": "cart"}).json()["reply"].lower()
+    assert "remove 1" in cart
+
+    # "remove 1" empties the cart.
+    removed = client.post("/webhook", json={"from": phone, "message": "remove 1"}).json()["reply"].lower()
+    assert "removed" in removed and "empty" in removed
+
+
 def test_commission_model_no_gating_and_bank_code(tmp_path, monkeypatch):
     db_path = tmp_path / "test_bot.db"
     monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")

@@ -70,8 +70,10 @@ class AppOrder {
         age: (json['age'] ?? '').toString(),
       );
 
-  bool get needsAction => availableActions.contains('set_delivery_fee') ||
-      availableActions.contains('mark_paid');
+  // True whenever the business still has something to do on this order — set the
+  // fee, confirm payment, dispatch, or mark delivered. (awaiting_payment waits on
+  // the customer, so it has no action.)
+  bool get needsAction => availableActions.isNotEmpty;
 }
 
 /// Human labels for the action verbs the backend accepts.

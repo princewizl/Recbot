@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import '../api.dart';
+import '../config.dart';
 import '../push.dart';
 import '../storage.dart';
 import '../theme.dart';
@@ -15,24 +16,17 @@ class LoginScreen extends StatefulWidget {
 }
 
 class _LoginScreenState extends State<LoginScreen> {
-  final _baseUrl = TextEditingController();
+  // The backend is live; the app always talks to the production server.
+  static const _baseUrl = Config.defaultBaseUrl;
   final _email = TextEditingController();
   final _password = TextEditingController();
   final _code = TextEditingController();
   bool _needs2fa = false;
   bool _busy = false;
-  bool _showAdvanced = false;
   String? _error;
 
   @override
-  void initState() {
-    super.initState();
-    Storage.readBaseUrl().then((v) => setState(() => _baseUrl.text = v));
-  }
-
-  @override
   void dispose() {
-    _baseUrl.dispose();
     _email.dispose();
     _password.dispose();
     _code.dispose();
@@ -44,15 +38,13 @@ class _LoginScreenState extends State<LoginScreen> {
       _busy = true;
       _error = null;
     });
-    final baseUrl = _baseUrl.text.trim().replaceAll(RegExp(r'/+$'), '');
     try {
       final result = await ApiClient.login(
-        baseUrl: baseUrl,
+        baseUrl: _baseUrl,
         email: _email.text.trim(),
         password: _password.text,
         code: _needs2fa ? _code.text.trim() : null,
       );
-      await Storage.writeBaseUrl(baseUrl);
       await Storage.writeToken(result.token);
       await Storage.writeProfile(email: _email.text.trim(), businessName: result.businessName);
       await PushService.registerWithBackend();
@@ -123,7 +115,7 @@ class _LoginScreenState extends State<LoginScreen> {
 
   Future<void> _forgotPassword() async {
     final controller = TextEditingController(text: _email.text.trim());
-    final baseUrl = _baseUrl.text.trim().replaceAll(RegExp(r'/+$'), '');
+    const baseUrl = _baseUrl;
     final email = await showDialog<String>(
       context: context,
       builder: (ctx) => AlertDialog(
@@ -165,8 +157,7 @@ class _LoginScreenState extends State<LoginScreen> {
   }
 
   Future<void> _openLegal(String path) async {
-    final base = _baseUrl.text.trim().replaceAll(RegExp(r'/+$'), '');
-    final uri = Uri.parse('$base$path');
+    final uri = Uri.parse('$_baseUrl$path');
     if (!await launchUrl(uri, mode: LaunchMode.externalApplication)) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Couldn’t open the page.')));
@@ -243,22 +234,6 @@ class _LoginScreenState extends State<LoginScreen> {
               child: const Text('Forgot your password?', style: TextStyle(color: AppColors.emeraldBright, fontSize: 13)),
             ),
           ),
-          Align(
-            alignment: Alignment.center,
-            child: TextButton(
-              onPressed: () => setState(() => _showAdvanced = !_showAdvanced),
-              child: Text(
-                _showAdvanced ? 'Hide server settings' : 'Server settings',
-                style: const TextStyle(color: AppColors.muted, fontSize: 13),
-              ),
-            ),
-          ),
-          if (_showAdvanced)
-            TextField(
-              controller: _baseUrl,
-              decoration: const InputDecoration(labelText: 'Server address', prefixIcon: Icon(Icons.dns_outlined, size: 20)),
-              keyboardType: TextInputType.url,
-            ),
         ],
       ),
     );

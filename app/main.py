@@ -1264,15 +1264,15 @@ def create_paystack_order_link(business: Business, order: Order) -> Optional[str
     digits = re.sub(r"[^0-9]", "", order.customer_phone) or "customer"
     payload = {
         "email": f"{digits}@collxct.com.ng",
-        "amount": order.total * 100,  # kobo
+        "amount": order_grand_total(business, order) * 100,  # kobo — items + delivery + platform fee
         "reference": reference,
         "currency": "NGN",
         "metadata": {"order_id": order.id, "business_id": business.id, "customer_phone": order.customer_phone},
     }
     if subaccount:
-        # transaction_charge (kobo) is Collxct's flat cut for this order; the
-        # remainder settles to the business subaccount. bearer=subaccount means the
-        # business bears Paystack's own processing fee.
+        # transaction_charge (kobo) is Collxct's fee for this order, taken from the
+        # customer's grand total; the order value settles to the business subaccount.
+        # bearer=subaccount means the business bears Paystack's own processing fee.
         payload["subaccount"] = subaccount
         payload["transaction_charge"] = order_platform_charge(order) * 100
         payload["bearer"] = "subaccount"
@@ -1311,8 +1311,8 @@ def verify_paystack_order_payment(business: Business, order: Order) -> Optional[
         tx = data.get("data") or {}
         if tx.get("status") != "success":
             return False
-        # Guard against a lesser amount slipping through.
-        return int(tx.get("amount") or 0) >= order.total * 100
+        # Guard against a lesser amount slipping through (grand total = order + fee).
+        return int(tx.get("amount") or 0) >= order_grand_total(business, order) * 100
     except Exception as exc:
         logger.error("paystack verify failed (order=%s): %s", order.id, exc)
         return None
@@ -1610,6 +1610,8 @@ ACTION_NEEDED_STATUSES = ("awaiting_delivery_fee", "payment_claimed")
 ACTION_LABELS = {
     "awaiting_delivery_fee": "Set delivery fee",
     "payment_claimed": "Confirm payment",
+    "paid": "Dispatch",
+    "out_for_delivery": "Mark delivered",
 }
 STAFF_ROLES = {"admin", "business_owner", "business-owner", "owner"}
 ACTION_REMINDER_AFTER = timedelta(minutes=int(os.getenv("ACTION_REMINDER_AFTER_MINUTES", "10")))
@@ -2025,8 +2027,8 @@ def format_item_menu(items: List[MenuItem], category_name: str) -> str:
             lines.append(f"_{item.description}_")
     return (
         f"*{category_name}*\n\n" + "\n".join(lines) + "\n\n"
-        "Reply with a number to add an item to your cart, 'cart' to view your cart, "
-        "'back' to see other categories, or 'checkout' when you're ready to order."
+        "Reply *see 1* to view a photo of item 1, a *number* to add that item to your cart, "
+        "'cart' to view your cart, 'back' for other categories, or 'checkout' when you're ready."
     )
 
 
@@ -2056,6 +2058,16 @@ def format_cart_lines(cart: List[Dict[str, object]]) -> str:
         qty = entry.get("qty", 1)
         price = entry.get("price", 0)
         lines.append(f"{qty} x {entry.get('name', 'Item')} — N{int(price) * int(qty)}")
+    return "\n".join(lines)
+
+
+def format_cart_numbered(cart: List[Dict[str, object]]) -> str:
+    """Cart with position numbers, so customers can 'remove 1' to drop an item."""
+    lines = []
+    for i, entry in enumerate(cart, start=1):
+        qty = entry.get("qty", 1)
+        price = entry.get("price", 0)
+        lines.append(f"*{i}.* {qty} x {entry.get('name', 'Item')} — N{int(price) * int(qty)}")
     return "\n".join(lines)
 
 
@@ -2089,10 +2101,29 @@ def format_bank_info(business: Optional[Business]) -> str:
     return "\n".join(lines) if lines else "Please contact us for payment details."
 
 
+def order_customer_fee(business: Optional[Business], order: Order) -> int:
+    """Platform fee added to the customer's total — only for Paystack orders, where
+    we collect it via the transaction split. Bank transfers add nothing (we can't
+    split a manual transfer)."""
+    if business and business.payment_method == "paystack":
+        return order_platform_charge(order)
+    return 0
+
+
+def order_grand_total(business: Optional[Business], order: Order) -> int:
+    """What the customer actually pays: items + delivery + platform fee."""
+    return order.total + order_customer_fee(business, order)
+
+
 def format_payment_request(order: Order, business: Optional[Business]) -> str:
+    fee = order_customer_fee(business, order)
+    grand = order.total + fee
     if business and business.payment_method == "paystack" and order.payment_link:
+        fee_line = f"\n*Service fee:* N{fee}" if fee else ""
         return (
-            f"Your order *#{order.id}* total is *N{order.total}* (including N{order.delivery_fee} delivery).\n\n"
+            f"Your order *#{order.id}*:\n"
+            f"*Items + delivery:* N{order.total} (incl. N{order.delivery_fee} delivery){fee_line}\n"
+            f"*Total to pay:* N{grand}\n\n"
             f"*Pay securely here:* {order.payment_link}\n\n"
             f"Cards, bank transfer, and USSD all work. Reply *paid* once you're done and we'll confirm instantly. ⚡"
         )
@@ -2154,6 +2185,12 @@ def record_payment_claim(db, business: Business, conversation: Conversation, ord
             conversation.stage = CONV_NEW
             conversation.address = None
             db.commit()
+            push_to_business(
+                business.id,
+                "💰 Payment received",
+                f"Order #{order.id} — {order.customer_name or order.customer_phone} paid ₦{order.total}. Ready to dispatch.",
+                {"type": "paid", "order_id": str(order.id), "business_id": str(business.id)},
+            )
             if business.owner_notify_number:
                 link = order_link(order.id)
                 link_line = f"\nOpen: {link}" if link else ""
@@ -2346,7 +2383,7 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
         if normalized in CART_WORDS:
             if not cart:
                 return "Your cart is empty. Reply with a number to add an item."
-            return f"*Your cart:*\n{format_cart_lines(cart)}\n\n*Total:* N{cart_total(cart)}\n\nReply 'checkout' to place your order or add another item number."
+            return f"*Your cart:*\n{format_cart_numbered(cart)}\n\n*Total:* N{cart_total(cart)}\n\nReply 'checkout' to place your order, 'remove 1' to remove item 1, or add another item number."
         if normalized in CLEAR_CART_WORDS:
             conversation.cart_json = "[]"
             db.commit()
@@ -2361,6 +2398,36 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
             reply = build_greeting_reply(db, business, conversation)
             db.commit()
             return reply
+        # "See N" — show a photo of item N (on tap), without adding it to the cart.
+        see_match = re.match(r"^see\s+(\d+)$", normalized)
+        if see_match:
+            n = int(see_match.group(1))
+            if n < 1 or n > len(items):
+                return f"There's no item {n} here. Reply 'see 1' to view item 1."
+            target = items[n - 1]
+            caption = f"*{n}. {target.name}* — N{target.price}" + (f"\n{target.description}" if target.description else "")
+            url = public_media_url(getattr(target, "image_url", None))
+            if url:
+                send_whatsapp_message(conversation.phone_number, caption, from_number=business.whatsapp_number, media_url=url)
+                conversation.message_count = (conversation.message_count or 0) + 1
+                db.commit()
+                return f"👆 That's *{target.name}*. Reply *{n}* to add it to your cart, 'see' another number, or 'checkout'."
+            db.commit()
+            return f"{caption}\n\n(No photo for this one.) Reply *{n}* to add it to your cart."
+        # "Remove N" — take cart item N out of the cart.
+        remove_match = re.match(r"^remove\s+(\d+)$", normalized)
+        if remove_match:
+            if not cart:
+                return "Your cart is empty — nothing to remove."
+            n = int(remove_match.group(1))
+            if n < 1 or n > len(cart):
+                return f"There's no item {n} in your cart. Reply 'cart' to see it."
+            removed = cart.pop(n - 1)
+            conversation.cart_json = json.dumps(cart)
+            db.commit()
+            if cart:
+                return f"🗑️ Removed *{removed.get('name', 'item')}*.\n\n*Your cart:*\n{format_cart_numbered(cart)}\n\n*Total:* N{cart_total(cart)}\n\nReply 'checkout' to order, or add another number."
+            return f"🗑️ Removed *{removed.get('name', 'item')}*. Your cart is now empty — reply with a number to add an item."
         index = resolve_choice(message, [item.name for item in items])
         if index is None or index < 1 or index > len(items):
             category = db.query(Category).filter(Category.id == conversation.category_id).one_or_none()
@@ -2375,20 +2442,8 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
         else:
             cart.append({"item_id": item.id, "name": item.name, "description": item.description or "", "price": item.price, "qty": 1})
         conversation.cart_json = json.dumps(cart)
-        # "On tap": send the photo of the item the customer actually chose (one
-        # message), instead of blasting the whole category to window-shoppers.
-        item_url = public_media_url(getattr(item, "image_url", None))
-        if item_url:
-            send_whatsapp_message(
-                conversation.phone_number,
-                f"✅ Added *{item.name}* — N{item.price}",
-                from_number=business.whatsapp_number, media_url=item_url,
-            )
-            conversation.message_count = (conversation.message_count or 0) + 1
-            db.commit()
-            return "Reply with another number to add more, 'cart' to view your cart, or 'checkout' to place your order."
         db.commit()
-        return f"✅ Added *{item.name}* to your cart. Reply with another number to add more, 'cart' to view your cart, or 'checkout' to place your order."
+        return f"✅ Added *{item.name}* to your cart. Reply with another number to add more, 'see 2' to view an item, 'cart' to view your cart, or 'checkout' to place your order."
 
     if conversation.stage == CONV_NAME:
         name = message.strip()
@@ -4849,7 +4904,7 @@ async def api_unregister_device(request: Request) -> JSONResponse:
 
 
 @app.get("/api/orders")
-def api_orders(request: Request) -> JSONResponse:
+def api_orders(request: Request, scope: str = "") -> JSONResponse:
     user = get_current_user(request)
     if not user or user.role not in STAFF_ROLES:
         return JSONResponse({"error": "unauthorized"}, status_code=401)
@@ -4860,6 +4915,10 @@ def api_orders(request: Request) -> JSONResponse:
             if not user.business_id:
                 return JSONResponse({"count": 0, "orders": []})
             query = query.filter(Order.business_id == user.business_id)
+        # scope=active: everything still in flight (until delivered/cancelled), so
+        # an order stays in the app's list until it's actually delivered.
+        if scope == "active":
+            query = query.filter(Order.status.in_(tuple(ACTIVE_ORDER_STATUSES)))
         orders = query.order_by(Order.id.desc()).limit(50).all()
         businesses = {b.id: b for b in db.query(Business).all()} if orders else {}
         items = [order_to_json(o, businesses.get(o.business_id)) for o in orders]

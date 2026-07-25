@@ -4,9 +4,8 @@
 /// different one (e.g. an ngrok tunnel or a laptop's LAN IP) and it is saved,
 /// so you can point the same APK at any environment without rebuilding.
 class Config {
-  /// Change this to your deployed backend, or leave it and override on the
-  /// login screen. No trailing slash.
-  static const String defaultBaseUrl = 'https://collxct.com.ng:8443';
+  /// The live backend. No trailing slash.
+  static const String defaultBaseUrl = 'https://recbot.collxct.ng';
 
   /// Android notification channel used for order alerts. Must match the
   /// `channel_id` the backend sets on the FCM message ("orders").

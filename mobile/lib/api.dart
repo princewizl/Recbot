@@ -2,6 +2,7 @@ import 'dart:convert';
 
 import 'package:http/http.dart' as http;
 
+import 'config.dart';
 import 'models.dart';
 import 'storage.dart';
 
@@ -50,9 +51,8 @@ class ApiClient {
 
   /// Builds a client from what's persisted (base URL + token).
   static Future<ApiClient> current() async {
-    final baseUrl = await Storage.readBaseUrl();
     final token = await Storage.readToken();
-    return ApiClient(baseUrl: baseUrl, token: token);
+    return ApiClient(baseUrl: Config.defaultBaseUrl, token: token);
   }
 
   Map<String, String> get _headers => {
@@ -114,8 +114,9 @@ class ApiClient {
     );
   }
 
-  Future<List<AppOrder>> listOrders({bool onlyActionRequired = false}) async {
-    final path = onlyActionRequired ? '/api/action-required' : '/api/orders';
+  /// scope 'active' = orders still in flight (until delivered); '' = all recent.
+  Future<List<AppOrder>> listOrders({String scope = ''}) async {
+    final path = scope == 'active' ? '/api/orders?scope=active' : '/api/orders';
     final res = await http.get(_uri(path), headers: _headers);
     if (res.statusCode != 200) _raise(res);
     final body = jsonDecode(res.body) as Map<String, dynamic>;

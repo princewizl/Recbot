@@ -15,9 +15,9 @@ class OrdersScreen extends StatefulWidget {
   State<OrdersScreen> createState() => _OrdersScreenState();
 }
 
-class _OrdersScreenState extends State<OrdersScreen> {
+class _OrdersScreenState extends State<OrdersScreen> with WidgetsBindingObserver {
   late Future<List<AppOrder>> _future;
-  bool _onlyActionRequired = true;
+  bool _activeOnly = true;
   String? _businessName;
   bool? _acceptingOrders;
   bool _togglingOpen = false;
@@ -25,15 +25,31 @@ class _OrdersScreenState extends State<OrdersScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _future = _load();
     Storage.readBusinessName().then((v) => setState(() => _businessName = v));
     _loadOpenState();
     PushService.registerWithBackend();
   }
 
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // Auto-refresh whenever the app comes back to the foreground (e.g. you left
+    // to another app and came back), so the list is never stale.
+    if (state == AppLifecycleState.resumed) {
+      _refresh();
+    }
+  }
+
   Future<List<AppOrder>> _load() async {
     final client = await ApiClient.current();
-    return client.listOrders(onlyActionRequired: _onlyActionRequired);
+    return client.listOrders(scope: _activeOnly ? 'active' : '');
   }
 
   Future<void> _refresh() async {
@@ -153,10 +169,10 @@ class _OrdersScreenState extends State<OrdersScreen> {
                       final orders = snapshot.data ?? [];
                       if (orders.isEmpty) {
                         return _emptyState(
-                          _onlyActionRequired ? Icons.check_circle_outline_rounded : Icons.receipt_long_outlined,
-                          _onlyActionRequired ? 'You’re all caught up' : 'No recent orders',
-                          _onlyActionRequired
-                              ? 'Nothing needs your attention right now. 🎉'
+                          _activeOnly ? Icons.check_circle_outline_rounded : Icons.receipt_long_outlined,
+                          _activeOnly ? 'No active orders' : 'No recent orders',
+                          _activeOnly
+                              ? 'Orders in progress show here until they’re delivered. 🎉'
                               : 'New orders will show up here.',
                         );
                       }
@@ -225,21 +241,21 @@ class _OrdersScreenState extends State<OrdersScreen> {
       ),
       child: Row(
         children: [
-          _filterPill('Needs action', true),
-          _filterPill('All recent', false),
+          _filterPill('Active', true),
+          _filterPill('All', false),
         ],
       ),
     );
   }
 
   Widget _filterPill(String label, bool value) {
-    final selected = _onlyActionRequired == value;
+    final selected = _activeOnly == value;
     return Expanded(
       child: GestureDetector(
         onTap: () {
-          if (_onlyActionRequired != value) {
+          if (_activeOnly != value) {
             setState(() {
-              _onlyActionRequired = value;
+              _activeOnly = value;
               _future = _load();
             });
           }
