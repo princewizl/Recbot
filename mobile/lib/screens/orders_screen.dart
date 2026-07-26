@@ -338,9 +338,9 @@ class _OrderCard extends StatelessWidget {
     final needs = order.needsAction;
     return Material(
       color: AppColors.surface,
-      borderRadius: BorderRadius.circular(16),
+      borderRadius: BorderRadius.circular(18),
       child: InkWell(
-        borderRadius: BorderRadius.circular(16),
+        borderRadius: BorderRadius.circular(18),
         onTap: () async {
           await Navigator.of(context).push(
             MaterialPageRoute(builder: (_) => OrderDetailScreen(orderId: order.id)),
@@ -348,61 +348,60 @@ class _OrderCard extends StatelessWidget {
           await onChanged();
         },
         child: Container(
-          padding: const EdgeInsets.all(14),
           decoration: BoxDecoration(
-            borderRadius: BorderRadius.circular(16),
+            borderRadius: BorderRadius.circular(18),
             border: Border.all(color: needs ? color.withValues(alpha: 0.35) : AppColors.border),
+            boxShadow: const [BoxShadow(color: Color(0x2B000000), blurRadius: 16, offset: Offset(0, 6))],
           ),
+          clipBehavior: Clip.antiAlias,
           child: Row(
             children: [
-              Container(
-                width: 46,
-                height: 46,
-                decoration: BoxDecoration(
-                  color: color.withValues(alpha: 0.14),
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                alignment: Alignment.center,
-                child: Text('#${order.id}',
-                    style: TextStyle(color: color, fontWeight: FontWeight.w800, fontSize: 13)),
-              ),
-              const SizedBox(width: 12),
+              // Status accent stripe down the left edge.
+              Container(width: 4, height: 68, color: color.withValues(alpha: needs ? 0.9 : 0.4)),
               Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(order.customer,
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(color: AppColors.text, fontWeight: FontWeight.w700, fontSize: 15)),
-                    const SizedBox(height: 3),
-                    Row(
-                      children: [
-                        Text('₦${order.total}', style: const TextStyle(color: AppColors.muted, fontSize: 13, fontWeight: FontWeight.w600)),
-                        const Text('  ·  ', style: TextStyle(color: AppColors.muted2)),
-                        Flexible(
-                          child: Text(order.statusLabel,
-                              maxLines: 1, overflow: TextOverflow.ellipsis,
-                              style: const TextStyle(color: AppColors.muted, fontSize: 13)),
-                        ),
-                      ],
-                    ),
-                  ],
+                child: Padding(
+                  padding: const EdgeInsets.fromLTRB(14, 13, 14, 13),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        children: [
+                          Expanded(
+                            child: Text(order.customer,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(color: AppColors.text, fontWeight: FontWeight.w700, fontSize: 15.5, letterSpacing: -0.2)),
+                          ),
+                          const SizedBox(width: 10),
+                          Text('₦${order.total}',
+                              style: const TextStyle(color: AppColors.text, fontWeight: FontWeight.w800, fontSize: 15.5)),
+                        ],
+                      ),
+                      const SizedBox(height: 7),
+                      Row(
+                        children: [
+                          Text('#${order.id}', style: const TextStyle(color: AppColors.muted2, fontSize: 12, fontWeight: FontWeight.w600)),
+                          const Text('   ·   ', style: TextStyle(color: AppColors.muted2, fontSize: 12)),
+                          Expanded(
+                            child: Text(order.statusLabel,
+                                maxLines: 1, overflow: TextOverflow.ellipsis,
+                                style: TextStyle(color: color, fontSize: 12.5, fontWeight: FontWeight.w600)),
+                          ),
+                          const SizedBox(width: 8),
+                          if (needs)
+                            Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
+                              decoration: BoxDecoration(color: color.withValues(alpha: 0.16), borderRadius: BorderRadius.circular(20)),
+                              child: Text(order.action, style: TextStyle(color: color, fontWeight: FontWeight.w700, fontSize: 11)),
+                            )
+                          else
+                            Text(order.age, style: const TextStyle(color: AppColors.muted2, fontSize: 11.5)),
+                        ],
+                      ),
+                    ],
+                  ),
                 ),
               ),
-              const SizedBox(width: 8),
-              if (needs)
-                Container(
-                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                  decoration: BoxDecoration(
-                    color: color.withValues(alpha: 0.16),
-                    borderRadius: BorderRadius.circular(20),
-                  ),
-                  child: Text(order.action,
-                      style: TextStyle(color: color, fontWeight: FontWeight.w700, fontSize: 11.5)),
-                )
-              else
-                Text(order.age, style: const TextStyle(color: AppColors.muted2, fontSize: 12)),
             ],
           ),
         ),

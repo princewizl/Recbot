@@ -47,6 +47,56 @@ class _OrderDetailScreenState extends State<OrderDetailScreen> {
     if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
   }
 
+  Future<void> _cancel() async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: AppColors.surface,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
+        title: const Text('Cancel this order?', style: TextStyle(color: AppColors.text)),
+        content: const Text('This clears the order and can’t be undone — use it for abandoned or stale orders.',
+            style: TextStyle(color: AppColors.muted)),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Keep it', style: TextStyle(color: AppColors.muted))),
+          TextButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Cancel order', style: TextStyle(color: AppColors.danger, fontWeight: FontWeight.w700))),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    setState(() => _acting = true);
+    try {
+      final client = await ApiClient.current();
+      await client.doAction(widget.orderId, 'cancel');
+      if (mounted) {
+        _toast('Order cancelled.');
+        Navigator.pop(context);
+      }
+    } on ApiException catch (e) {
+      _toast(e.friendly);
+    } catch (_) {
+      _toast('Couldn’t cancel.');
+    } finally {
+      if (mounted) setState(() => _acting = false);
+    }
+  }
+
+  Widget _cancelButton(AppOrder order) => Padding(
+        padding: const EdgeInsets.only(top: 4),
+        child: SizedBox(
+          height: 50,
+          child: OutlinedButton.icon(
+            onPressed: _acting ? null : _cancel,
+            style: OutlinedButton.styleFrom(
+              foregroundColor: AppColors.dangerSoft,
+              side: BorderSide(color: AppColors.danger.withValues(alpha: 0.4)),
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+            ),
+            icon: const Icon(Icons.cancel_outlined, size: 18),
+            label: const Text('Cancel order', style: TextStyle(fontWeight: FontWeight.w700)),
+          ),
+        ),
+      );
+
   Future<void> _promptDeliveryFee() async {
     final controller = TextEditingController();
     final fee = await showDialog<int>(
@@ -113,6 +163,7 @@ class _OrderDetailScreenState extends State<OrderDetailScreen> {
                   ]),
                   const SizedBox(height: 24),
                   ..._actionButtons(order),
+                  if (order.canCancel) _cancelButton(order),
                 ],
               );
             },

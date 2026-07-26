@@ -4584,6 +4584,19 @@ def apply_order_action(db, order: Order, business: Optional[Business], action: s
             from_number=business.whatsapp_number if business else None,
         )
         return True, ""
+    if action == "cancel":
+        # Used to clear stale/abandoned orders. Only a customer who had actually
+        # committed (past the fee stage) is worth pinging.
+        notify_customer = order.status not in ("awaiting_delivery_fee",)
+        set_order_status(order, "cancelled")
+        db.commit()
+        if notify_customer:
+            send_whatsapp_message(
+                order.customer_phone,
+                f"Your order *#{order.id}* has been cancelled. Reply 'hi' anytime to start a new order.",
+                from_number=business.whatsapp_number if business else None,
+            )
+        return True, ""
     return False, "unknown_action"
 
 
@@ -4659,6 +4672,25 @@ def mark_order_delivered(request: Request, order_id: int) -> RedirectResponse:
             return RedirectResponse(url="/login", status_code=303)
         business = get_business(db, order.business_id)
         apply_order_action(db, order, business, "mark_delivered")
+        business_id = order.business_id
+    finally:
+        db.close()
+    return _order_action_dashboard_redirect(current_user, business_id)
+
+
+@app.post("/orders/{order_id}/cancel")
+def cancel_order(request: Request, order_id: int) -> RedirectResponse:
+    current_user = get_current_user(request)
+    db = SessionLocal()
+    try:
+        order = db.query(Order).filter(Order.id == order_id).one_or_none()
+        if not order:
+            return RedirectResponse(url="/admin/orders", status_code=303)
+        if not current_user or (current_user.role != "admin" and current_user.business_id != order.business_id):
+            return RedirectResponse(url="/login", status_code=303)
+        business = get_business(db, order.business_id)
+        if order.status in ACTIVE_ORDER_STATUSES:
+            apply_order_action(db, order, business, "cancel")
         business_id = order.business_id
     finally:
         db.close()
@@ -4786,6 +4818,7 @@ def order_to_json(order: Order, business: Optional[Business]) -> dict:
         "status_label": ORDER_STATUS_LABELS.get(order.status, order.status),
         "action": ACTION_LABELS.get(order.status, ""),
         "available_actions": available,
+        "can_cancel": order.status in ACTIVE_ORDER_STATUSES,
         "age": format_age(waiting_since),
         "created_at": order.created_at.isoformat() if order.created_at else None,
         "message_count": order.message_count or 0,
@@ -4960,7 +4993,7 @@ async def api_order_action(request: Request, order_id: int) -> JSONResponse:
     except Exception:
         return JSONResponse({"error": "invalid_json"}, status_code=400)
     action = (data.get("action") or "").strip()
-    if action not in {"set_delivery_fee", "mark_paid", "dispatch", "mark_delivered"}:
+    if action not in {"set_delivery_fee", "mark_paid", "dispatch", "mark_delivered", "cancel"}:
         return JSONResponse({"error": "unknown_action"}, status_code=400)
     delivery_fee = None
     if action == "set_delivery_fee":
@@ -5417,6 +5450,15 @@ def order_detail(request: Request, order_id: int) -> HTMLResponse:
         </dialog>
         """
 
+    # Cancel is available for any live order — handy for clearing stale/abandoned ones.
+    cancel_button = ""
+    if order.status in ACTIVE_ORDER_STATUSES:
+        cancel_button = (
+            f"<form method='post' action='/orders/{order.id}/cancel' style='display:inline' "
+            f"onsubmit=\"return confirm('Cancel order #{order.id}? This cannot be undone.')\">"
+            f"<button type='submit' class='btn' style='border-color:rgba(255,94,122,.4);color:var(--danger);'>Cancel order</button></form>"
+        )
+
     body = f"""
     <div class="hero-panel">
       <div>
@@ -5428,6 +5470,7 @@ def order_detail(request: Request, order_id: int) -> HTMLResponse:
         <span class="status-pill">{escape(status_label)}</span>
         {verify_button}
         {action_button}
+        {cancel_button}
       </div>
     </div>
     <div class="detail-grid">

@@ -29,6 +29,7 @@ class AppOrder {
   final String statusLabel;
   final String action;
   final List<String> availableActions;
+  final bool canCancel;
   final String age;
 
   AppOrder({
@@ -46,6 +47,7 @@ class AppOrder {
     required this.statusLabel,
     required this.action,
     required this.availableActions,
+    required this.canCancel,
     required this.age,
   });
 
@@ -67,6 +69,7 @@ class AppOrder {
         action: (json['action'] ?? '').toString(),
         availableActions:
             ((json['available_actions'] ?? []) as List).map((e) => e.toString()).toList(),
+        canCancel: json['can_cancel'] == true,
         age: (json['age'] ?? '').toString(),
       );
 

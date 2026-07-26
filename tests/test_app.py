@@ -693,6 +693,32 @@ def test_message_count_and_platform_charge(tmp_path, monkeypatch):
         main.PLATFORM_PER_MESSAGE_NGN * main.PLATFORM_MAX_BILLED_MESSAGES
 
 
+def test_cancel_order(tmp_path, monkeypatch):
+    db_path = tmp_path / "test_bot.db"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
+    monkeypatch.setenv("ADMIN_EMAIL", "admin@example.com")
+    monkeypatch.setenv("ADMIN_PASSWORD", "test-admin-password")
+
+    import app.main as main
+    importlib.reload(main)
+    client = TestClient(main.app)
+
+    _place_demo_order(client)
+    token = client.post("/api/login", json={"email": "admin@example.com", "password": "test-admin-password"}).json()["token"]
+    auth = {"Authorization": f"Bearer {token}"}
+
+    order = client.get("/api/orders?scope=active", headers=auth).json()["orders"][0]
+    assert order["can_cancel"] is True
+
+    cancelled = client.post(f"/api/orders/{order['id']}/action", headers=auth, json={"action": "cancel"})
+    assert cancelled.status_code == 200 and cancelled.json()["status"] == "cancelled"
+    assert cancelled.json()["can_cancel"] is False
+
+    # It drops out of the active list.
+    active = client.get("/api/orders?scope=active", headers=auth).json()["orders"]
+    assert not any(o["id"] == order["id"] for o in active)
+
+
 def test_see_and_remove_cart_commands(tmp_path, monkeypatch):
     db_path = tmp_path / "test_bot.db"
     monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
