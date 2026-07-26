@@ -1270,9 +1270,12 @@ def create_paystack_order_link(business: Business, order: Order) -> Optional[str
         "metadata": {"order_id": order.id, "business_id": business.id, "customer_phone": order.customer_phone},
     }
     if subaccount:
-        # transaction_charge (kobo) is Collxct's fee for this order, taken from the
-        # customer's grand total; the order value settles to the business subaccount.
-        # bearer=subaccount means the business bears Paystack's own processing fee.
+        # Collxct keeps the FULL platform charge (flat + commission + messaging) as a
+        # flat transaction_charge. The customer only added the service fee (flat +
+        # messaging) to their total, so the commission portion is effectively drawn
+        # from the business's share — i.e. the business bears the commission, the
+        # customer bears the service fee. bearer=subaccount: business also carries
+        # Paystack's own processing fee.
         payload["subaccount"] = subaccount
         payload["transaction_charge"] = order_platform_charge(order) * 100
         payload["bearer"] = "subaccount"
@@ -2102,16 +2105,19 @@ def format_bank_info(business: Optional[Business]) -> str:
 
 
 def order_customer_fee(business: Optional[Business], order: Order) -> int:
-    """Platform fee added to the customer's total — only for Paystack orders, where
-    we collect it via the transaction split. Bank transfers add nothing (we can't
-    split a manual transfer)."""
+    """The service fee shown to and paid by the CUSTOMER: WhatsApp cost recovery
+    plus the flat fee. The commission is deliberately NOT here — it's the business's
+    cost of using Recbot and comes out of their payout via the Paystack split (see
+    the transaction charge in create_paystack_order_link). Paystack orders only —
+    a manual bank transfer can't be split."""
     if business and business.payment_method == "paystack":
-        return order_platform_charge(order)
+        billed = min(order.message_count or 0, PLATFORM_MAX_BILLED_MESSAGES)
+        return PLATFORM_SERVICE_CHARGE_NGN + PLATFORM_PER_MESSAGE_NGN * billed
     return 0
 
 
 def order_grand_total(business: Optional[Business], order: Order) -> int:
-    """What the customer actually pays: items + delivery + platform fee."""
+    """What the customer actually pays: items + delivery + the customer service fee."""
     return order.total + order_customer_fee(business, order)
 
 
