@@ -84,7 +84,6 @@ class _BusinessConfigScreenState extends State<BusinessConfigScreen> {
       await client.saveBusinessConfig(data);
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Settings saved.')));
-        Navigator.pop(context);
       }
     } on ApiException catch (e) {
       _toast(e.friendly);

@@ -3,8 +3,8 @@ import 'package:flutter/material.dart';
 
 import 'push.dart';
 import 'screens/login_screen.dart';
+import 'screens/main_shell.dart';
 import 'screens/order_detail_screen.dart';
-import 'screens/orders_screen.dart';
 import 'storage.dart';
 import 'theme.dart';
 
@@ -39,7 +39,7 @@ class RecbotApp extends StatelessWidget {
       navigatorKey: navigatorKey,
       debugShowCheckedModeBanner: false,
       theme: buildAppTheme(),
-      home: loggedIn ? const OrdersScreen() : const LoginScreen(),
+      home: loggedIn ? const MainShell() : const LoginScreen(),
     );
   }
 }

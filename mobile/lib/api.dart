@@ -164,6 +164,14 @@ class ApiClient {
     return body['accepting_orders'] == true;
   }
 
+  // --- Dashboard ---
+
+  Future<Map<String, dynamic>> getStats() async {
+    final res = await http.get(_uri('/api/stats'), headers: _headers);
+    if (res.statusCode != 200) _raise(res);
+    return jsonDecode(res.body) as Map<String, dynamic>;
+  }
+
   // --- Catalogue ---
 
   Future<({List<CatalogueCategory> categories, List<CatalogueItem> items})> getCatalogue() async {

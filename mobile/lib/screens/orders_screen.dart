@@ -2,12 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../api.dart';
 import '../models.dart';
-import '../push.dart';
-import '../storage.dart';
 import '../theme.dart';
-import 'business_config_screen.dart';
-import 'catalogue_screen.dart';
-import 'login_screen.dart';
 import 'order_detail_screen.dart';
 
 class OrdersScreen extends StatefulWidget {
@@ -20,18 +15,12 @@ class OrdersScreen extends StatefulWidget {
 class _OrdersScreenState extends State<OrdersScreen> with WidgetsBindingObserver {
   late Future<List<AppOrder>> _future;
   bool _activeOnly = true;
-  String? _businessName;
-  bool? _acceptingOrders;
-  bool _togglingOpen = false;
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
     _future = _load();
-    Storage.readBusinessName().then((v) => setState(() => _businessName = v));
-    _loadOpenState();
-    PushService.registerWithBackend();
   }
 
   @override
@@ -42,11 +31,7 @@ class _OrdersScreenState extends State<OrdersScreen> with WidgetsBindingObserver
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    // Auto-refresh whenever the app comes back to the foreground (e.g. you left
-    // to another app and came back), so the list is never stale.
-    if (state == AppLifecycleState.resumed) {
-      _refresh();
-    }
+    if (state == AppLifecycleState.resumed) _refresh();
   }
 
   Future<List<AppOrder>> _load() async {
@@ -58,111 +43,18 @@ class _OrdersScreenState extends State<OrdersScreen> with WidgetsBindingObserver
     final future = _load();
     setState(() => _future = future);
     await future;
-    _loadOpenState();
-  }
-
-  Future<void> _loadOpenState() async {
-    try {
-      final client = await ApiClient.current();
-      final accepting = await client.getAcceptingOrders();
-      if (mounted) setState(() => _acceptingOrders = accepting);
-    } catch (_) {/* non-fatal */}
-  }
-
-  Future<void> _setOpen(bool accepting) async {
-    setState(() => _togglingOpen = true);
-    try {
-      final client = await ApiClient.current();
-      final result = await client.setAcceptingOrders(accepting);
-      if (mounted) {
-        setState(() => _acceptingOrders = result);
-        _toast(result ? 'Open — accepting orders.' : 'Paused — new orders are blocked.');
-      }
-    } on ApiException catch (e) {
-      _toast(e.friendly);
-    } catch (_) {
-      _toast('Couldn’t reach the server.');
-    } finally {
-      if (mounted) setState(() => _togglingOpen = false);
-    }
-  }
-
-  void _toast(String msg) {
-    if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
-  }
-
-  Future<void> _logout() async {
-    await PushService.unregister();
-    await Storage.clearToken();
-    if (!mounted) return;
-    Navigator.of(context).pushAndRemoveUntil(
-      MaterialPageRoute(builder: (_) => const LoginScreen()),
-      (route) => false,
-    );
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       extendBodyBehindAppBar: true,
-      appBar: AppBar(
-        toolbarHeight: 64,
-        title: Row(
-          children: [
-            const BrandLogo(size: 34),
-            const SizedBox(width: 12),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  const Text('Hello 👋', style: TextStyle(color: AppColors.muted, fontSize: 12, fontWeight: FontWeight.w500)),
-                  Text(_businessName ?? 'Your storefront',
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(color: AppColors.text, fontSize: 18, fontWeight: FontWeight.w800)),
-                ],
-              ),
-            ),
-          ],
-        ),
-        actions: [
-          IconButton(
-            tooltip: 'Catalogue',
-            icon: const Icon(Icons.inventory_2_outlined, color: AppColors.muted),
-            onPressed: () async {
-              await Navigator.of(context).push(MaterialPageRoute(builder: (_) => const CatalogueScreen()));
-            },
-          ),
-          PopupMenuButton<String>(
-            icon: const Icon(Icons.more_vert, color: AppColors.muted),
-            color: AppColors.surface2,
-            onSelected: (v) async {
-              if (v == 'settings') {
-                await Navigator.of(context).push(MaterialPageRoute(builder: (_) => const BusinessConfigScreen()));
-                _loadOpenState();
-              } else if (v == 'logout') {
-                _logout();
-              }
-            },
-            itemBuilder: (_) => const [
-              PopupMenuItem(value: 'settings', child: Text('Business settings', style: TextStyle(color: AppColors.text))),
-              PopupMenuItem(value: 'logout', child: Text('Sign out', style: TextStyle(color: AppColors.text))),
-            ],
-          ),
-          const SizedBox(width: 4),
-        ],
-      ),
+      appBar: AppBar(title: const Text('Orders')),
       body: GlowBackground(
         child: SafeArea(
           child: Column(
             children: [
-              const SizedBox(height: 8),
-              if (_acceptingOrders != null)
-                Padding(
-                  padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
-                  child: _openCard(),
-                ),
+              const SizedBox(height: 4),
               Padding(
                 padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
                 child: _filterToggle(),
@@ -180,9 +72,6 @@ class _OrdersScreenState extends State<OrdersScreen> with WidgetsBindingObserver
                       }
                       if (snapshot.hasError) {
                         final err = snapshot.error;
-                        if (err is ApiException && err.code == 'unauthorized') {
-                          WidgetsBinding.instance.addPostFrameCallback((_) => _logout());
-                        }
                         return _emptyState(Icons.wifi_off_rounded,
                             'Couldn’t load orders', err is ApiException ? err.friendly : 'Pull down to retry.');
                       }
@@ -209,44 +98,6 @@ class _OrdersScreenState extends State<OrdersScreen> with WidgetsBindingObserver
             ],
           ),
         ),
-      ),
-    );
-  }
-
-  Widget _openCard() {
-    final open = _acceptingOrders!;
-    final color = open ? AppColors.emeraldBright : AppColors.danger;
-    return Container(
-      padding: const EdgeInsets.fromLTRB(16, 12, 12, 12),
-      decoration: BoxDecoration(
-        color: color.withValues(alpha: 0.10),
-        borderRadius: BorderRadius.circular(18),
-        border: Border.all(color: color.withValues(alpha: 0.35)),
-      ),
-      child: Row(
-        children: [
-          Icon(open ? Icons.storefront_rounded : Icons.pause_circle_filled_rounded, color: color),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(open ? 'Open — accepting orders' : 'Paused — orders blocked',
-                    style: TextStyle(fontWeight: FontWeight.w800, color: color, fontSize: 15)),
-                const SizedBox(height: 2),
-                Text(open ? 'Customers can order on WhatsApp.' : 'New WhatsApp orders are turned away.',
-                    style: const TextStyle(color: AppColors.muted, fontSize: 12.5)),
-              ],
-            ),
-          ),
-          if (_togglingOpen)
-            const Padding(
-              padding: EdgeInsets.symmetric(horizontal: 10),
-              child: SizedBox(height: 22, width: 22, child: CircularProgressIndicator(strokeWidth: 2, color: AppColors.emeraldBright)),
-            )
-          else
-            Switch(value: open, onChanged: _setOpen),
-        ],
       ),
     );
   }

@@ -5095,6 +5095,37 @@ def _api_owner(request: Request) -> Optional[User]:
     return user
 
 
+@app.get("/api/stats")
+def api_stats(request: Request) -> JSONResponse:
+    user = _api_owner(request)
+    if not user:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    db = SessionLocal()
+    try:
+        bid = user.business_id
+        today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+        active = db.query(Order).filter(Order.business_id == bid, Order.status.in_(tuple(ACTIVE_ORDER_STATUSES))).count()
+        orders_today = db.query(Order).filter(Order.business_id == bid, Order.created_at >= today_start).count()
+        revenue_today = sum(
+            o.total for o in db.query(Order).filter(
+                Order.business_id == bid, Order.created_at >= today_start,
+                Order.status.in_(("paid", "out_for_delivery", "delivered")),
+            ).all()
+        )
+        business = get_business(db, bid)
+        return JSONResponse({
+            "business_name": business.name if business else "",
+            "accepting_orders": bool(business.accepting_orders) if business else True,
+            "needs_action": len(action_needed_orders(db, bid)),
+            "active_orders": active,
+            "orders_today": orders_today,
+            "revenue_today": revenue_today,
+            "item_count": db.query(MenuItem).filter(MenuItem.business_id == bid).count(),
+        })
+    finally:
+        db.close()
+
+
 @app.get("/api/catalogue")
 def api_catalogue(request: Request) -> JSONResponse:
     user = _api_owner(request)

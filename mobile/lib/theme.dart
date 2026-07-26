@@ -58,6 +58,7 @@ ThemeData buildAppTheme() {
     useMaterial3: true,
     brightness: Brightness.dark,
     colorScheme: scheme,
+    fontFamily: 'Jakarta',
     scaffoldBackgroundColor: AppColors.bg,
     canvasColor: AppColors.bg,
     splashColor: AppColors.emerald.withValues(alpha: 0.10),

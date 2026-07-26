@@ -794,6 +794,11 @@ def test_catalogue_and_business_config_api(tmp_path, monkeypatch):
     assert client.request("DELETE", f"/api/items/{item_id}", headers=auth).json()["ok"] is True
     assert not any(i["id"] == item_id for i in client.get("/api/catalogue", headers=auth).json()["items"])
 
+    # Dashboard stats.
+    stats = client.get("/api/stats", headers=auth).json()
+    for key in ("business_name", "accepting_orders", "needs_action", "active_orders", "orders_today", "revenue_today", "item_count"):
+        assert key in stats
+
     # Business config round-trips.
     assert "whatsapp_number" in client.get("/api/business/config", headers=auth).json()
     saved = client.post("/api/business/config", json={"name": "My Shop", "bank_code": "058", "open_time": "09:00", "close_time": "18:00"}, headers=auth)

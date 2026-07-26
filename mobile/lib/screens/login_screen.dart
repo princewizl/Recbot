@@ -6,7 +6,7 @@ import '../config.dart';
 import '../push.dart';
 import '../storage.dart';
 import '../theme.dart';
-import 'orders_screen.dart';
+import 'main_shell.dart';
 
 class LoginScreen extends StatefulWidget {
   const LoginScreen({super.key});
@@ -49,7 +49,7 @@ class _LoginScreenState extends State<LoginScreen> {
       await Storage.writeProfile(email: _email.text.trim(), businessName: result.businessName);
       await PushService.registerWithBackend();
       if (!mounted) return;
-      Navigator.of(context).pushReplacement(MaterialPageRoute(builder: (_) => const OrdersScreen()));
+      Navigator.of(context).pushReplacement(MaterialPageRoute(builder: (_) => const MainShell()));
     } on ApiException catch (e) {
       setState(() {
         if (e.code == 'totp_required') {
