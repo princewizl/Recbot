@@ -38,7 +38,7 @@ The `twilio` SDK is installed and a `send_whatsapp_message(to_number, body, from
 One Twilio account/subaccount maps to exactly one WhatsApp Business Account (WABA) — you can't have separate WABAs per business under one account. But **within that one WABA you can register multiple phone numbers ("senders")**, so multiple businesses can share a single Twilio account, each with their own distinct number.
 
 1. In the Twilio Console, register a new phone number for WhatsApp under your existing WABA (Twilio can provision a number for you, or you can bring your own). Meta requires ownership verification of that specific number via SMS/voice OTP — quick, not a real barrier.
-2. Set that number's "when a message comes in" webhook to the same URL as your first number: `https://collxct.com.ng:8443/webhook` — routing between businesses happens inside the app (`resolve_webhook_business` matches Twilio's `To` field against `Business.whatsapp_number`), not via separate webhook URLs.
+2. Set that number's "when a message comes in" webhook to the same URL as your first number: `https://recbot.collxct.ng/webhook` — routing between businesses happens inside the app (`resolve_webhook_business` matches Twilio's `To` field against `Business.whatsapp_number`), not via separate webhook URLs.
 3. On the Collxct admin side, create the business with that exact number in `whatsapp_number` (matching the format Twilio sends, e.g. `+234...`).
 4. Set the business's bank details in config so the payment flow works.
 

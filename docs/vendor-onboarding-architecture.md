@@ -1,5 +1,12 @@
 # Nigeria-Friendly Vendor Onboarding Architecture
 
+> **Note (July 2026):** this is a historical analysis. Pricing has since moved to
+> **commission-only** — 2% per order (business, via a Paystack split) + a small
+> per-order service fee (customer); **no subscription plans**. Payments run through
+> one **central Paystack account with a subaccount per business**, so vendors no
+> longer supply their own Paystack key. References to subscription plans / per-business
+> Paystack keys below are superseded.
+
 ## Current state of this repository
 This repository currently contains a single FastAPI-based WhatsApp ordering MVP, not a full multi-vendor platform yet.
 

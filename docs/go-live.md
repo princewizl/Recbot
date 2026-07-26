@@ -9,8 +9,8 @@ Google Play Store and Apple App Store.
 
 Needed for **both** stores before you can submit:
 
-- [ ] **Privacy Policy URL** — live at `https://collxct.com.ng:8443/privacy`
-- [ ] **Terms of Use URL** — live at `https://collxct.com.ng:8443/terms`
+- [ ] **Privacy Policy URL** — live at `https://recbot.collxct.ng/privacy`
+- [ ] **Terms of Use URL** — live at `https://recbot.collxct.ng/terms`
       (Both were added to the web portal. Have a lawyer review the template text —
       see the note at the top of each page.)
 - [ ] **App icon** — the app still uses the default Flutter icon. Design a
@@ -30,7 +30,7 @@ Needed for **both** stores before you can submit:
 
 ## Part 1 — Backend to production
 
-The apps need the production backend (`collxct.com.ng:8443`) running this
+The apps need the production backend (`recbot.collxct.ng`) running this
 branch's `/api/*` code + FCM. Full steps: **[push-deploy.md](push-deploy.md)**.
 Summary:
 
@@ -98,7 +98,8 @@ Full detail: **[../mobile/IOS-SETUP.md](../mobile/IOS-SETUP.md)**. Summary:
       2023 and GDPR-style rights for global users.
 - [ ] Nigeria: if you process personal data at scale, check whether you must file
       with the **Nigeria Data Protection Commission (NDPC)** and/or appoint a DPO.
-- [ ] Payment/refund terms accurate (Paystack; onboarding + subscription fees).
+- [ ] Payment terms accurate: **2% per-order commission (business) + per-order
+      service fee (customer)**, no subscriptions; optional one-time setup fee.
 - [ ] Account & data deletion path in place (email now; in-app recommended).
 - [ ] Store listings link the Privacy Policy URL (required by both stores).
 - [ ] Push notifications are opt-in and transactional (they are).

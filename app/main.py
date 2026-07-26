@@ -2956,24 +2956,18 @@ def homepage(request: Request, sent: Optional[str] = None) -> HTMLResponse:
               </div>
               <div class="doc-card">
                 <h3>💳 Getting paid</h3>
-                <p class="doc-lead">Bank transfer works from day one with no account to set up. Paystack adds instant, auto-confirmed payment links (card, transfer, USSD) — a live Paystack account is typically approved in <b style="display:inline;color:var(--text);">1–3 days</b> and settles straight to your bank. We never hold your money.</p>
-                <b class="have">Paystack Starter (unregistered business) needs:</b>
+                <p class="doc-lead">Just give us the <b style="display:inline;color:var(--text);">bank account</b> you want to be paid into — that's it. Card, transfer and USSD payments are auto-confirmed and settle <b style="display:inline;color:var(--text);">straight to your bank</b>, minus our small per-order fee. <b style="display:inline;color:var(--text);">You don't create or manage any Paystack account</b> — we handle the payment side centrally and never hold your money.</p>
+                <b class="have">All we need to pay you:</b>
                 <ul>
-                  <li>Your BVN</li>
-                  <li>A valid ID — NIN, driver's licence, voter's card or passport</li>
-                  <li>The bank account you want to be paid into</li>
+                  <li>Your bank name and account number</li>
+                  <li>BVN or CAC to verify the payout account, if requested</li>
                 </ul>
-                <b class="need">Registered-business Paystack (higher limits) needs:</b>
-                <ul>
-                  <li>CAC certificate &amp; business details (TIN if you have one)</li>
-                  <li>Directors' IDs / BVNs</li>
-                </ul>
-                <div class="doc-note">No Paystack yet? Start taking orders on bank transfer today and switch to payment links later — zero downtime.</div>
+                <div class="doc-note">Prefer plain bank transfer? You can start on manual transfer today and switch to instant auto-confirmed payments anytime — zero downtime.</div>
               </div>
             </div>
             <div class="timeline-banner">
-              <div><b>Number + Paystack/CAC ready</b><span>Live in a few days — the time for our build plus Meta's number approval.</span></div>
-              <div><b>Starting from scratch</b><span>We launch you on bank transfer right away and go live on your own number as Meta &amp; Paystack approvals come through.</span></div>
+              <div><b>Number + bank details ready</b><span>Live in a few days — the time for our build plus Meta's number approval.</span></div>
+              <div><b>Starting from scratch</b><span>We launch you on bank transfer right away and go live on your own number as Meta's approval comes through.</span></div>
             </div>
           </div>
         </section>
@@ -3121,10 +3115,14 @@ def terms_page(request: Request) -> HTMLResponse:
       <p>You must not use Recbot for anything illegal, deceptive, or abusive; to send spam; to sell prohibited
       goods; or to attempt to disrupt, reverse-engineer, or gain unauthorised access to the service.</p>
 
-      <h3>6. Fees, subscriptions &amp; payments</h3>
-      <p>Onboarding/setup fees and subscription plan prices are shown before you buy. Subscription billing is
-      recurring for the cycle you choose and is processed by our payment partner (Paystack). Except where the law
-      requires otherwise, fees are non-refundable. We may change pricing on reasonable notice.</p>
+      <h3>6. Fees &amp; payments</h3>
+      <p>Recbot is commission-based: for each completed order we charge the business a commission
+      (a percentage of the order value) and the customer a small per-order service fee that recovers
+      messaging costs. These are collected automatically through our payment partner (Paystack) as a
+      transaction split — the business's share settles to its bank, our fee to us. There are no
+      subscriptions. Any optional one-time setup fee is shown before you agree to it. Except where the
+      law requires otherwise, fees already collected are non-refundable, and we may change our rates on
+      reasonable notice.</p>
 
       <h3>7. Third-party services</h3>
       <p>Recbot relies on third parties including Meta/WhatsApp, Twilio, Paystack, Google Firebase and
@@ -3198,7 +3196,7 @@ def privacy_page(request: Request) -> HTMLResponse:
 
       <h3>4. How and why we use it</h3>
       <p>To provide and operate the ordering service; to route and price orders; to send you order alerts
-      (including push notifications); to process subscriptions and payments; to provide support; to keep the
+      (including push notifications); to process order payments and our fees; to provide support; to keep the
       service secure; and to meet legal obligations.</p>
 
       <h3>5. Legal bases</h3>
@@ -3382,7 +3380,7 @@ def login_page(request: Request) -> HTMLResponse:
       <div class="auth-hero">
         <div class="eyebrow">Recbot CRM</div>
         <h2>Welcome back</h2>
-        <p>Sign in to manage your storefront, menus, subscriptions, and WhatsApp ordering flow.</p>
+        <p>Sign in to manage your storefront, catalogue, orders, and WhatsApp ordering flow.</p>
       </div>
       <div class="card auth-form">
         <h2>Secure sign in</h2>

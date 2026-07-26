@@ -1,6 +1,6 @@
 # Deploying the push-enabled backend to the server
 
-The mobile app needs the production backend (`collxct.com.ng:8443`) to run this
+The mobile app needs the production backend (`recbot.collxct.ng`) to run this
 branch's `/api/*` code **and** have Firebase Cloud Messaging configured. Steps:
 
 ## 1. Get the code on the server
@@ -43,9 +43,9 @@ docker compose logs recbot | grep -i push
 docker compose exec recbot curl -fs http://127.0.0.1:8000/health
 ```
 
-Then the app's default Server address (`https://collxct.com.ng:8443`) works from
-any network — no LAN IP or ngrok needed. If push is misconfigured the app still
-works; alerts just fall back to WhatsApp + the web dashboard.
+Then the app (which targets `https://recbot.collxct.ng`) works from any network.
+If push is misconfigured the app still works; alerts just fall back to WhatsApp +
+the web dashboard.
 
 ## Security notes
 - The key is mounted read-only and is **not** in the image or git (`.dockerignore`

@@ -1,6 +1,23 @@
-# Deploying Recbot to the Collxct Server (same domain, port 8443)
+# Deploying Recbot to the Collxct server
 
-## Important correction from earlier
+> **⚠️ Current setup (July 2026) — this supersedes the guide below.**
+> Recbot is now served at **`https://recbot.collxct.ng`** through the **main
+> Collxct nginx** (`collxct-nginx-1`, which already owns ports 80/443), *not* via a
+> private nginx sidecar on `:8443`. The Recbot app container joins the main proxy's
+> network (`collxct_collxct_net`), and the proxy reverse-proxies
+> `recbot.collxct.ng` → `collxct-recbot:8000`. Recbot has its **own** Let's Encrypt
+> certificate for `recbot.collxct.ng` (issued with `certbot certonly --standalone`
+> plus `--pre-hook`/`--post-hook` that stop/start the main nginx for auto-renewal).
+> No `:8443`, no sidecar container.
+>
+> **Authoritative, up-to-date steps: [push-deploy.md](push-deploy.md).** Pricing is
+> now **commission-only** — 2% per order (business) + a small per-order service fee
+> (customer), no subscriptions. Everything below describes the *original*
+> sidecar-on-8443 approach and is kept for history only.
+
+---
+
+## (Historical) Important correction from earlier
 
 Collxct, as documented in your existing deploy guide, is **a different, already-running application** — Flask + Postgres + Redis + Celery, Monnify for payments, Meta's native WhatsApp Cloud API for messaging, deployed from `github.com/princewizl/collxct` to `/opt/collxct` on a Contabo VPS at `collxct.com.ng`, with its own `nginx` container owning host ports 80/443 as part of that stack. This Recbot app is FastAPI + SQLite + Paystack + Twilio — a separate codebase. They are **not** the same running app, despite the `COLLXCT-` string that shows up in this app's Paystack payment references (that was a naming coincidence, not evidence of shared deployment).
 
@@ -161,7 +178,7 @@ Should return `{"status":"ok"}` with a valid cert this time (no `-k` needed). Al
 git push origin main
 
 # on the server
-ssh root@<server-ip>
+ssh root@158.220.84.21
 cd /opt/recbot
 git pull origin main
 docker compose up -d --build
