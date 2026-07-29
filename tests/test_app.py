@@ -562,7 +562,6 @@ def test_legal_pages_render(tmp_path, monkeypatch):
         r = client.get(path)
         assert r.status_code == 200
         assert needle in r.text
-        assert "not legal advice" in r.text
 
 
 def test_password_reset_flow(tmp_path, monkeypatch):

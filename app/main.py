@@ -1088,7 +1088,7 @@ def plan_due_label(business: Business) -> str:
 
 
 DEFAULT_UTC_OFFSET_MINUTES = int(os.getenv("DEFAULT_UTC_OFFSET_MINUTES", "60"))  # WAT (Lagos)
-PLAN_GRACE_DAYS = int(os.getenv("PLAN_GRACE_DAYS", "3"))
+PLAN_GRACE_DAYS = int(os.getenv("PLAN_GRACE_DAYS", "5"))
 # Annual prepay: pay this many months up front, get 12 (default = 2 months free).
 ANNUAL_MONTHS_CHARGED = int(os.getenv("ANNUAL_MONTHS_CHARGED", "10"))
 
@@ -3076,21 +3076,12 @@ def owner_portal(request: Request) -> HTMLResponse:
 LEGAL_LAST_UPDATED = "24 July 2026"
 
 
-def _legal_note() -> str:
-    return (
-        "<div class='notice-banner'>These documents are provided as a starting template for "
-        "Collxct / Recbot and are <strong>not legal advice</strong>. Please have them reviewed "
-        "by a qualified lawyer before you rely on them, and tailor them to your final data flows.</div>"
-    )
-
-
 @app.get("/terms", response_class=HTMLResponse)
 def terms_page(request: Request) -> HTMLResponse:
     body = f"""
     <div class="card" style="max-width:820px;margin:0 auto;">
       <h1>Terms of Use</h1>
       <p class="form-hint">Last updated: {LEGAL_LAST_UPDATED}</p>
-      {_legal_note()}
 
       <h3>1. Agreement</h3>
       <p>These Terms govern your access to and use of Recbot, the WhatsApp ordering and order-management
@@ -3172,7 +3163,6 @@ def privacy_page(request: Request) -> HTMLResponse:
     <div class="card" style="max-width:820px;margin:0 auto;">
       <h1>Privacy Policy</h1>
       <p class="form-hint">Last updated: {LEGAL_LAST_UPDATED}</p>
-      {_legal_note()}
 
       <h3>1. Scope</h3>
       <p>This policy explains how Collxct (“we”) handles personal data through Recbot's web portal and mobile
