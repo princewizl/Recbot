@@ -381,7 +381,7 @@ def test_landing_page_and_contact_form(tmp_path, monkeypatch):
 
     page = client.get("/")
     assert page.status_code == 200
-    for needle in ["ordering machine", "Pay only when you sell", "per order", "no Paystack account needed", "What we need to onboard you", "Request my setup", "logo-white.svg"]:
+    for needle in ["ordering machine", "Pay only when you sell", "per order", "processed securely by Paystack", "What we need to onboard you", "Request my setup", "logo-white.svg"]:
         assert needle in page.text, f"missing: {needle}"
 
     # Contact form stores the lead (SMTP unconfigured -> sent=0 notice).

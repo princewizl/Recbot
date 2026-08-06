@@ -2910,7 +2910,7 @@ def homepage(request: Request, sent: Optional[str] = None) -> HTMLResponse:
             </div>
             <div style="max-width:560px;margin:0 auto;text-align:center;background:var(--surface);border:1px solid rgba(52,211,153,.5);border-radius:22px;padding:36px 28px;box-shadow:0 20px 50px rgba(0,0,0,.4);">
               <div style="font-size:3.2rem;font-weight:800;line-height:1;color:var(--green-strong);">{PLATFORM_COMMISSION_PERCENT:g}%<span style="font-size:1rem;color:var(--muted);font-weight:600;"> per order</span></div>
-              <p style="color:var(--muted);margin:16px 0 0;">Plus a small WhatsApp messaging fee per order. Your money settles <strong style="color:var(--text);">straight to your bank</strong> automatically — no monthly plans, no order limits, and <strong style="color:var(--text);">no Paystack account needed on your side.</strong></p>
+              <p style="color:var(--muted);margin:16px 0 0;">Plus a small WhatsApp messaging fee per order. Payments are processed securely by Paystack and your money settles <strong style="color:var(--text);">straight to your bank</strong> automatically — no monthly plans and no order limits.</p>
             </div>
             <p class="lp-setup">Optional one-time setup from <strong>₦{ONBOARDING_FEE_NGN:,}</strong> covers your catalogue build, payment setup, and a guided test launch. No order caps, ever.</p>
           </div>
@@ -2925,7 +2925,7 @@ def homepage(request: Request, sent: Optional[str] = None) -> HTMLResponse:
             <div class="req-grid">
               <div class="req"><span class="tick">✓</span><div><b>A WhatsApp number</b><span>Your own dedicated number for the bot (each business gets its own — we help you set one up).</span></div></div>
               <div class="req"><span class="tick">✓</span><div><b>Your menu &amp; prices</b><span>A simple list or photo is fine — we'll structure it into categories for the bot.</span></div></div>
-              <div class="req"><span class="tick">✓</span><div><b>How you get paid</b><span>Just your bank account details — card &amp; transfer payments settle straight to your bank automatically. No Paystack account needed on your side.</span></div></div>
+              <div class="req"><span class="tick">✓</span><div><b>How you get paid</b><span>Just your bank account details. Payments are processed by Paystack and settle straight to your bank automatically, through a Paystack subaccount we set up for you.</span></div></div>
               <div class="req"><span class="tick">✓</span><div><b>Opening hours &amp; delivery</b><span>When you sell, where you deliver from, and your delivery pricing (or let us auto-calculate it).</span></div></div>
             </div>
           </div>
@@ -2956,7 +2956,7 @@ def homepage(request: Request, sent: Optional[str] = None) -> HTMLResponse:
               </div>
               <div class="doc-card">
                 <h3>💳 Getting paid</h3>
-                <p class="doc-lead">Just give us the <b style="display:inline;color:var(--text);">bank account</b> you want to be paid into — that's it. Card, transfer and USSD payments are auto-confirmed and settle <b style="display:inline;color:var(--text);">straight to your bank</b>, minus our small per-order fee. <b style="display:inline;color:var(--text);">You don't create or manage any Paystack account</b> — we handle the payment side centrally and never hold your money.</p>
+                <p class="doc-lead">Just give us the <b style="display:inline;color:var(--text);">bank account</b> you want to be paid into. Payments are processed securely by <b style="display:inline;color:var(--text);">Paystack</b>: we set you up with a Paystack subaccount linked to your bank, so card, transfer and USSD payments are auto-confirmed and settle <b style="display:inline;color:var(--text);">straight to your bank account</b>, minus our small per-order fee. You don't have to integrate or manage Paystack yourself, and we never hold your money.</p>
                 <b class="have">All we need to pay you:</b>
                 <ul>
                   <li>Your bank name and account number</li>
@@ -4058,7 +4058,7 @@ def business_detail(request: Request, business_id: int, notice: Optional[str] = 
             </label>
             {bank_field}
             {"<span class='status-pill'>✅ Payout account linked</span>" if business.paystack_subaccount_code else ""}
-            <p class="form-hint">With Paystack, customers pay by card, transfer, or USSD and it's confirmed automatically. Recbot runs Paystack <em>centrally</em> and takes its commission as a split, settling the rest straight to the bank account above — <strong>you don't need your own Paystack key</strong>. The bank code is Paystack's numeric code for your bank (we'll set it for you if unsure).</p>
+            <p class="form-hint">With Paystack, customers pay by card, transfer, or USSD and it's confirmed automatically. Recbot processes payments through Paystack centrally and takes its commission as a transaction split, with the rest settling straight to the bank account above via a Paystack subaccount — <strong>you don't set up or manage your own Paystack integration</strong>. The bank code is Paystack's numeric code for your bank (we'll set it for you if unsure).</p>
             <hr style="border:none;border-top:1px solid var(--border);margin:14px 0;" />
             <label><input type="checkbox" name="delivery_autocalc" {"checked" if business.delivery_autocalc else ""} /> Auto-calculate delivery fees by distance</label>
             <textarea name="location_address" placeholder="Pickup address — where deliveries leave from (defaults to your first branch's address)">{escape(business.location_address or '')}</textarea>
