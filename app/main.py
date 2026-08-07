@@ -841,12 +841,14 @@ def render_page(title: str, body: str, nav_html: Optional[str] = None) -> HTMLRe
                       --shadow-sm:0 1px 2px rgba(0,0,0,.5); --shadow-md:0 12px 32px rgba(0,0,0,.4);
                     }}
                     * {{ box-sizing: border-box; }}
-                    html,body {{ height:100%; }}
+                    html,body {{ height:100%; overflow-x:hidden; }}
                     body {{
                       margin:0; font-family:'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-                      font-size:15px; line-height:1.6; color:var(--text);
+                      font-size:15px; line-height:1.6; color:var(--text); overflow-wrap:break-word;
                       background: radial-gradient(1100px circle at 12% -8%, rgba(16,185,129,.12), transparent 55%), radial-gradient(900px circle at 100% 0%, rgba(245,158,11,.05), transparent 50%), var(--bg);
                     }}
+                    img, svg {{ max-width:100%; }}
+                    .main-area, .content, .auth-shell > *, .hero-panel > *, .detail-grid > *, .panel-grid > *, .stats-grid > * {{ min-width:0; }}
                     .shell {{ display:flex; min-height:100vh; }}
                     .sidebar {{ width:258px; flex-shrink:0; background:var(--surface); border-right:1px solid var(--border); display:flex; flex-direction:column; padding:18px 14px; position:sticky; top:0; height:100vh; overflow-y:auto; }}
                     .brand {{ display:flex; align-items:center; gap:10px; padding:4px 8px 18px; margin-bottom:10px; border-bottom:1px solid var(--border); text-decoration:none; }}
@@ -990,6 +992,7 @@ def render_page(title: str, body: str, nav_html: Optional[str] = None) -> HTMLRe
                     .rb-mascot.rb-collapsed .rb-avatar {{ width:72px; height:72px; }}
                     @keyframes rb-bob {{ 0%, 100% {{ transform:translateY(0); }} 50% {{ transform:translateY(-6px); }} }}
                     @media (max-width: 900px) {{
+                      .rb-mascot {{ display:none; }}
                       .shell {{ flex-direction:column; }}
                       .sidebar {{ width:100%; height:auto; position:relative; flex-direction:row; align-items:center; overflow-x:auto; padding:10px 12px; gap:14px; }}
                       .brand {{ border-bottom:none; border-right:1px solid var(--border); padding:4px 14px 4px 0; margin-bottom:0; }}
@@ -2718,7 +2721,10 @@ def homepage(request: Request, sent: Optional[str] = None) -> HTMLResponse:
           }}
           * {{ box-sizing:border-box; margin:0; }}
           html {{ scroll-behavior:smooth; }}
-          body {{ font-family:'Inter',system-ui,sans-serif; background:var(--bg); color:var(--text); line-height:1.6; }}
+          html, body {{ overflow-x:hidden; }}
+          body {{ font-family:'Inter',system-ui,sans-serif; background:var(--bg); color:var(--text); line-height:1.6; overflow-wrap:break-word; }}
+          img, svg {{ max-width:100%; }}
+          .lp-hero .wrap > *, .contact-grid > * {{ min-width:0; }}
           .wrap {{ max-width:1100px; margin:0 auto; padding:0 22px; }}
           .lp-nav {{ position:sticky; top:0; z-index:50; backdrop-filter:blur(12px); background:rgba(9,12,11,.8); border-bottom:1px solid var(--border); }}
           .lp-nav .wrap {{ display:flex; align-items:center; gap:22px; height:64px; }}
