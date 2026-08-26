@@ -384,6 +384,11 @@ def test_landing_page_and_contact_form(tmp_path, monkeypatch):
     for needle in ["ordering machine", "Pay only when you sell", "per order", "processed securely by Paystack", "What we need to onboard you", "Request my setup", "logo-white.svg"]:
         assert needle in page.text, f"missing: {needle}"
 
+    # No APK on disk in tests → the button is hidden and the route shows "coming soon".
+    assert "Get the Android app" not in page.text
+    soon = client.get("/download/android")
+    assert soon.status_code == 200 and "coming soon" in soon.text.lower()
+
     # Contact form stores the lead (SMTP unconfigured -> sent=0 notice).
     response = client.post(
         "/contact",

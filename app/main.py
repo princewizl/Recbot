@@ -41,6 +41,10 @@ os.makedirs(RECEIPTS_DIR, exist_ok=True)
 # Public item/catalogue images (served over /media, unlike private receipts).
 MEDIA_DIR = os.path.join(_DATA_DIR, "media")
 os.makedirs(MEDIA_DIR, exist_ok=True)
+# Downloadable Android app. Drop the release APK at this path on the server
+# (default /data/recbot.apk, which lives in the persistent volume) to light up the
+# "Get the Android app" button on the landing page.
+APK_PATH = os.getenv("ANDROID_APK_PATH", os.path.join(_DATA_DIR, "recbot.apk"))
 
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
@@ -2663,8 +2667,24 @@ async def webhook(request: Request) -> Response:
     return Response(content=json.dumps({"reply": reply}), media_type="application/json")
 
 
+@app.get("/download/android")
+def download_android(request: Request):
+    if not os.path.exists(APK_PATH):
+        body = (
+            "<div class='card'><h3>Android app — coming soon</h3>"
+            "<p class='form-hint'>The download isn't available just yet. Please check back shortly.</p>"
+            "<div class='form-actions'><a class='btn' href='/'>Back home</a></div></div>"
+        )
+        return render_page("App coming soon", body, nav_html=make_nav(get_current_user(request)))
+    return FileResponse(APK_PATH, media_type="application/vnd.android.package-archive", filename="recbot.apk")
+
+
 @app.get("/", response_class=HTMLResponse)
 def homepage(request: Request, sent: Optional[str] = None) -> HTMLResponse:
+    apk_button = (
+        '<a class="lp-btn" href="/download/android">📲 Get the Android app</a>'
+        if os.path.exists(APK_PATH) else ""
+    )
     db = SessionLocal()
     try:
         plans = db.query(Plan).order_by(Plan.price_ngn).all()
@@ -2732,7 +2752,7 @@ def homepage(request: Request, sent: Optional[str] = None) -> HTMLResponse:
           .lp-nav a {{ color:var(--muted); text-decoration:none; font-size:.9rem; font-weight:600; }}
           .lp-nav a:hover {{ color:var(--text); }}
           .lp-nav .spacer {{ flex:1; }}
-          .lp-btn {{ display:inline-block; padding:11px 20px; border-radius:10px; font-weight:700; font-size:.92rem; text-decoration:none; border:1px solid var(--border-strong); color:var(--text); transition:transform .12s ease, background .15s ease; }}
+          .lp-btn {{ display:inline-block; padding:11px 20px; border-radius:10px; font-weight:700; font-size:.92rem; text-decoration:none; border:1px solid var(--border-strong); color:var(--text); white-space:nowrap; transition:transform .12s ease, background .15s ease; }}
           .lp-btn:hover {{ transform:translateY(-1px); background:var(--surface-2); }}
           .lp-btn-primary {{ background:linear-gradient(135deg,#34d399,#059669); border-color:transparent; color:#03130c; box-shadow:0 8px 24px rgba(16,185,129,.35); }}
           .lp-hero {{ padding:88px 0 60px; background:radial-gradient(900px circle at 15% 0%, rgba(16,185,129,.16), transparent 55%), radial-gradient(700px circle at 95% 15%, rgba(245,158,11,.08), transparent 50%); }}
@@ -2851,6 +2871,7 @@ def homepage(request: Request, sent: Optional[str] = None) -> HTMLResponse:
               <div class="hero-ctas">
                 <a class="lp-btn lp-btn-primary" href="#contact">Set up my business</a>
                 <a class="lp-btn" href="#how">See how it works</a>
+                {apk_button}
               </div>
               <div class="hero-facts">
                 <div><strong>24–48h</strong><span>to build &amp; test your bot</span></div>
