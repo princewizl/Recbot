@@ -1,0 +1,35 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<style>
+  html, body { margin: 0; padding: 0; }
+  .frame {
+    width: 1080px; height: 1080px; position: relative; overflow: hidden;
+    background: linear-gradient(135deg, #34d399 0%, #10b981 46%, #059669 100%);
+    display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 34px;
+    font-family: "Segoe UI", system-ui, -apple-system, Roboto, sans-serif;
+  }
+  /* top sheen for depth */
+  .sheen { position: absolute; inset: 0; background: linear-gradient(180deg, rgba(255,255,255,.20), rgba(255,255,255,0) 46%); }
+  /* faint safe-circle vignette so corners recede when cropped to a circle */
+  .vignette { position: absolute; inset: 0; background: radial-gradient(circle at 50% 50%, transparent 62%, rgba(3,19,12,.18) 100%); }
+  .mark { width: 470px; height: 470px; position: relative; filter: drop-shadow(0 16px 34px rgba(3,19,12,.30)); }
+  .word { position: relative; font-size: 118px; font-weight: 800; letter-spacing: -2px; color: #ffffff; text-shadow: 0 4px 18px rgba(3,19,12,.25); }
+  .word .x { color: #fcd34d; }
+</style>
+</head>
+<body>
+  <div class="frame">
+    <div class="sheen"></div>
+    <svg class="mark" viewBox="0 0 48 48" fill="none">
+      <path d="M34,10.5 A13.5,13.5 0 1,0 34,37.5" stroke="white" stroke-width="4" stroke-linecap="round" fill="none"/>
+      <path d="M30.5,7 L34,10.5 L37.5,7" stroke="white" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+      <line x1="7" y1="21" x2="33" y2="21" stroke="white" stroke-width="2.8" stroke-linecap="round"/>
+      <line x1="7" y1="27" x2="33" y2="27" stroke="white" stroke-width="2.8" stroke-linecap="round"/>
+    </svg>
+    <div class="word">coll<span class="x">x</span>ct</div>
+    <div class="vignette"></div>
+  </div>
+</body>
+</html>
