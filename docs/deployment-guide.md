@@ -190,6 +190,28 @@ If only `nginx/recbot.conf` changed (not the app code), the app container doesn'
 
 The SQLite database lives in the `recbot_data` named volume, not in the container, so rebuilds and restarts never lose order/conversation data.
 
+## Deploying the Android APK (download page)
+
+The landing page shows a "Download for Android" hero button + QR band **only when the signed APK exists on disk** at `/data/recbot.apk` inside the container (`APK_PATH`). Until then, `/download/android` renders a graceful "coming soon" page and the download section stays hidden.
+
+The APK is **not** in git (`.gitignore` excludes `*.apk`), so `git pull` never carries it. Copy it manually — once. It lives in the `recbot_data` named volume, so it survives every rebuild/restart and only needs re-copying when you ship a new build.
+
+```bash
+# on your machine — upload the signed release APK to the server
+scp "C:\Users\Olufemi\Desktop\recbot-release.apk" root@158.220.84.21:/opt/recbot/recbot-release.apk
+
+# on the server — copy it into the container's data volume
+ssh root@158.220.84.21
+docker cp /opt/recbot/recbot-release.apk collxct-recbot:/data/recbot.apk
+docker exec collxct-recbot chown appuser:appuser /data/recbot.apk   # container runs as appuser
+```
+
+No restart needed — the download route and landing section check for the file per request. Verify:
+
+```bash
+curl -sI https://recbot.collxct.ng/download/android | head -3   # expect 200 + application/vnd.android.package-archive
+```
+
 ## Files this deployment added
 
 - `Dockerfile`, `docker-compose.yml`, `.dockerignore`, `.env.example`, `.gitignore` — the app container
