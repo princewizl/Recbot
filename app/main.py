@@ -16,6 +16,7 @@ from html import escape
 from typing import Dict, List, Optional
 
 import httpx
+import qrcode
 from fastapi import FastAPI, File, Form, Request, Response, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -2667,6 +2668,31 @@ async def webhook(request: Request) -> Response:
     return Response(content=json.dumps({"reply": reply}), media_type="application/json")
 
 
+_qr_cache: Dict[str, str] = {}
+
+
+def android_qr_svg(url: str, dark: str = "#04140d") -> str:
+    """Inline SVG QR code for a URL (generated once, then cached)."""
+    if url in _qr_cache:
+        return _qr_cache[url]
+    qr = qrcode.QRCode(border=2, error_correction=qrcode.constants.ERROR_CORRECT_M)
+    qr.add_data(url)
+    qr.make(fit=True)
+    matrix = qr.get_matrix()
+    n = len(matrix)
+    rects = "".join(
+        f"<rect x='{x}' y='{y}' width='1.03' height='1.03'/>"
+        for y, row in enumerate(matrix) for x, on in enumerate(row) if on
+    )
+    svg = (
+        f"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 {n} {n}' "
+        f"shape-rendering='crispEdges' fill='{dark}' width='100%' height='100%'>"
+        f"<rect width='{n}' height='{n}' fill='#ffffff'/>{rects}</svg>"
+    )
+    _qr_cache[url] = svg
+    return svg
+
+
 @app.get("/download/android")
 def download_android(request: Request):
     if not os.path.exists(APK_PATH):
@@ -2685,6 +2711,21 @@ def homepage(request: Request, sent: Optional[str] = None) -> HTMLResponse:
         '<a class="lp-btn" href="/download/android">📲 Get the Android app</a>'
         if os.path.exists(APK_PATH) else ""
     )
+    app_section = ""
+    if os.path.exists(APK_PATH):
+        qr_url = f"{os.getenv('PUBLIC_BASE_URL', '').rstrip('/')}/download/android"
+        app_section = (
+            '<section id="app" style="background:linear-gradient(135deg, rgba(16,185,129,.10), rgba(245,158,11,.04)); border-top:1px solid var(--border); border-bottom:1px solid var(--border);">'
+            '<div class="wrap app-band">'
+            '<div class="app-copy">'
+            '<span class="lp-eyebrow">Now on Android</span>'
+            '<h2>Run your shop from your pocket.</h2>'
+            '<p>Push alerts the moment an order lands. Confirm payments, manage your catalogue, and open or pause your shop — right from your phone.</p>'
+            '<a class="lp-btn lp-btn-primary" href="/download/android">📲 Download for Android</a>'
+            '</div>'
+            '<div class="app-qr"><div class="qr-box">' + android_qr_svg(qr_url) + '</div><span>Scan to install</span></div>'
+            '</div></section>'
+        )
     db = SessionLocal()
     try:
         plans = db.query(Plan).order_by(Plan.price_ngn).all()
@@ -2834,6 +2875,13 @@ def homepage(request: Request, sent: Optional[str] = None) -> HTMLResponse:
           .lp-notice {{ padding:13px 16px; border-radius:12px; border:1px solid rgba(245,158,11,.4); background:rgba(245,158,11,.08); color:#ffd866; font-size:.9rem; margin-bottom:16px; }}
           .lp-notice.ok {{ border-color:rgba(52,211,153,.4); background:rgba(52,211,153,.08); color:var(--green-strong); }}
           .hp-field {{ position:absolute; left:-9999px; opacity:0; height:0; }}
+          .app-band {{ display:grid; grid-template-columns:1.15fr .85fr; gap:44px; align-items:center; }}
+          .app-band h2 {{ margin:10px 0 12px; font-size:1.9rem; letter-spacing:-.02em; }}
+          .app-band p {{ color:var(--muted); max-width:440px; margin:0 0 22px; }}
+          .app-qr {{ display:flex; flex-direction:column; align-items:center; gap:12px; }}
+          .qr-box {{ width:196px; height:196px; padding:14px; background:#fff; border-radius:20px; box-shadow:0 18px 44px rgba(0,0,0,.42); }}
+          .qr-box svg {{ display:block; border-radius:6px; }}
+          .app-qr span {{ color:var(--muted); font-size:.85rem; font-weight:600; }}
           footer {{ border-top:1px solid var(--border); padding:34px 0; }}
           footer .wrap {{ display:flex; align-items:center; gap:18px; flex-wrap:wrap; }}
           footer img {{ height:26px; }}
@@ -2844,6 +2892,8 @@ def homepage(request: Request, sent: Optional[str] = None) -> HTMLResponse:
             .phone {{ margin:0 auto; }}
             .contact-grid {{ grid-template-columns:1fr; }}
             .lp-nav a.hide-sm {{ display:none; }}
+            .app-band {{ grid-template-columns:1fr; text-align:center; justify-items:center; }}
+            .app-band p {{ margin-left:auto; margin-right:auto; }}
           }}
         </style>
       </head>
@@ -2998,6 +3048,8 @@ def homepage(request: Request, sent: Optional[str] = None) -> HTMLResponse:
             </div>
           </div>
         </section>
+
+        {app_section}
 
         <section id="contact" style="background:var(--surface); border-top:1px solid var(--border);">
           <div class="wrap">
