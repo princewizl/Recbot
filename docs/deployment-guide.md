@@ -88,7 +88,7 @@ Fill in:
 - `PAYSTACK_SECRET_KEY`, `PAYSTACK_CALLBACK_URL` → `https://collxct.com.ng:8443/paystack/webhook`
 - `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, `TWILIO_WHATSAPP_NUMBER`
 - `PUBLIC_PORT` — leave as `8443` unless that's taken (check with `ss -ltnp`)
-- `PUBLIC_BASE_URL` → `https://collxct.com.ng:8443` — used to build the clickable order links inside the "ACTION NEEDED" WhatsApp alerts sent to business owners
+- `PUBLIC_BASE_URL` → `https://recbot.collxct.ng` — used to build the clickable order links inside the "ACTION NEEDED" WhatsApp alerts sent to business owners, and the QR code target on the landing page's Android download band (a stale value here silently points the QR at the wrong host)
 - `ACTION_REMINDER_AFTER_MINUTES` / `ACTION_REMINDER_MAX` — how often and how many times an owner gets re-pinged on WhatsApp while an order sits waiting on them (defaults: every 10 minutes, 3 times per stage)
 - `DEFAULT_UTC_OFFSET_MINUTES` — local-time offset for business opening hours (default 60 = WAT/Lagos)
 - `PLAN_GRACE_DAYS` — days a business keeps taking orders after its paid plan expires before the bot pauses ordering (default 3); renewal reminders go out daily from 3 days before expiry until 7 days after
@@ -209,7 +209,9 @@ docker exec collxct-recbot chown appuser:appuser /data/recbot.apk   # container 
 No restart needed — the download route and landing section check for the file per request. Verify:
 
 ```bash
-curl -sI https://recbot.collxct.ng/download/android | head -3   # expect 200 + application/vnd.android.package-archive
+# NB: this app returns 405 for HEAD, so `curl -I` reports a false negative — use GET.
+curl -s -o /dev/null -w '%{http_code} %{content_type} %{size_download}\n' https://recbot.collxct.ng/download/android
+# expect: 200 application/vnd.android.package-archive <apk size in bytes>
 ```
 
 ## Files this deployment added
