@@ -618,28 +618,82 @@ def get_current_user(request: Request) -> Optional[User]:
         db.close()
 
 
+# Sidebar glyphs. 24x24 stroke icons that inherit currentColor, so a nav link's
+# hover/active colour carries into its icon for free.
+NAV_ICONS = {
+    "home": "M3 10.5 12 3l9 7.5M5.5 9.5V20a1 1 0 0 0 1 1h11a1 1 0 0 0 1-1V9.5",
+    "grid": "M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h6v6h-6z",
+    "orders": "M6 3h12a1 1 0 0 1 1 1v17l-3-2-2 2-2-2-2 2-2-2-3 2V4a1 1 0 0 1 1-1zM9 8h6M9 12h6",
+    "chat": "M21 12a8 8 0 0 1-8 8H7l-4 2 1.5-4.5A8 8 0 1 1 21 12z",
+    "store": "M4 9h16v11a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1zM3 9l1.5-5h15L21 9M9 21v-6h6v6",
+    "leads": "M3 6h18v12H3zM3 7l9 6 9-6",
+    "users": "M16 20v-2a4 4 0 0 0-4-4H7a4 4 0 0 0-4 4v2M9.5 10a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7zM21 20v-2a4 4 0 0 0-3-3.85M16.5 3.15A4 4 0 0 1 16.5 11",
+    "userplus": "M15 20v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2M8.5 10a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7zM18 8v6M21 11h-6",
+    "layout": "M4 4h16v16H4zM4 10h16M10 10v10",
+    "activity": "M3 12h4l3 8 4-16 3 8h4",
+    "settings": "M4 7h10M18 7h2M4 17h4M12 17h8M16 5v4M8 15v4",
+    "shield": "M12 3l7 3v6c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6z",
+    "login": "M15 3h4a1 1 0 0 1 1 1v16a1 1 0 0 1-1 1h-4M10 17l5-5-5-5M15 12H3",
+    "logout": "M9 3H5a1 1 0 0 0-1 1v16a1 1 0 0 0 1 1h4M16 17l5-5-5-5M21 12H9",
+}
+
+
+def nav_icon(name: str) -> str:
+    path = NAV_ICONS.get(name, NAV_ICONS["grid"])
+    return (
+        "<svg class='nav-ico' viewBox='0 0 24 24' fill='none' stroke='currentColor' "
+        "stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round' aria-hidden='true'>"
+        f"<path d='{path}'/></svg>"
+    )
+
+
+def nav_item(href: str, label: str, icon: str, extra_class: str = "") -> str:
+    cls = f"nav-link {extra_class}".strip()
+    return f"<a class='{cls}' href='{href}'>{nav_icon(icon)}<span>{escape(label)}</span></a>"
+
+
 def make_nav(current_user: Optional[User] = None) -> str:
-    links = ["<a class='nav-link' href='/'>Home</a>"]
+    # Grouped into labelled sections so a long admin nav stays scannable. The
+    # active link is marked client-side in render_page (every caller passes a
+    # user, not a request path).
+    groups: List[tuple] = []
     if current_user:
         if current_user.role == "admin":
-            links.append("<a class='nav-link' href='/admin/'>Command Center</a>")
-            links.append("<a class='nav-link' href='/admin/orders'>Orders</a>")
-            links.append("<a class='nav-link' href='/admin/conversations'>Conversations</a>")
-            links.append("<a class='nav-link' href='/admin/businesses'>Businesses</a>")
-            links.append("<a class='nav-link' href='/admin/messages'>Leads</a>")
-            links.append("<a class='nav-link' href='/admin/users'>Users</a>")
-            links.append("<a class='nav-link' href='/register'>Create Owners</a>")
+            groups.append(("Overview", [
+                ("/", "Home", "home"),
+                ("/admin/", "Command Center", "grid"),
+            ]))
+            groups.append(("Operations", [
+                ("/admin/orders", "Orders", "orders"),
+                ("/admin/conversations", "Conversations", "chat"),
+                ("/admin/businesses", "Businesses", "store"),
+            ]))
+            groups.append(("Growth", [
+                ("/admin/messages", "Leads", "leads"),
+                ("/admin/users", "Users", "users"),
+                ("/register", "Create Owners", "userplus"),
+            ]))
         is_business_owner = current_user.role in {"business_owner", "business-owner", "owner"}
         if is_business_owner:
-            links.append("<a class='nav-link' href='/owner/portal'>Owner Portal</a>")
+            overview = [("/", "Home", "home"), ("/owner/portal", "Owner Portal", "layout")]
+            groups.append(("Overview", overview))
             if current_user.business_id:
-                links.append(f"<a class='nav-link' href='/business/{current_user.business_id}/dashboard'>Operations</a>")
-                links.append(f"<a class='nav-link' href='/business/{current_user.business_id}/config'>Config</a>")
+                groups.append(("Operations", [
+                    (f"/business/{current_user.business_id}/dashboard", "Operations", "activity"),
+                    (f"/business/{current_user.business_id}/config", "Config", "settings"),
+                ]))
         if current_user.role == "admin" or is_business_owner:
-            links.append("<a class='nav-link' href='/account/security'>Security</a>")
+            groups.append(("Account", [("/account/security", "Security", "shield")]))
     else:
-        links.append("<a class='nav-link' href='/login'>Login</a>")
-    nav_links_html = f"<div class='nav-links'>{''.join(links)}</div>"
+        groups.append(("", [("/", "Home", "home"), ("/login", "Login", "login")]))
+
+    blocks = []
+    for section, items in groups:
+        if section:
+            blocks.append(f"<div class='nav-section'>{escape(section)}</div>")
+        blocks.extend(nav_item(href, label, icon) for href, label, icon in items)
+    nav_links_html = f"<div class='nav-links'>{''.join(blocks)}</div>"
+
     if current_user:
         initial = escape(current_user.email[:1].upper())
         footer = f"""
@@ -648,7 +702,7 @@ def make_nav(current_user: Optional[User] = None) -> str:
             <span class='user-avatar'>{initial}</span>
             <span class='user-email'>{escape(current_user.email)}</span>
           </div>
-          <a class='nav-link logout' href='/logout'>Logout</a>
+          {nav_item('/logout', 'Logout', 'logout', 'logout')}
         </div>
         """
     else:
@@ -823,8 +877,62 @@ ALERT_WIDGET_HTML = """
 """
 
 
-def render_page(title: str, body: str, nav_html: Optional[str] = None) -> HTMLResponse:
+# Chart.js is themed once, globally, so every chart in the portal reads as one
+# system instead of each page restyling its own axes.
+CHART_THEME_SCRIPT = """
+<script>
+// Registered from <head> so it runs before any page-level chart script, which
+// all wait on DOMContentLoaded too. Chart.js itself is deferred.
+window.addEventListener("DOMContentLoaded", function () {
+  if (!window.Chart) return;
+  Chart.defaults.font.family = "Inter, system-ui, -apple-system, sans-serif";
+  Chart.defaults.font.size = 11;
+  Chart.defaults.color = "#8e9b96";
+  Chart.defaults.borderColor = "rgba(255,255,255,.06)";
+  Chart.defaults.maintainAspectRatio = false;
+  Chart.defaults.plugins.legend.display = false;
+  Chart.defaults.plugins.tooltip.backgroundColor = "#1b2321";
+  Chart.defaults.plugins.tooltip.borderColor = "rgba(255,255,255,.13)";
+  Chart.defaults.plugins.tooltip.borderWidth = 1;
+  Chart.defaults.plugins.tooltip.titleColor = "#f1f5f3";
+  Chart.defaults.plugins.tooltip.bodyColor = "#8e9b96";
+  Chart.defaults.plugins.tooltip.padding = 10;
+  Chart.defaults.plugins.tooltip.cornerRadius = 8;
+  Chart.defaults.plugins.tooltip.displayColors = false;
+});
+</script>
+"""
+
+
+PORTAL_SCRIPTS = """
+<script>
+(function () {
+  // Mark the sidebar link that best matches this URL. Longest matching href
+  // wins so /admin/orders beats /admin/.
+  function trimSlash(s) {
+    while (s.length > 1 && s.charAt(s.length - 1) === "/") s = s.slice(0, -1);
+    return s || "/";
+  }
+  var path = trimSlash(location.pathname);
+  var best = null, bestLen = -1;
+  var links = document.querySelectorAll(".sidebar .nav-link");
+  for (var i = 0; i < links.length; i++) {
+    var href = trimSlash(links[i].getAttribute("href") || "");
+    if (href === "/logout") continue;
+    var hit = href === "/" ? path === "/" : (path === href || path.indexOf(href + "/") === 0);
+    if (hit && href.length > bestLen) { best = links[i]; bestLen = href.length; }
+  }
+  if (best) best.classList.add("active");
+})();
+</script>
+"""
+
+
+def render_page(title: str, body: str, nav_html: Optional[str] = None,
+                subtitle: str = "", actions: str = "") -> HTMLResponse:
     nav_html = nav_html or make_nav(None)
+    subtitle_html = f"<p>{escape(subtitle)}</p>" if subtitle else ""
+    actions_html = f"<div class='topbar-actions'>{actions}</div>" if actions else ""
     html = f"""
     <!DOCTYPE html>
     <html>
@@ -836,100 +944,213 @@ def render_page(title: str, body: str, nav_html: Optional[str] = None) -> HTMLRe
         <link rel="preconnect" href="https://fonts.googleapis.com" />
         <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
         <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+        <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js" defer></script>
+        {CHART_THEME_SCRIPT}
         <style>
+                    /* ============================================================
+                       Collxct portal — design system
+                       Dark surface stack, emerald primary, amber accent.
+                       ============================================================ */
                     :root {{
-                      --bg:#090c0b; --surface:#101413; --surface-2:#161c1a; --surface-hover:#1c2422;
-                      --text:#f1f5f3; --muted:#8b9792; --muted-2:#5e6a65;
-                      --primary:#10b981; --primary-strong:#34d399; --accent:#f59e0b; --success:#34d399; --danger:#ff5e7a;
-                      --border:rgba(255,255,255,.08); --border-strong:rgba(255,255,255,.14);
-                      --radius-sm:8px; --radius-md:12px; --radius-lg:18px;
-                      --shadow-sm:0 1px 2px rgba(0,0,0,.5); --shadow-md:0 12px 32px rgba(0,0,0,.4);
+                      /* surfaces: page ground -> card -> raised -> hover */
+                      --bg:#080b0a; --surface:#0f1413; --surface-2:#151b19; --surface-3:#1b2321; --surface-hover:#212b28;
+                      --text:#f1f5f3; --muted:#8e9b96; --muted-2:#5e6a65;
+                      --primary:#10b981; --primary-strong:#34d399; --primary-dim:rgba(16,185,129,.12);
+                      --accent:#f59e0b; --success:#34d399; --danger:#ff5e7a; --warn:#ffc400; --info:#60a5fa;
+                      --border:rgba(255,255,255,.07); --border-strong:rgba(255,255,255,.13);
+                      --radius-sm:9px; --radius-md:14px; --radius-lg:20px;
+                      --shadow-sm:0 1px 2px rgba(0,0,0,.4);
+                      --shadow-md:0 4px 16px rgba(0,0,0,.35), 0 1px 2px rgba(0,0,0,.4);
+                      --shadow-lg:0 18px 48px rgba(0,0,0,.5), 0 2px 8px rgba(0,0,0,.4);
+                      --sidebar-w:248px;
                     }}
-                    * {{ box-sizing: border-box; }}
+                    * {{ box-sizing:border-box; }}
                     html,body {{ height:100%; overflow-x:hidden; }}
                     body {{
                       margin:0; font-family:'Inter', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
                       font-size:15px; line-height:1.6; color:var(--text); overflow-wrap:break-word;
-                      background: radial-gradient(1100px circle at 12% -8%, rgba(16,185,129,.12), transparent 55%), radial-gradient(900px circle at 100% 0%, rgba(245,158,11,.05), transparent 50%), var(--bg);
+                      -webkit-font-smoothing:antialiased;
+                      background: radial-gradient(1100px circle at 12% -8%, rgba(16,185,129,.10), transparent 55%), radial-gradient(900px circle at 100% 0%, rgba(245,158,11,.045), transparent 50%), var(--bg);
                     }}
                     img, svg {{ max-width:100%; }}
                     .main-area, .content, .auth-shell > *, .hero-panel > *, .detail-grid > *, .panel-grid > *, .stats-grid > * {{ min-width:0; }}
+                    a {{ color:var(--primary-strong); }}
+                    ::selection {{ background:rgba(16,185,129,.3); }}
+                    :focus-visible {{ outline:2px solid var(--primary); outline-offset:2px; }}
+                    * {{ scrollbar-width:thin; scrollbar-color:var(--surface-3) transparent; }}
+                    ::-webkit-scrollbar {{ width:10px; height:10px; }}
+                    ::-webkit-scrollbar-thumb {{ background:var(--surface-3); border-radius:99px; border:2px solid transparent; background-clip:content-box; }}
+                    ::-webkit-scrollbar-thumb:hover {{ background:var(--surface-hover); background-clip:content-box; }}
+
+                    /* ---------- shell ---------- */
                     .shell {{ display:flex; min-height:100vh; }}
-                    .sidebar {{ width:258px; flex-shrink:0; background:var(--surface); border-right:1px solid var(--border); display:flex; flex-direction:column; padding:18px 14px; position:sticky; top:0; height:100vh; overflow-y:auto; }}
-                    .brand {{ display:flex; align-items:center; gap:10px; padding:4px 8px 18px; margin-bottom:10px; border-bottom:1px solid var(--border); text-decoration:none; }}
-                    .brand-logo {{ height:32px; width:auto; display:block; }}
+                    .sidebar {{ width:var(--sidebar-w); flex-shrink:0; background:linear-gradient(180deg,#0d1211,#0a0e0d); border-right:1px solid var(--border); display:flex; flex-direction:column; padding:16px 12px; position:sticky; top:0; height:100vh; overflow-y:auto; }}
+                    .brand {{ display:flex; align-items:center; gap:10px; padding:6px 10px 16px; margin-bottom:12px; border-bottom:1px solid var(--border); text-decoration:none; }}
+                    .brand-logo {{ height:30px; width:auto; display:block; }}
                     .nav-links {{ display:flex; flex-direction:column; gap:2px; }}
-                    .nav-link {{ display:flex; align-items:center; gap:9px; padding:9px 11px; border-radius:var(--radius-sm); color:var(--muted); font-weight:500; font-size:.9rem; text-decoration:none; transition:background .15s ease, color .15s ease; }}
+                    .nav-section {{ padding:16px 12px 6px; font-size:.66rem; text-transform:uppercase; letter-spacing:.13em; color:var(--muted-2); font-weight:700; }}
+                    .nav-link {{ position:relative; display:flex; align-items:center; gap:11px; padding:9px 12px; border-radius:var(--radius-sm); color:var(--muted); font-weight:500; font-size:.885rem; text-decoration:none; transition:background .15s ease, color .15s ease; }}
+                    .nav-link .nav-ico {{ width:17px; height:17px; flex-shrink:0; opacity:.8; }}
                     .nav-link:hover {{ background:var(--surface-2); color:var(--text); }}
+                    .nav-link:hover .nav-ico {{ opacity:1; }}
+                    .nav-link.active {{ background:var(--primary-dim); color:var(--primary-strong); font-weight:600; }}
+                    .nav-link.active .nav-ico {{ opacity:1; }}
+                    .nav-link.active::before {{ content:''; position:absolute; left:-12px; top:50%; transform:translateY(-50%); width:3px; height:19px; border-radius:0 3px 3px 0; background:var(--primary); }}
                     .nav-footer {{ margin-top:auto; padding-top:14px; border-top:1px solid var(--border); display:flex; flex-direction:column; gap:6px; }}
-                    .user-chip {{ display:flex; align-items:center; gap:9px; padding:8px 10px; border-radius:var(--radius-sm); background:var(--surface-2); }}
-                    .user-avatar {{ width:26px; height:26px; border-radius:50%; background:linear-gradient(135deg,#34d399,#059669); color:#fff; display:flex; align-items:center; justify-content:center; font-size:.72rem; font-weight:700; flex-shrink:0; }}
-                    .user-email {{ font-size:.82rem; color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
+                    .user-chip {{ display:flex; align-items:center; gap:9px; padding:9px 10px; border-radius:var(--radius-sm); background:var(--surface-2); border:1px solid var(--border); }}
+                    .user-avatar {{ width:28px; height:28px; border-radius:50%; background:linear-gradient(135deg,#34d399,#059669); color:#04140d; display:flex; align-items:center; justify-content:center; font-size:.74rem; font-weight:800; flex-shrink:0; }}
+                    .user-email {{ font-size:.8rem; color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
                     .nav-link.logout {{ color:var(--danger); }}
                     .nav-link.logout:hover {{ background:rgba(255,94,122,.1); color:var(--danger); }}
-                    .chip {{ padding:5px 10px; border:1px solid var(--border); border-radius:999px; color:var(--muted); font-size:.82rem; }}
                     .main-area {{ flex:1; min-width:0; display:flex; flex-direction:column; }}
-                    .page-title {{ position:sticky; top:0; z-index:5; padding:16px 32px; background:rgba(9,9,11,.75); backdrop-filter:blur(10px); border-bottom:1px solid var(--border); }}
-                    .page-title h1 {{ margin:0; font-size:1.3rem; font-weight:700; letter-spacing:-.01em; color:var(--text); }}
-                    .page-title p {{ margin:6px 0 0; color:var(--muted); font-size:.88rem; }}
-                    .content {{ padding:28px 32px 64px; max-width:1280px; display:flex; flex-direction:column; gap:22px; width:100%; }}
+
+                    /* ---------- topbar ---------- */
+                    .page-title {{ position:sticky; top:0; z-index:20; display:flex; align-items:center; gap:16px; padding:14px 32px; background:rgba(8,11,10,.82); backdrop-filter:blur(12px); border-bottom:1px solid var(--border); }}
+                    .page-title h1 {{ margin:0; font-size:1.22rem; font-weight:700; letter-spacing:-.015em; color:var(--text); }}
+                    .page-title p {{ margin:3px 0 0; color:var(--muted); font-size:.84rem; }}
+                    .topbar-main {{ min-width:0; }}
+                    .topbar-actions {{ margin-left:auto; display:flex; align-items:center; gap:10px; flex-shrink:0; }}
+                    .icon-btn {{ display:inline-flex; align-items:center; justify-content:center; width:36px; height:36px; padding:0; border-radius:var(--radius-sm); border:1px solid var(--border); background:var(--surface-2); color:var(--muted); cursor:pointer; margin:0; transition:background .15s ease, color .15s ease; }}
+                    .icon-btn:hover {{ background:var(--surface-hover); color:var(--text); transform:none; }}
+                    .content {{ padding:26px 32px 64px; max-width:1320px; display:flex; flex-direction:column; gap:20px; width:100%; }}
+
+                    /* ---------- hero panels ---------- */
                     .hero, .hero-panel, .auth-hero {{ border-radius:var(--radius-lg); border:1px solid var(--border-strong); background:linear-gradient(135deg,#0d2f24 0%,#0a231c 48%,#071710 100%); box-shadow:inset 0 1px 0 rgba(255,255,255,.05), var(--shadow-md); color:var(--text); }}
                     .hero {{ padding:30px; }}
                     .hero h1 {{ margin:0 0 10px; font-size:1.9rem; letter-spacing:-.02em; }}
                     .hero p {{ margin:0 0 16px; color:#bcd8cc; max-width:720px; }}
-                    .hero-panel {{ display:flex; flex-wrap:wrap; justify-content:space-between; align-items:center; gap:18px; padding:28px; }}
-                    .hero-panel h1 {{ margin:0 0 8px; font-size:clamp(1.5rem,2.6vw,2.1rem); line-height:1.1; letter-spacing:-.02em; }}
+                    .hero-panel {{ display:flex; flex-wrap:wrap; justify-content:space-between; align-items:center; gap:18px; padding:26px 28px; }}
+                    .hero-panel h1 {{ margin:0 0 8px; font-size:clamp(1.5rem,2.6vw,2rem); line-height:1.1; letter-spacing:-.02em; }}
                     .hero-panel p {{ margin:0; color:#bcd8cc; max-width:680px; }}
                     .hero-panel .actions {{ display:flex; flex-wrap:wrap; gap:10px; }}
+
+                    /* ---------- auth ---------- */
                     .auth-shell {{ display:grid; grid-template-columns:1.05fr .95fr; gap:20px; align-items:stretch; }}
-                    .auth-hero {{ padding:26px; display:flex; flex-direction:column; justify-content:center; min-height:320px; }}
+                    .auth-hero {{ padding:28px; display:flex; flex-direction:column; justify-content:center; min-height:320px; }}
                     .auth-hero h2 {{ margin:0 0 10px; font-size:1.6rem; letter-spacing:-.02em; }}
                     .auth-hero p {{ color:#bcd8cc; }}
                     .auth-form {{ display:flex; flex-direction:column; gap:10px; }}
                     .auth-form .form-row {{ display:flex; flex-direction:column; gap:8px; }}
-                    .form-hint {{ color:var(--muted); font-size:.88rem; margin-top:4px; }}
+
+                    /* ---------- cards ---------- */
                     .grid {{ display:grid; grid-template-columns:repeat(auto-fit, minmax(220px, 1fr)); gap:16px; }}
                     .card {{ background:var(--surface); border:1px solid var(--border); border-radius:var(--radius-md); padding:22px; box-shadow:var(--shadow-sm); }}
                     .card h2, .card h3 {{ margin-top:0; }}
                     .card p {{ color:var(--muted); line-height:1.7; }}
-                    .stats-grid {{ display:grid; grid-template-columns:repeat(auto-fit, minmax(180px, 1fr)); gap:14px; }}
-                    .stat-card {{ min-height:104px; display:flex; flex-direction:column; justify-content:center; gap:4px; }}
-                    .stat-card .value {{ font-size:1.7rem; font-weight:700; letter-spacing:-.03em; }}
-                    .panel-grid {{ display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:16px; }}
+                    .card-head {{ display:flex; align-items:center; justify-content:space-between; gap:12px; margin:-2px 0 16px; }}
+                    .card-head h3 {{ margin:0; font-size:.98rem; font-weight:700; letter-spacing:-.01em; }}
+                    .card-head .sub {{ color:var(--muted); font-size:.8rem; margin:2px 0 0; }}
                     .section-head {{ display:flex; justify-content:space-between; align-items:center; gap:10px; margin-bottom:12px; }}
                     .section-head h3 {{ margin:0; font-size:1rem; }}
-                    .table-wrap {{ overflow-x:auto; }}
-                    .table-wrap table {{ min-width:500px; }}
-                    .form-row {{ display:grid; gap:8px; }}
-                    .form-actions {{ display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-top:8px; }}
-                    .pill-list {{ display:flex; flex-wrap:wrap; gap:8px; margin-top:8px; }}
-                    .pill-list .pill {{ margin:0; }}
+                    .panel-grid {{ display:grid; grid-template-columns:repeat(2, minmax(0, 1fr)); gap:16px; }}
+                    .panel-grid.wide-left {{ grid-template-columns:1.6fr 1fr; }}
+                    .stack {{ display:flex; flex-direction:column; gap:10px; }}
+
+                    /* ---------- stat cards ---------- */
+                    .stats-grid {{ display:grid; grid-template-columns:repeat(auto-fit, minmax(210px, 1fr)); gap:14px; }}
+                    .stat-card {{ position:relative; min-height:112px; display:flex; flex-direction:column; gap:10px; padding:18px; overflow:hidden; transition:border-color .15s ease, transform .15s ease; }}
+                    .stat-card:hover {{ border-color:var(--border-strong); transform:translateY(-1px); }}
+                    .stat-head {{ display:flex; align-items:center; gap:10px; }}
+                    .stat-ico {{ width:38px; height:38px; border-radius:11px; display:flex; align-items:center; justify-content:center; font-size:1.05rem; flex-shrink:0; background:var(--primary-dim); color:var(--primary-strong); }}
+                    .stat-ico.amber {{ background:rgba(245,158,11,.13); color:var(--accent); }}
+                    .stat-ico.rose  {{ background:rgba(255,94,122,.13); color:var(--danger); }}
+                    .stat-ico.blue  {{ background:rgba(96,165,250,.13); color:var(--info); }}
+                    .stat-label {{ color:var(--muted); font-size:.78rem; font-weight:600; text-transform:uppercase; letter-spacing:.07em; }}
+                    .stat-card .value {{ font-size:1.72rem; font-weight:700; letter-spacing:-.03em; line-height:1.1; }}
+                    .stat-foot {{ display:flex; align-items:center; gap:8px; margin-top:auto; }}
+                    .stat-delta {{ display:inline-flex; align-items:center; gap:4px; padding:3px 8px; border-radius:999px; font-size:.73rem; font-weight:700; background:var(--surface-3); color:var(--muted); }}
+                    .stat-delta.up {{ background:rgba(52,211,153,.13); color:var(--success); }}
+                    .stat-delta.down {{ background:rgba(255,94,122,.13); color:var(--danger); }}
+                    .stat-note {{ color:var(--muted-2); font-size:.75rem; }}
+                    .stat-card.alert {{ border-color:rgba(255,94,122,.45); background:linear-gradient(180deg,rgba(255,94,122,.08),transparent 70%), var(--surface); }}
+                    .stat-card.alert .value {{ color:var(--danger); }}
                     .metric {{ display:flex; flex-direction:column; gap:6px; }}
                     .metric .value {{ font-size:1.5rem; font-weight:700; letter-spacing:-.03em; }}
                     .metric .label {{ color:var(--muted); font-size:.82rem; }}
-                    .btn, button {{ display:inline-flex; align-items:center; justify-content:center; padding:9px 16px; border-radius:var(--radius-sm); font-weight:600; font-size:.88rem; text-decoration:none; cursor:pointer; border:1px solid var(--border-strong); background:var(--surface-2); color:var(--text); font-family:inherit; transition:background .15s ease, border-color .15s ease, transform .1s ease; margin-right:8px; }}
+
+                    /* ---------- charts ---------- */
+                    .chart-box {{ position:relative; width:100%; height:230px; }}
+                    .chart-box.tall {{ height:280px; }}
+                    .chart-legend {{ display:flex; flex-wrap:wrap; gap:14px; margin-top:14px; }}
+                    .chart-legend span {{ display:inline-flex; align-items:center; gap:7px; color:var(--muted); font-size:.8rem; font-weight:500; }}
+                    .chart-legend i {{ width:9px; height:9px; border-radius:3px; flex-shrink:0; }}
+
+                    /* ---------- buttons ---------- */
+                    .btn, button {{ display:inline-flex; align-items:center; justify-content:center; gap:7px; padding:9px 16px; border-radius:var(--radius-sm); font-weight:600; font-size:.87rem; text-decoration:none; cursor:pointer; border:1px solid var(--border-strong); background:var(--surface-2); color:var(--text); font-family:inherit; transition:background .15s ease, border-color .15s ease, transform .1s ease; margin-right:8px; }}
                     .btn:hover, button:hover {{ background:var(--surface-hover); transform:translateY(-1px); }}
-                    .btn.primary, button[type="submit"] {{ background:var(--primary); border-color:var(--primary); color:#fff; }}
+                    .btn:active, button:active {{ transform:translateY(0); }}
+                    .btn.primary, button[type="submit"] {{ background:var(--primary); border-color:var(--primary); color:#04140d; }}
                     .btn.primary:hover, button[type="submit"]:hover {{ background:var(--primary-strong); border-color:var(--primary-strong); }}
+                    .btn.ghost {{ background:transparent; border-color:var(--border); color:var(--muted); }}
+                    .btn.ghost:hover {{ background:var(--surface-2); color:var(--text); }}
+                    .btn.danger {{ background:rgba(255,94,122,.12); border-color:rgba(255,94,122,.4); color:#ff8fa3; }}
+                    .btn.danger:hover {{ background:rgba(255,94,122,.2); }}
+                    .btn.sm {{ padding:6px 11px; font-size:.79rem; }}
                     button.secondary {{ background:transparent; }}
+
+                    /* ---------- tables ---------- */
+                    .table-wrap {{ overflow-x:auto; border:1px solid var(--border); border-radius:var(--radius-md); background:var(--surface); }}
+                    .table-wrap table {{ min-width:560px; border:none; border-radius:0; }}
                     table {{ width:100%; border-collapse:collapse; background:var(--surface); border:1px solid var(--border); border-radius:var(--radius-md); overflow:hidden; }}
-                    th {{ text-align:left; padding:10px 14px; font-size:.72rem; text-transform:uppercase; letter-spacing:.05em; color:var(--muted); font-weight:600; background:var(--surface-2); border-bottom:1px solid var(--border-strong); }}
-                    td {{ padding:12px 14px; border-bottom:1px solid var(--border); text-align:left; font-size:.88rem; }}
+                    th {{ text-align:left; padding:11px 16px; font-size:.7rem; text-transform:uppercase; letter-spacing:.06em; color:var(--muted); font-weight:700; background:var(--surface-2); border-bottom:1px solid var(--border-strong); white-space:nowrap; }}
+                    td {{ padding:13px 16px; border-bottom:1px solid var(--border); text-align:left; font-size:.87rem; vertical-align:middle; }}
                     tr:last-child td {{ border-bottom:none; }}
+                    tbody tr {{ transition:background .12s ease; }}
                     tbody tr:hover td {{ background:var(--surface-2); }}
+                    td.num, th.num {{ text-align:right; font-variant-numeric:tabular-nums; }}
+                    .cell-main {{ display:flex; align-items:center; gap:10px; }}
+                    .cell-sub {{ display:block; color:var(--muted-2); font-size:.76rem; }}
+                    .age-normal {{ color:var(--muted); }}
+                    .age-stale {{ color:var(--danger); font-weight:700; }}
+                    .avatar-sm {{ width:30px; height:30px; border-radius:50%; background:var(--surface-3); color:var(--muted); display:inline-flex; align-items:center; justify-content:center; font-size:.72rem; font-weight:700; flex-shrink:0; }}
+
+                    /* ---------- forms ---------- */
                     form {{ margin-top:10px; margin-bottom:14px; }}
+                    .form-row {{ display:grid; gap:8px; }}
+                    .form-actions {{ display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-top:8px; }}
+                    .form-group {{ margin-bottom:14px; }}
+                    .form-hint {{ color:var(--muted); font-size:.87rem; margin-top:4px; }}
                     input, select, textarea {{ display:block; margin-bottom:10px; padding:10px 13px; width:100%; max-width:480px; border:1px solid var(--border-strong); border-radius:var(--radius-sm); background:var(--surface-2); color:var(--text); font-size:.9rem; font-family:inherit; transition:border-color .15s ease, box-shadow .15s ease; }}
                     input:focus, select:focus, textarea:focus {{ outline:none; border-color:var(--primary); box-shadow:0 0 0 3px rgba(16,185,129,.18); }}
                     input::placeholder, textarea::placeholder {{ color:var(--muted-2); }}
-                    ul {{ margin-left:20px; }}
-                    a {{ color:var(--primary-strong); }}
-                    .eyebrow {{ font-size:.72rem; text-transform:uppercase; letter-spacing:.14em; color:var(--muted); font-weight:700; margin-bottom:8px; }}
-                    .stack {{ display:flex; flex-direction:column; gap:10px; }}
-                    .pill {{ display:inline-block; padding:4px 10px; border-radius:999px; background:var(--surface-2); border:1px solid var(--border); color:var(--muted); font-size:.76rem; font-weight:600; margin-right:6px; }}
-                    .form-group {{ margin-bottom:14px; }}
-                    .status-pill {{ display:inline-flex; align-items:center; padding:6px 12px; border-radius:999px; background:rgba(52,211,153,.12); border:1px solid rgba(52,211,153,.3); color:var(--success); font-weight:600; font-size:.82rem; }}
                     label {{ display:inline-flex; align-items:center; gap:8px; font-weight:500; font-size:.9rem; cursor:pointer; color:var(--text); }}
-                    input[type="checkbox"], input[type="radio"] {{ width:auto; display:inline-block; max-width:none; margin:0; }}
+                    input[type="checkbox"], input[type="radio"] {{ width:auto; display:inline-block; max-width:none; margin:0; accent-color:var(--primary); }}
+                    ul {{ margin-left:20px; }}
+
+                    /* ---------- pills & badges ---------- */
+                    .chip {{ padding:5px 10px; border:1px solid var(--border); border-radius:999px; color:var(--muted); font-size:.82rem; }}
+                    .pill {{ display:inline-block; padding:4px 10px; border-radius:999px; background:var(--surface-2); border:1px solid var(--border); color:var(--muted); font-size:.76rem; font-weight:600; margin-right:6px; }}
+                    .pill-list {{ display:flex; flex-wrap:wrap; gap:8px; margin-top:8px; }}
+                    .pill-list .pill {{ margin:0; }}
+                    .eyebrow {{ font-size:.72rem; text-transform:uppercase; letter-spacing:.14em; color:var(--muted); font-weight:700; margin-bottom:8px; }}
+                    .status-pill {{ display:inline-flex; align-items:center; gap:6px; padding:5px 11px; border-radius:999px; background:rgba(52,211,153,.12); border:1px solid rgba(52,211,153,.28); color:var(--success); font-weight:600; font-size:.79rem; white-space:nowrap; }}
+                    .status-pill.ok {{ background:rgba(52,211,153,.12); border-color:rgba(52,211,153,.28); color:var(--success); }}
+                    .status-pill.warn {{ background:rgba(255,196,0,.12); border-color:rgba(255,196,0,.32); color:#ffd866; }}
+                    .status-pill.danger {{ background:rgba(255,94,122,.12); border-color:rgba(255,94,122,.3); color:#ff8fa3; }}
+                    .status-pill.info {{ background:rgba(96,165,250,.12); border-color:rgba(96,165,250,.3); color:var(--info); }}
+                    .status-pill.neutral {{ background:var(--surface-3); border-color:var(--border-strong); color:var(--muted); }}
+                    .status-pill.amber {{ background:rgba(245,158,11,.12); border-color:rgba(245,158,11,.32); color:var(--accent); }}
+
+                    /* ---------- misc blocks ---------- */
+                    .empty-state {{ padding:26px 18px; border:1px dashed var(--border-strong); border-radius:var(--radius-md); color:var(--muted); text-align:center; }}
+                    .notice-banner {{ padding:14px 18px; border:1px solid rgba(255,196,0,.4); border-radius:var(--radius-md); background:rgba(255,196,0,.08); color:#ffd866; font-weight:600; }}
+                    .notice-banner.danger {{ border-color:rgba(255,94,122,.45); background:rgba(255,94,122,.08); color:#ff8fa3; }}
+                    .notice-banner a {{ color:inherit; text-decoration:underline; }}
+                    .detail-grid {{ display:grid; grid-template-columns:1.4fr 1fr; gap:16px; align-items:start; }}
+                    .kv-list {{ display:flex; flex-direction:column; gap:0; }}
+                    .kv-list .kv-row {{ display:flex; justify-content:space-between; gap:12px; padding:11px 0; border-bottom:1px solid var(--border); }}
+                    .kv-list .kv-row:last-child {{ border-bottom:none; }}
+                    .kv-list .kv-label {{ color:var(--muted); font-size:.85rem; }}
+                    .kv-list .kv-value {{ font-weight:600; text-align:right; }}
+                    .receipt-preview {{ max-width:100%; border-radius:var(--radius-md); border:1px solid var(--border); margin-top:10px; }}
+                    dialog.modal {{ border:1px solid var(--border-strong); border-radius:var(--radius-lg); padding:0; background:var(--surface); color:var(--text); box-shadow:var(--shadow-lg); width:min(420px, 90vw); }}
+                    dialog.modal::backdrop {{ background:rgba(2,4,10,.68); backdrop-filter:blur(2px); }}
+                    dialog.modal .modal-body {{ padding:24px; }}
+                    dialog.modal h3 {{ margin-top:0; }}
+                    dialog.modal .modal-actions {{ display:flex; gap:10px; margin-top:18px; }}
+                    dialog.modal .modal-actions button {{ margin-right:0; }}
+
+                    /* ---------- plans ---------- */
                     .plan-grid {{ display:grid; grid-template-columns:repeat(auto-fit, minmax(230px, 1fr)); gap:16px; margin:6px 0; }}
                     .plan-card {{ position:relative; display:flex; flex-direction:column; gap:8px; background:var(--surface); border:1px solid var(--border); border-radius:var(--radius-md); padding:22px; transition:border-color .15s ease, transform .15s ease; }}
                     .plan-card:hover {{ transform:translateY(-2px); border-color:var(--border-strong); }}
@@ -940,20 +1161,22 @@ def render_page(title: str, body: str, nav_html: Optional[str] = None) -> HTMLRe
                     .plan-card .price {{ font-size:1.7rem; font-weight:800; letter-spacing:-.03em; color:var(--text); }}
                     .plan-card p {{ color:var(--muted); margin:0; font-size:.88rem; }}
                     .plan-card label {{ margin-top:6px; }}
-                    dialog.modal {{ border:1px solid var(--border-strong); border-radius:var(--radius-lg); padding:0; background:var(--surface); color:var(--text); box-shadow:var(--shadow-md); width:min(420px, 90vw); }}
-                    dialog.modal::backdrop {{ background:rgba(2,4,10,.68); backdrop-filter:blur(2px); }}
-                    dialog.modal .modal-body {{ padding:24px; }}
-                    dialog.modal h3 {{ margin-top:0; }}
-                    dialog.modal .modal-actions {{ display:flex; gap:10px; margin-top:18px; }}
-                    dialog.modal .modal-actions button {{ margin-right:0; }}
-                    .detail-grid {{ display:grid; grid-template-columns:1.4fr 1fr; gap:16px; align-items:start; }}
-                    .kv-list {{ display:flex; flex-direction:column; gap:10px; }}
-                    .kv-list .kv-row {{ display:flex; justify-content:space-between; gap:12px; padding:10px 0; border-bottom:1px solid var(--border); }}
-                    .kv-list .kv-row:last-child {{ border-bottom:none; }}
-                    .kv-list .kv-label {{ color:var(--muted); font-size:.85rem; }}
-                    .kv-list .kv-value {{ font-weight:600; text-align:right; }}
-                    .receipt-preview {{ max-width:100%; border-radius:var(--radius-md); border:1px solid var(--border); margin-top:10px; }}
-                    @media (max-width:780px) {{ .detail-grid {{ grid-template-columns:1fr; }} }}
+
+                    /* ---------- action queue ---------- */
+                    .queue-list {{ display:flex; flex-direction:column; gap:10px; }}
+                    .queue-item {{ display:flex; align-items:center; gap:14px; padding:14px 16px; border:1px solid rgba(255,94,122,.32); border-radius:var(--radius-md); background:linear-gradient(90deg,rgba(255,94,122,.09),rgba(255,94,122,.04)); text-decoration:none; transition:background .15s ease, transform .1s ease, border-color .15s ease; }}
+                    .queue-item:hover {{ border-color:rgba(255,94,122,.5); transform:translateY(-1px); }}
+                    .queue-main {{ display:flex; flex-direction:column; gap:2px; min-width:0; }}
+                    .queue-id {{ font-weight:800; color:var(--text); }}
+                    .queue-customer {{ color:var(--text); font-size:.9rem; }}
+                    .queue-biz {{ color:var(--muted); font-size:.78rem; }}
+                    .queue-meta {{ margin-left:auto; display:flex; flex-direction:column; align-items:flex-end; gap:2px; flex-shrink:0; }}
+                    .queue-total {{ font-weight:700; color:var(--text); }}
+                    .queue-status {{ color:#ff8fa3; font-size:.78rem; font-weight:600; }}
+                    .queue-age {{ color:var(--muted); font-size:.75rem; }}
+                    .queue-cta {{ flex-shrink:0; }}
+
+                    /* ---------- alert widget ---------- */
                     .rb-alert {{ position:fixed; top:14px; left:50%; transform:translateX(-50%); z-index:10001; width:min(560px, calc(100vw - 24px)); background:linear-gradient(160deg,#2a1218,#1a0d11); border:1px solid rgba(255,94,122,.55); border-radius:var(--radius-md); overflow:hidden; animation:rb-alert-pulse 1.6s ease-in-out infinite; }}
                     .rb-alert-head {{ display:flex; align-items:center; gap:10px; padding:12px 16px; border-bottom:1px solid rgba(255,94,122,.25); font-weight:700; color:#ffb3c1; }}
                     .rb-alert-icon {{ font-size:1.1rem; animation:rb-alert-ring 1.2s ease-in-out infinite; }}
@@ -969,26 +1192,10 @@ def render_page(title: str, body: str, nav_html: Optional[str] = None) -> HTMLRe
                     .rb-alert-more {{ padding:8px 16px; color:var(--muted); font-size:.8rem; }}
                     @keyframes rb-alert-pulse {{ 0%,100% {{ box-shadow:0 18px 50px rgba(0,0,0,.6), 0 0 0 1px rgba(255,94,122,.25); }} 50% {{ box-shadow:0 18px 50px rgba(0,0,0,.6), 0 0 0 6px rgba(255,94,122,.30); }} }}
                     @keyframes rb-alert-ring {{ 0%,100% {{ transform:rotate(0); }} 20% {{ transform:rotate(14deg); }} 40% {{ transform:rotate(-12deg); }} 60% {{ transform:rotate(8deg); }} 80% {{ transform:rotate(-6deg); }} }}
-                    .queue-list {{ display:flex; flex-direction:column; gap:10px; }}
-                    .queue-item {{ display:flex; align-items:center; gap:14px; padding:14px 16px; border:1px solid rgba(255,94,122,.35); border-radius:var(--radius-md); background:rgba(255,94,122,.06); text-decoration:none; transition:background .15s ease, transform .1s ease; }}
-                    .queue-item:hover {{ background:rgba(255,94,122,.12); transform:translateY(-1px); }}
-                    .queue-main {{ display:flex; flex-direction:column; gap:2px; min-width:0; }}
-                    .queue-id {{ font-weight:800; color:var(--text); }}
-                    .queue-customer {{ color:var(--text); font-size:.9rem; }}
-                    .queue-biz {{ color:var(--muted); font-size:.78rem; }}
-                    .queue-meta {{ margin-left:auto; display:flex; flex-direction:column; align-items:flex-end; gap:2px; flex-shrink:0; }}
-                    .queue-total {{ font-weight:700; color:var(--text); }}
-                    .queue-status {{ color:#ff8fa3; font-size:.78rem; font-weight:600; }}
-                    .queue-age {{ color:var(--muted); font-size:.75rem; }}
-                    .queue-cta {{ flex-shrink:0; }}
-                    .empty-state {{ padding:18px; border:1px dashed var(--border-strong); border-radius:var(--radius-md); color:var(--muted); text-align:center; }}
-                    .notice-banner {{ padding:14px 18px; border:1px solid rgba(255,196,0,.4); border-radius:var(--radius-md); background:rgba(255,196,0,.08); color:#ffd866; font-weight:600; }}
-                    .notice-banner.danger {{ border-color:rgba(255,94,122,.45); background:rgba(255,94,122,.08); color:#ff8fa3; }}
-                    .notice-banner a {{ color:inherit; text-decoration:underline; }}
-                    .stat-card.alert {{ border-color:rgba(255,94,122,.5); background:rgba(255,94,122,.07); }}
-                    .stat-card.alert .value {{ color:var(--danger); }}
+
+                    /* ---------- mascot ---------- */
                     .rb-mascot {{ position:fixed; right:20px; bottom:20px; z-index:9999; display:flex; flex-direction:column; align-items:flex-end; gap:10px; }}
-                    .rb-bubble {{ max-width:240px; padding:12px 14px; border-radius:16px 16px 4px 16px; background:var(--surface); border:1px solid var(--border-strong); color:var(--text); font-size:.85rem; line-height:1.4; box-shadow:var(--shadow-md); }}
+                    .rb-bubble {{ max-width:240px; padding:12px 14px; border-radius:16px 16px 4px 16px; background:var(--surface); border:1px solid var(--border-strong); color:var(--text); font-size:.85rem; line-height:1.4; box-shadow:var(--shadow-lg); }}
                     .rb-toggle {{ width:130px; height:130px; padding:0; border:none; background:transparent; cursor:pointer; display:flex; align-items:center; justify-content:center; transition:transform .2s ease; filter:drop-shadow(0 18px 30px rgba(0,0,0,.4)); }}
                     .rb-toggle:hover {{ transform:translateY(-2px) scale(1.04); }}
                     .rb-avatar {{ width:130px; height:130px; animation:rb-bob 3s ease-in-out infinite; }}
@@ -996,29 +1203,41 @@ def render_page(title: str, body: str, nav_html: Optional[str] = None) -> HTMLRe
                     .rb-mascot.rb-collapsed .rb-toggle {{ width:72px; height:72px; opacity:.85; }}
                     .rb-mascot.rb-collapsed .rb-avatar {{ width:72px; height:72px; }}
                     @keyframes rb-bob {{ 0%, 100% {{ transform:translateY(0); }} 50% {{ transform:translateY(-6px); }} }}
-                    @media (max-width: 900px) {{
+
+                    /* ---------- responsive ---------- */
+                    @media (max-width:900px) {{
                       .rb-mascot {{ display:none; }}
                       .shell {{ flex-direction:column; }}
                       .sidebar {{ width:100%; height:auto; position:relative; flex-direction:row; align-items:center; overflow-x:auto; padding:10px 12px; gap:14px; }}
-                      .brand {{ border-bottom:none; border-right:1px solid var(--border); padding:4px 14px 4px 0; margin-bottom:0; }}
+                      .brand {{ border-bottom:none; border-right:1px solid var(--border); padding:4px 14px 4px 0; margin-bottom:0; flex-shrink:0; }}
                       .nav-links {{ flex-direction:row; }}
+                      .nav-section {{ display:none; }}
+                      .nav-link {{ white-space:nowrap; }}
+                      .nav-link.active::before {{ display:none; }}
                       .nav-footer {{ margin-top:0; padding-top:0; border-top:none; flex-direction:row; margin-left:auto; }}
                       .user-email {{ display:none; }}
                       .content {{ padding:20px 16px 48px; }}
                       .page-title {{ padding:14px 16px; }}
                       .hero-panel {{ padding:22px; }}
-                      .panel-grid {{ grid-template-columns:1fr; }}
-                      .stats-grid {{ grid-template-columns:1fr; }}
+                      .panel-grid, .panel-grid.wide-left {{ grid-template-columns:1fr; }}
+                      .stats-grid {{ grid-template-columns:repeat(auto-fit, minmax(150px, 1fr)); }}
                       .auth-shell {{ grid-template-columns:1fr; }}
-                      .table-wrap table {{ min-width:420px; }}
+                      .table-wrap table {{ min-width:460px; }}
                       .plan-grid {{ grid-template-columns:1fr; }}
+                      .detail-grid {{ grid-template-columns:1fr; }}
                     }}
-                    @media (max-width: 420px) {{
+                    @media (max-width:520px) {{
+                      .stats-grid {{ grid-template-columns:1fr; }}
+                    }}
+                    @media (max-width:420px) {{
                       .hero, .hero-panel, .auth-hero {{ padding:18px; }}
                       .hero h1, .hero-panel h1 {{ font-size:1.4rem; }}
-                      .stat-card .value, .metric .value {{ font-size:1.3rem; }}
+                      .stat-card .value, .metric .value {{ font-size:1.35rem; }}
                       .form-actions .btn, .form-actions button, .auth-form button, form button[type="submit"] {{ width:100%; text-align:center; margin-right:0; }}
                       .rb-bubble {{ max-width:calc(100vw - 88px); font-size:.82rem; }}
+                    }}
+                    @media (prefers-reduced-motion:reduce) {{
+                      * {{ animation-duration:.001ms !important; animation-iteration-count:1 !important; transition-duration:.001ms !important; }}
                     }}
                 </style>
       </head>
@@ -1032,7 +1251,11 @@ def render_page(title: str, body: str, nav_html: Optional[str] = None) -> HTMLRe
           </aside>
           <div class="main-area">
             <header class="page-title">
-              <h1>{escape(title)}</h1>
+              <div class="topbar-main">
+                <h1>{escape(title)}</h1>
+                {subtitle_html}
+              </div>
+              {actions_html}
             </header>
             <main class="content">
               {body}
@@ -1041,6 +1264,7 @@ def render_page(title: str, body: str, nav_html: Optional[str] = None) -> HTMLRe
         </div>
         {MASCOT_WIDGET_HTML}
         {ALERT_WIDGET_HTML}
+        {PORTAL_SCRIPTS}
       </body>
     </html>
     """
@@ -3594,7 +3818,7 @@ def account_security(request: Request) -> HTMLResponse:
           </form>
         </div>
         """
-        return render_page("Account Security", body, nav_html=make_nav(current_user))
+        return render_page("Account Security", body, nav_html=make_nav(current_user), subtitle="Two-factor authentication and sign-in")
 
     # Not yet enabled: make sure a secret exists to enrol against.
     db = SessionLocal()
@@ -3611,7 +3835,7 @@ def account_security(request: Request) -> HTMLResponse:
     <div class="card">
       <div class="section-head">
         <h3>Enable two-factor authentication</h3>
-        <span class="status-pill" style="background:rgba(255,196,0,.12);border-color:rgba(255,196,0,.35);color:#ffd866;">Not enabled</span>
+        <span class="status-pill warn">Not enabled</span>
       </div>
       <p>Add a second lock on your account: after your password, sign-in will also require a 6-digit code from an authenticator app (Google Authenticator, Authy, 1Password…).</p>
       <ol>
@@ -3628,7 +3852,7 @@ def account_security(request: Request) -> HTMLResponse:
       </form>
     </div>
     """
-    return render_page("Account Security", body, nav_html=make_nav(current_user))
+    return render_page("Account Security", body, nav_html=make_nav(current_user), subtitle="Two-factor authentication and sign-in")
 
 
 @app.post("/account/security/enable")
@@ -3684,7 +3908,7 @@ def register_page(request: Request) -> HTMLResponse:
           </div>
         </div>
         """
-        return render_page("Create Business Owner", body, nav_html=make_nav(current_user))
+        return render_page("Create Business Owner", body, nav_html=make_nav(current_user), subtitle="Add an owner and attach them to a business")
 
     db = SessionLocal()
     try:
@@ -3719,7 +3943,7 @@ def register_page(request: Request) -> HTMLResponse:
       </div>
     </div>
     """
-    return render_page("Create Business Owner", body, nav_html=make_nav(current_user))
+    return render_page("Create Business Owner", body, nav_html=make_nav(current_user), subtitle="Add an owner and attach them to a business")
 
 
 @app.post("/register")
@@ -3773,6 +3997,11 @@ def admin_dashboard(request: Request) -> HTMLResponse:
         )
         recent_orders = db.query(Order).order_by(Order.created_at.desc()).limit(10).all()
         conversations = db.query(Conversation).order_by(Conversation.updated_at.desc()).limit(8).all()
+        chart_labels, daily_counts, daily_revenue = daily_order_series(db, days=14)
+        orders_yesterday = daily_counts[-2] if len(daily_counts) > 1 else 0
+        revenue_yesterday = daily_revenue[-2] if len(daily_revenue) > 1 else 0
+        breakdown = status_breakdown(db, days=30)
+        busiest = top_businesses(db, business_names, days=30)
 
         action_queue_html = render_action_queue(action_orders, business_names)
         orders_rows = "".join(
@@ -3797,7 +4026,42 @@ def admin_dashboard(request: Request) -> HTMLResponse:
         business_list = "".join(
             f"<li><a href='/admin/businesses/{business.id}'>{escape(business.name)}</a></li>" for business in businesses
         )
-        action_stat_class = " alert" if action_orders else ""
+        stats_html = "".join([
+            stat_card("Needs action now", str(len(action_orders)), "\u26a1", "rose",
+                      note="blocking a customer" if action_orders else "all clear",
+                      alert=bool(action_orders)),
+            stat_card("Open orders", str(open_orders), "\U0001f4e6", "blue", note="across all businesses"),
+            stat_card("Orders today", str(orders_today), "\U0001f9fe", "",
+                      delta=pct_delta(orders_today, orders_yesterday), note="vs yesterday"),
+            stat_card("Revenue today", f"\u20a6{revenue_today:,}", "\U0001f4b0", "amber",
+                      delta=pct_delta(revenue_today, revenue_yesterday), note="confirmed only"),
+            stat_card("Businesses", str(len(businesses)), "\U0001f3ea", "blue", note="on the platform"),
+        ])
+        revenue_card = chart_card(
+            "Platform revenue", "revChart",
+            revenue_area_chart(chart_labels, daily_revenue, "revChart"),
+            sub_text="Confirmed revenue, last 14 days",
+            badge=f"\u20a6{sum(daily_revenue):,} total",
+        )
+        if breakdown:
+            donut_card = chart_card(
+                "Order mix", "statusChart", status_donut_chart(breakdown),
+                sub_text="Last 30 days by status",
+                legend=[(row[0], row[2]) for row in breakdown],
+            )
+        else:
+            donut_card = (
+                "<div class='card'><div class='card-head'><div><h3>Order mix</h3>"
+                "<p class='sub'>Last 30 days by status</p></div></div>"
+                "<div class='empty-state'>No orders in the last 30 days yet.</div></div>"
+            )
+        if busiest:
+            busiest_card = chart_card(
+                "Busiest businesses", "bizChart", top_businesses_chart(busiest),
+                sub_text="Orders in the last 30 days",
+            )
+        else:
+            busiest_card = ""
         body = f"""
         <div class="hero-panel">
           <div>
@@ -3810,28 +4074,12 @@ def admin_dashboard(request: Request) -> HTMLResponse:
             <a class="btn" href="/admin/conversations">Conversations</a>
           </div>
         </div>
-        <div class="stats-grid">
-          <div class="card stat-card metric{action_stat_class}">
-            <span class="label">Needs action now</span>
-            <span class="value">{len(action_orders)}</span>
-          </div>
-          <div class="card stat-card metric">
-            <span class="label">Open orders</span>
-            <span class="value">{open_orders}</span>
-          </div>
-          <div class="card stat-card metric">
-            <span class="label">Orders today</span>
-            <span class="value">{orders_today}</span>
-          </div>
-          <div class="card stat-card metric">
-            <span class="label">Confirmed revenue today</span>
-            <span class="value">₦{revenue_today}</span>
-          </div>
-          <div class="card stat-card metric">
-            <span class="label">Businesses</span>
-            <span class="value">{len(businesses)}</span>
-          </div>
+        <div class="stats-grid">{stats_html}</div>
+        <div class="panel-grid wide-left">
+          {revenue_card}
+          {donut_card}
         </div>
+        {busiest_card}
         <div class="card">
           <div class="section-head">
             <h3>⚡ Needs your action</h3>
@@ -3862,7 +4110,7 @@ def admin_dashboard(request: Request) -> HTMLResponse:
         """
     finally:
         db.close()
-    return render_page("Admin Dashboard", body, nav_html=make_nav(current_user))
+    return render_page("Admin Dashboard", body, nav_html=make_nav(current_user), subtitle="Platform-wide operations across every business")
 
 
 @app.get("/admin/users", response_class=HTMLResponse)
@@ -3888,7 +4136,7 @@ def admin_users(request: Request) -> HTMLResponse:
         """
     finally:
         db.close()
-    return render_page("Users", body, nav_html=make_nav(get_current_user(request)))
+    return render_page("Users", body, nav_html=make_nav(get_current_user(request)), subtitle="Everyone with access to the portal")
 
 
 @app.get("/admin/users/{user_id}", response_class=HTMLResponse)
@@ -3994,7 +4242,7 @@ def admin_businesses(request: Request) -> HTMLResponse:
         """
     finally:
         db.close()
-    return render_page("Businesses", body, nav_html=make_nav(get_current_user(request)))
+    return render_page("Businesses", body, nav_html=make_nav(get_current_user(request)), subtitle="Every business trading on the platform")
 
 
 @app.post("/admin/businesses")
@@ -4086,8 +4334,8 @@ def business_detail(request: Request, business_id: int, notice: Optional[str] = 
     key_mode = paystack_key_mode(business.paystack_secret_key)
     key_badges = {
         "live": "<span class='status-pill'>✅ Live Paystack key saved</span>",
-        "test": "<span class='status-pill' style='background:rgba(255,196,0,.12);border-color:rgba(255,196,0,.35);color:#ffd866;'>⚠️ TEST key saved — real customers can't pay with this</span>",
-        "unknown": "<span class='status-pill' style='background:rgba(255,94,122,.12);border-color:rgba(255,94,122,.3);color:var(--danger);'>⚠️ Key doesn't look like sk_test_… / sk_live_…</span>",
+        "test": "<span class='status-pill warn'>⚠️ TEST key saved — real customers can't pay with this</span>",
+        "unknown": "<span class='status-pill danger'>⚠️ Key doesn't look like sk_test_… / sk_live_…</span>",
         "missing": "",
     }
     key_badge = key_badges.get(key_mode, "")
@@ -4225,7 +4473,7 @@ def business_detail(request: Request, business_id: int, notice: Optional[str] = 
       </div>
     </div>
     """
-    return render_page(f"{business.name} Configuration", body, nav_html=make_nav(get_current_user(request)))
+    return render_page(f"{business.name} Configuration", body, nav_html=make_nav(get_current_user(request)), subtitle="Menu, branches, hours and payment setup")
 
 
 @app.post("/business/{business_id}/purchase-plan")
@@ -4560,16 +4808,217 @@ def render_order_row(order: Order, show_business_name: bool = False, business_na
     business_cell = f"<td>{escape(business_name)}</td>" if show_business_name else ""
     is_pending = order.status not in {"delivered", "cancelled"}
     is_stale = is_pending and order.created_at and (datetime.utcnow() - order.created_at) > timedelta(hours=2)
-    age_style = "color:var(--danger);font-weight:700;" if is_stale else "color:var(--muted);"
-    age_cell = f"<td style='{age_style}'>{format_age(order.created_at)}</td>"
-    status_pill_style = "background:rgba(255,94,122,.12);border-color:rgba(255,94,122,.3);color:var(--danger);" if is_stale else ""
-    status_label = ORDER_STATUS_LABELS.get(order.status, order.status)
-    status_cell = f"<span class='status-pill' style='{status_pill_style}'>{escape(status_label)}</span>"
+    age_cell = f"<td class='{'age-stale' if is_stale else 'age-normal'}'>{format_age(order.created_at)}</td>"
+    status_cell = order_status_pill(order.status, stale=is_stale)
     customer_cell = escape(order.customer_name) if order.customer_name else escape(order.customer_phone)
     return (
         f"<tr>{business_cell}<td><a href='/orders/{order.id}'>#{order.id}</a></td><td>{customer_cell}</td><td>{escape(order.address)}</td>"
         f"<td>₦{order.total}</td>{age_cell}<td>{status_cell}</td></tr>"
     )
+
+
+# Statuses that count as money actually earned.
+PAID_STATUSES = ("paid", "out_for_delivery", "delivered")
+
+# Donut/legend colours per order status, ordered from "just arrived" to "done".
+STATUS_CHART_COLORS = {
+    "awaiting_delivery_fee": "#f59e0b",
+    "awaiting_payment": "#fbbf24",
+    "payment_claimed": "#60a5fa",
+    "paid": "#10b981",
+    "out_for_delivery": "#34d399",
+    "delivered": "#6ee7b7",
+    "cancelled": "#ff5e7a",
+}
+
+
+# Which pill variant each order status wears, so a table reads at a glance
+# instead of every status being the same green.
+STATUS_PILL_TONE = {
+    "awaiting_delivery_fee": "amber",
+    "awaiting_payment": "amber",
+    "payment_claimed": "info",
+    "paid": "ok",
+    "out_for_delivery": "info",
+    "delivered": "ok",
+    "cancelled": "neutral",
+}
+
+
+def order_status_pill(status: str, stale: bool = False) -> str:
+    """Status pill for an order; a stale order always shows as danger."""
+    tone = "danger" if stale else STATUS_PILL_TONE.get(status, "neutral")
+    label = ORDER_STATUS_LABELS.get(status, status)
+    return f"<span class='status-pill {tone}'>{escape(label)}</span>"
+
+
+def stat_card(label: str, value: str, icon: str = "", tone: str = "",
+              delta: Optional[tuple] = None, note: str = "", alert: bool = False) -> str:
+    """One KPI tile: icon chip, label, big value, and an optional delta badge."""
+    cls = "card stat-card alert" if alert else "card stat-card"
+    ico = f"<span class='stat-ico {tone}'>{icon}</span>" if icon else ""
+    foot = ""
+    if delta:
+        foot += f"<span class='stat-delta {delta[0]}'>{escape(delta[1])}</span>"
+    if note:
+        foot += f"<span class='stat-note'>{escape(note)}</span>"
+    foot_html = f"<div class='stat-foot'>{foot}</div>" if foot else ""
+    return (
+        f"<div class='{cls}'>"
+        f"<div class='stat-head'>{ico}<span class='stat-label'>{escape(label)}</span></div>"
+        f"<span class='value'>{value}</span>"
+        f"{foot_html}</div>"
+    )
+
+
+def pct_delta(current: float, previous: float) -> Optional[tuple]:
+    """(css_class, label) comparing two periods, or None when there's no basis."""
+    if previous == 0:
+        return ("up", "New") if current else None
+    change = round((current - previous) / previous * 100)
+    if change == 0:
+        return ("flat", "No change")
+    return ("up" if change > 0 else "down", f"{change:+d}%")
+
+
+def chart_card(title: str, canvas_id: str, config: dict, sub_text: str = "",
+               badge: str = "", legend: Optional[List[tuple]] = None, tall: bool = False) -> str:
+    """A card wrapping one Chart.js canvas plus an optional colour legend."""
+    head_right = f"<span class='status-pill neutral'>{escape(badge)}</span>" if badge else ""
+    sub_html = f"<p class='sub'>{escape(sub_text)}</p>" if sub_text else ""
+    legend_html = ""
+    if legend:
+        items = "".join(
+            f"<span><i style='background:{color}'></i>{escape(label)}</span>"
+            for label, color in legend
+        )
+        legend_html = f"<div class='chart-legend'>{items}</div>"
+    box_cls = "chart-box tall" if tall else "chart-box"
+    script = (
+        "<script>window.addEventListener('DOMContentLoaded',function(){"
+        f"var el=document.getElementById('{canvas_id}');"
+        f"if(el&&window.Chart){{new Chart(el,{json.dumps(config)});}}"
+        "});</script>"
+    )
+    return (
+        f"<div class='card'><div class='card-head'><div><h3>{escape(title)}</h3>{sub_html}</div>"
+        f"{head_right}</div><div class='{box_cls}'><canvas id='{canvas_id}'></canvas></div>"
+        f"{legend_html}{script}</div>"
+    )
+
+
+def daily_order_series(db, business_id: Optional[int] = None, days: int = 14) -> tuple:
+    """(labels, order_counts, confirmed_revenue) bucketed by day, oldest first."""
+    today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    start = today - timedelta(days=days - 1)
+    query = db.query(Order).filter(Order.created_at >= start)
+    if business_id is not None:
+        query = query.filter(Order.business_id == business_id)
+    orders = query.all()
+    labels, counts, revenue = [], [], []
+    for offset in range(days):
+        day = start + timedelta(days=offset)
+        nxt = day + timedelta(days=1)
+        bucket = [o for o in orders if o.created_at and day <= o.created_at < nxt]
+        labels.append(day.strftime("%d %b"))
+        counts.append(len(bucket))
+        revenue.append(sum(o.total for o in bucket if o.status in PAID_STATUSES))
+    return labels, counts, revenue
+
+
+def status_breakdown(db, business_id: Optional[int] = None, days: int = 30) -> List[tuple]:
+    """[(label, count, colour)] for every status present in the window."""
+    start = datetime.utcnow() - timedelta(days=days)
+    query = db.query(Order).filter(Order.created_at >= start)
+    if business_id is not None:
+        query = query.filter(Order.business_id == business_id)
+    tally: Dict[str, int] = {}
+    for order in query.all():
+        tally[order.status] = tally.get(order.status, 0) + 1
+    rows = []
+    for status in STATUS_CHART_COLORS:
+        if tally.get(status):
+            rows.append((ORDER_STATUS_LABELS.get(status, status), tally[status], STATUS_CHART_COLORS[status]))
+    return rows
+
+
+def top_businesses(db, business_names: Dict[int, str], days: int = 30, limit: int = 6) -> List[tuple]:
+    """[(business_name, order_count)] for the busiest businesses in the window."""
+    start = datetime.utcnow() - timedelta(days=days)
+    tally: Dict[int, int] = {}
+    for order in db.query(Order).filter(Order.created_at >= start).all():
+        tally[order.business_id] = tally.get(order.business_id, 0) + 1
+    ranked = sorted(tally.items(), key=lambda kv: kv[1], reverse=True)[:limit]
+    return [(business_names.get(bid, f"Business #{bid}"), count) for bid, count in ranked]
+
+
+def top_businesses_chart(rows: List[tuple]) -> dict:
+    """Chart.js config for the horizontal busiest-businesses bars."""
+    return {
+        "type": "bar",
+        "data": {"labels": [r[0] for r in rows], "datasets": [{
+            "data": [r[1] for r in rows],
+            "backgroundColor": "rgba(16,185,129,.5)",
+            "hoverBackgroundColor": "#10b981",
+            "borderRadius": 6,
+            "borderSkipped": False,
+            "barThickness": 16,
+        }]},
+        "options": {
+            "indexAxis": "y",
+            "scales": {
+                "x": {"beginAtZero": True, "grid": {"color": "rgba(255,255,255,.05)"},
+                      "border": {"display": False}, "ticks": {"precision": 0}},
+                "y": {"grid": {"display": False}, "border": {"display": False}},
+            },
+        },
+    }
+
+
+def revenue_area_chart(labels: List[str], revenue: List[int], canvas_id: str) -> dict:
+    """Chart.js config for the emerald revenue area line."""
+    return {
+        "type": "line",
+        "data": {"labels": labels, "datasets": [{
+            "data": revenue,
+            "borderColor": "#10b981",
+            "backgroundColor": "rgba(16,185,129,.14)",
+            "borderWidth": 2,
+            "fill": True,
+            "tension": 0.35,
+            "pointRadius": 0,
+            "pointHoverRadius": 4,
+            "pointHoverBackgroundColor": "#34d399",
+        }]},
+        "options": {
+            "scales": {
+                "y": {"beginAtZero": True, "grid": {"color": "rgba(255,255,255,.05)"},
+                      "border": {"display": False}, "ticks": {"maxTicksLimit": 5}},
+                "x": {"grid": {"display": False}, "border": {"display": False},
+                      "ticks": {"maxRotation": 0, "autoSkipPadding": 14}},
+            },
+            "plugins": {"tooltip": {"callbacks": {}}},
+            "interaction": {"intersect": False, "mode": "index"},
+        },
+    }
+
+
+def status_donut_chart(rows: List[tuple]) -> dict:
+    """Chart.js config for the order-status doughnut."""
+    return {
+        "type": "doughnut",
+        "data": {
+            "labels": [r[0] for r in rows],
+            "datasets": [{
+                "data": [r[1] for r in rows],
+                "backgroundColor": [r[2] for r in rows],
+                "borderColor": "#0f1413",
+                "borderWidth": 3,
+                "hoverOffset": 6,
+            }],
+        },
+        "options": {"cutout": "68%", "plugins": {"tooltip": {"displayColors": True}}},
+    }
 
 
 def render_action_queue(orders: List[Order], business_names: Optional[Dict[int, str]] = None) -> str:
@@ -5612,7 +6061,7 @@ def admin_orders(request: Request) -> HTMLResponse:
     finally:
         db.close()
     body = f"<div class=\"card\"><div class=\"table-wrap\"><table><tr><th>Business</th><th>Order</th><th>Customer</th><th>Address</th><th>Total</th><th>Age</th><th>Status</th></tr>{rows}</table></div></div>"
-    return render_page("Orders", body, nav_html=make_nav(current_user))
+    return render_page("Orders", body, nav_html=make_nav(current_user), subtitle="Every order across all businesses")
 
 
 CONV_STAGE_LABELS = {
@@ -5645,7 +6094,7 @@ def admin_conversations(request: Request) -> HTMLResponse:
     finally:
         db.close()
     body = f"<div class=\"card\"><div class=\"table-wrap\"><table><tr><th>Business</th><th>Phone</th><th>Stage</th><th>Cart / Address</th><th>Last active</th></tr>{rows}</table></div></div>"
-    return render_page("Conversations", body, nav_html=make_nav(current_user))
+    return render_page("Conversations", body, nav_html=make_nav(current_user), subtitle="Live WhatsApp threads in progress")
 
 
 @app.get("/conversations/{conversation_id}", response_class=HTMLResponse)
@@ -5754,6 +6203,10 @@ def business_dashboard(request: Request, business_id: int) -> HTMLResponse:
             .all()
         )
         item_count = db.query(MenuItem).filter(MenuItem.business_id == business_id).count()
+        chart_labels, daily_counts, daily_revenue = daily_order_series(db, business_id, days=14)
+        orders_yesterday = daily_counts[-2] if len(daily_counts) > 1 else 0
+        revenue_yesterday = daily_revenue[-2] if len(daily_revenue) > 1 else 0
+        breakdown = status_breakdown(db, business_id, days=30)
 
         action_queue_html = render_action_queue(action_orders)
         orders_rows = "".join(render_order_row(order) for order in recent_orders)
@@ -5795,12 +6248,41 @@ def business_dashboard(request: Request, business_id: int) -> HTMLResponse:
                     f"<div class='notice-banner'>📈 {used}/{cap} monthly orders used on your {escape(cap_plan.name)} plan. "
                     f"<a href='{plans_url}'>Upgrade</a> if you're trending past it.</div>"
                 )
+        stats_html = "".join([
+            stat_card("Needs action now", str(len(action_orders)), "\u26a1", "rose",
+                      note="blocking a customer" if action_orders else "all clear",
+                      alert=bool(action_orders)),
+            stat_card("Open orders", str(open_orders), "\U0001f4e6", "blue", note="in progress"),
+            stat_card("Orders today", str(orders_today), "\U0001f9fe", "",
+                      delta=pct_delta(orders_today, orders_yesterday), note="vs yesterday"),
+            stat_card("Revenue today", f"\u20a6{revenue_today:,}", "\U0001f4b0", "amber",
+                      delta=pct_delta(revenue_today, revenue_yesterday), note="confirmed only"),
+            stat_card("Menu items", str(item_count), "\U0001f37d\ufe0f", "blue", note="live on WhatsApp"),
+        ])
+        revenue_card = chart_card(
+            "Revenue trend", "revChart",
+            revenue_area_chart(chart_labels, daily_revenue, "revChart"),
+            sub_text="Confirmed revenue, last 14 days",
+            badge=f"\u20a6{sum(daily_revenue):,} total",
+        )
+        if breakdown:
+            donut_card = chart_card(
+                "Order mix", "statusChart", status_donut_chart(breakdown),
+                sub_text="Last 30 days by status",
+                legend=[(row[0], row[2]) for row in breakdown],
+            )
+        else:
+            donut_card = (
+                "<div class='card'><div class='card-head'><div><h3>Order mix</h3>"
+                "<p class='sub'>Last 30 days by status</p></div></div>"
+                "<div class='empty-state'>No orders in the last 30 days yet.</div></div>"
+            )
         action_stat_class = " alert" if action_orders else ""
         if business.open_time and business.close_time:
             if business_is_open(business):
                 hours_pill = f"<span class='status-pill'>🟢 Open now · {escape(business.open_time)}–{escape(business.close_time)}</span>"
             else:
-                hours_pill = f"<span class='status-pill' style='background:rgba(255,94,122,.12);border-color:rgba(255,94,122,.3);color:var(--danger);'>🔴 Closed now · opens {escape(business.open_time)}</span>"
+                hours_pill = f"<span class='status-pill danger'>🔴 Closed now · opens {escape(business.open_time)}</span>"
         else:
             hours_pill = "<span class='status-pill'>🟢 Open 24/7</span>"
         if business.accepting_orders:
@@ -5811,10 +6293,7 @@ def business_dashboard(request: Request, business_id: int) -> HTMLResponse:
             )
             paused_banner = ""
         else:
-            orders_pill = (
-                "<span class='status-pill' style='background:rgba(255,94,122,.12);"
-                "border-color:rgba(255,94,122,.3);color:var(--danger);'>🔴 Orders paused</span>"
-            )
+            orders_pill = "<span class='status-pill danger'>🔴 Orders paused</span>"
             toggle_btn = (
                 f"<form method='post' action='/business/{business.id}/toggle-orders' style='display:inline'>"
                 f"<button class='btn primary' type='submit'>▶ Resume orders</button></form>"
@@ -5841,27 +6320,10 @@ def business_dashboard(request: Request, business_id: int) -> HTMLResponse:
             <a class="btn" href="/business/{business.id}/plans">Plans</a>
           </div>
         </div>
-        <div class="stats-grid">
-          <div class="card stat-card metric{action_stat_class}">
-            <span class="label">Needs action now</span>
-            <span class="value">{len(action_orders)}</span>
-          </div>
-          <div class="card stat-card metric">
-            <span class="label">Open orders</span>
-            <span class="value">{open_orders}</span>
-          </div>
-          <div class="card stat-card metric">
-            <span class="label">Orders today</span>
-            <span class="value">{orders_today}</span>
-          </div>
-          <div class="card stat-card metric">
-            <span class="label">Confirmed revenue today</span>
-            <span class="value">₦{revenue_today}</span>
-          </div>
-          <div class="card stat-card metric">
-            <span class="label">Menu items</span>
-            <span class="value">{item_count}</span>
-          </div>
+        <div class="stats-grid">{stats_html}</div>
+        <div class="panel-grid wide-left">
+          {revenue_card}
+          {donut_card}
         </div>
         <div class="card">
           <div class="section-head">
@@ -5879,7 +6341,7 @@ def business_dashboard(request: Request, business_id: int) -> HTMLResponse:
         """
     finally:
         db.close()
-    return render_page(f"{business.name} Dashboard", body, nav_html=make_nav(current_user))
+    return render_page(f"{business.name} Dashboard", body, nav_html=make_nav(current_user), subtitle="Today at a glance — clear the red queue first")
 
 
 @app.post("/business/{business_id}/toggle-orders")
@@ -5948,7 +6410,7 @@ def business_plans(request: Request, business_id: int) -> HTMLResponse:
       </div>
     </form>
     """
-    return render_page(f"{business.name} Plans", body, nav_html=make_nav(current_user))
+    return render_page(f"{business.name} Plans", body, nav_html=make_nav(current_user), subtitle="Choose or renew this business’s subscription")
 
 
 @app.get("/admin/messages", response_class=HTMLResponse)
@@ -5981,7 +6443,7 @@ def admin_messages(request: Request) -> HTMLResponse:
       {table}
     </div>
     """
-    return render_page("Leads", body, nav_html=make_nav(current_user))
+    return render_page("Leads", body, nav_html=make_nav(current_user), subtitle="Enquiries from the website contact form")
 
 
 @app.get("/admin/plans", response_class=HTMLResponse)
@@ -6032,7 +6494,7 @@ def admin_plans(request: Request) -> HTMLResponse:
       {plan_cards}
     </div>
     """
-    return render_page("Plans & Pricing", body, nav_html=make_nav(current_user))
+    return render_page("Plans & Pricing", body, nav_html=make_nav(current_user), subtitle="Subscription tiers offered at checkout")
 
 
 @app.post("/admin/plans/{plan_id}")
