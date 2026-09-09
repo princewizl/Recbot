@@ -14,6 +14,36 @@ class OrderItem {
       );
 }
 
+/// What a refund on this order would return, and what it would not.
+/// Mirrors `order_refund_breakdown` in app/main.py.
+class RefundBreakdown {
+  /// Items + delivery — the part the customer gets back.
+  final int refundable;
+
+  /// The service fee, kept because it recovers WhatsApp messages already sent.
+  final int retainedServiceFee;
+
+  /// Everything the customer paid, refundable + retained.
+  final int customerPaid;
+
+  /// Our commission, which is reversed on a refund.
+  final int commissionReversed;
+
+  const RefundBreakdown({
+    required this.refundable,
+    required this.retainedServiceFee,
+    required this.customerPaid,
+    required this.commissionReversed,
+  });
+
+  factory RefundBreakdown.fromJson(Map<String, dynamic> j) => RefundBreakdown(
+        refundable: (j['refundable'] ?? 0) as int,
+        retainedServiceFee: (j['retained_service_fee'] ?? 0) as int,
+        customerPaid: (j['customer_paid'] ?? 0) as int,
+        commissionReversed: (j['commission_reversed'] ?? 0) as int,
+      );
+}
+
 class AppOrder {
   final int id;
   final int? businessId;
@@ -31,6 +61,14 @@ class AppOrder {
   final List<String> availableActions;
   final bool canCancel;
   final String age;
+  final RefundBreakdown? refund;
+  final int refundAmount;
+  final String? refundReason;
+  final String? refundedAt;
+
+  /// When the business accepted this order (and its refund liability) by
+  /// pricing the delivery. Null on orders priced before that was recorded.
+  final String? termsAcceptedAt;
 
   AppOrder({
     required this.id,
@@ -49,6 +87,11 @@ class AppOrder {
     required this.availableActions,
     required this.canCancel,
     required this.age,
+    this.refund,
+    this.refundAmount = 0,
+    this.refundReason,
+    this.refundedAt,
+    this.termsAcceptedAt,
   });
 
   factory AppOrder.fromJson(Map<String, dynamic> json) => AppOrder(
@@ -71,12 +114,27 @@ class AppOrder {
             ((json['available_actions'] ?? []) as List).map((e) => e.toString()).toList(),
         canCancel: json['can_cancel'] == true,
         age: (json['age'] ?? '').toString(),
+        refund: json['refund'] is Map<String, dynamic>
+            ? RefundBreakdown.fromJson(json['refund'] as Map<String, dynamic>)
+            : null,
+        refundAmount: (json['refund_amount'] ?? 0) as int,
+        refundReason: json['refund_reason'] as String?,
+        refundedAt: json['refunded_at'] as String?,
+        termsAcceptedAt: json['terms_accepted_at'] as String?,
       );
 
-  // True whenever the business still has something to do on this order — set the
-  // fee, confirm payment, dispatch, or mark delivered. (awaiting_payment waits on
-  // the customer, so it has no action.)
-  bool get needsAction => availableActions.isNotEmpty;
+  /// Statuses where the order is blocked on the business rather than on the
+  /// customer or the courier — the same two the backend flags in
+  /// ACTION_NEEDED_STATUSES and returns from /api/action-required.
+  ///
+  /// Deliberately not "has any available action": refund is offered on paid,
+  /// out-for-delivery and delivered orders, and a finished order must not
+  /// nag the owner as though something were outstanding.
+  static const Set<String> actionNeededStatuses = {'awaiting_delivery_fee', 'payment_claimed'};
+
+  bool get needsAction => actionNeededStatuses.contains(status);
+
+  bool get isRefunded => status == 'refunded';
 }
 
 /// Human labels for the action verbs the backend accepts.
@@ -85,6 +143,7 @@ const Map<String, String> actionLabels = {
   'mark_paid': 'Confirm payment',
   'dispatch': 'Mark dispatched',
   'mark_delivered': 'Mark delivered',
+  'refund': 'Refund order',
 };
 
 class CatalogueCategory {

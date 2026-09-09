@@ -27,11 +27,13 @@ class _OrderDetailScreenState extends State<OrderDetailScreen> {
     return client.getOrder(widget.orderId);
   }
 
-  Future<void> _runAction(String action, {int? deliveryFee}) async {
+  Future<void> _runAction(String action,
+      {int? deliveryFee, bool acceptTerms = false, String? refundReason}) async {
     setState(() => _acting = true);
     try {
       final client = await ApiClient.current();
-      final updated = await client.doAction(widget.orderId, action, deliveryFee: deliveryFee);
+      final updated = await client.doAction(widget.orderId, action,
+          deliveryFee: deliveryFee, acceptTerms: acceptTerms, refundReason: refundReason);
       setState(() => _future = Future.value(updated));
       _toast('Done — ${updated.statusLabel}.');
     } on ApiException catch (e) {
@@ -97,31 +99,173 @@ class _OrderDetailScreenState extends State<OrderDetailScreen> {
         ),
       );
 
+  /// Pricing an order is the point of no return: it bills the customer and
+  /// commits the business to fulfilling (or refunding) it. So the confirm stays
+  /// disabled until the liability notice is ticked, and the acceptance is sent
+  /// with the fee for the server to record against the order.
   Future<void> _promptDeliveryFee() async {
     final controller = TextEditingController();
+    var accepted = false;
     final fee = await showDialog<int>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setLocal) => AlertDialog(
+          backgroundColor: AppColors.surface,
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
+          title: const Text('Set delivery fee', style: TextStyle(color: AppColors.text)),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              TextField(
+                controller: controller,
+                autofocus: true,
+                keyboardType: TextInputType.number,
+                decoration: const InputDecoration(prefixText: '₦ ', hintText: 'e.g. 500'),
+              ),
+              const SizedBox(height: 16),
+              InkWell(
+                onTap: () => setLocal(() => accepted = !accepted),
+                borderRadius: BorderRadius.circular(12),
+                child: Container(
+                  padding: const EdgeInsets.fromLTRB(8, 10, 12, 10),
+                  decoration: BoxDecoration(
+                    border: Border.all(color: AppColors.border),
+                    borderRadius: BorderRadius.circular(12),
+                  ),
+                  child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      SizedBox(
+                        width: 24,
+                        height: 24,
+                        child: Checkbox(
+                          value: accepted,
+                          onChanged: (v) => setLocal(() => accepted = v ?? false),
+                          activeColor: AppColors.emeraldBright,
+                          side: const BorderSide(color: AppColors.muted),
+                          materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      const Expanded(
+                        child: Text(
+                          'Pricing this order accepts it. Once the customer pays, refunds for '
+                          'it are mine to make — the money settles to my bank, not Collxct’s.',
+                          style: TextStyle(color: AppColors.muted, fontSize: 12.5, height: 1.4),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+                onPressed: () => Navigator.pop(ctx),
+                child: const Text('Cancel', style: TextStyle(color: AppColors.muted))),
+            TextButton(
+              onPressed:
+                  accepted ? () => Navigator.pop(ctx, int.tryParse(controller.text.trim())) : null,
+              child: Text(
+                'Accept & send',
+                style: TextStyle(
+                  color: accepted
+                      ? AppColors.emeraldBright
+                      : AppColors.muted.withValues(alpha: 0.45),
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+    if (fee != null) _runAction('set_delivery_fee', deliveryFee: fee, acceptTerms: true);
+  }
+
+  Future<void> _promptRefund(AppOrder order) async {
+    final reason = TextEditingController();
+    final breakdown = order.refund;
+    final refundable = breakdown?.refundable ?? order.total;
+    final retained = breakdown?.retainedServiceFee ?? 0;
+    final ok = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
         backgroundColor: AppColors.surface,
         shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
-        title: const Text('Set delivery fee', style: TextStyle(color: AppColors.text)),
-        content: TextField(
-          controller: controller,
-          autofocus: true,
-          keyboardType: TextInputType.number,
-          decoration: const InputDecoration(prefixText: '₦ ', hintText: 'e.g. 500'),
+        title: const Text('Refund this order?', style: TextStyle(color: AppColors.text)),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              breakdown == null
+                  ? 'This refunds ₦$refundable (items + delivery).'
+                  : 'This refunds ₦$refundable (items + delivery) of the '
+                      '₦${breakdown.customerPaid} the customer paid.',
+              style: const TextStyle(color: AppColors.muted, height: 1.4),
+            ),
+            if (retained > 0) ...[
+              const SizedBox(height: 8),
+              Text(
+                'The ₦$retained service fee isn’t refunded — it covers messages already '
+                'sent. Our commission is reversed.',
+                style: const TextStyle(color: AppColors.muted, fontSize: 12.5, height: 1.4),
+              ),
+            ],
+            const SizedBox(height: 12),
+            const Text(
+              'You send the money. The payment settled to your bank, so Collxct can’t '
+              'return it for you — this records the refund and tells the customer to '
+              'expect it from you.',
+              style: TextStyle(color: AppColors.gold, fontSize: 12.5, height: 1.4),
+            ),
+            const SizedBox(height: 14),
+            TextField(
+              controller: reason,
+              maxLength: 200,
+              decoration: const InputDecoration(hintText: 'Reason (optional)', counterText: ''),
+            ),
+          ],
         ),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel', style: TextStyle(color: AppColors.muted))),
           TextButton(
-            onPressed: () => Navigator.pop(ctx, int.tryParse(controller.text.trim())),
-            child: const Text('Send to customer', style: TextStyle(color: AppColors.emeraldBright, fontWeight: FontWeight.w700)),
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Close', style: TextStyle(color: AppColors.muted))),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Record refund',
+                style: TextStyle(color: AppColors.dangerSoft, fontWeight: FontWeight.w700)),
           ),
         ],
       ),
     );
-    if (fee != null) _runAction('set_delivery_fee', deliveryFee: fee);
+    if (ok == true) _runAction('refund', refundReason: reason.text);
   }
+
+  Widget _refundButton() => Padding(
+        padding: const EdgeInsets.only(top: 4, bottom: 12),
+        child: SizedBox(
+          height: 50,
+          child: OutlinedButton.icon(
+            onPressed: _acting
+                ? null
+                : () async {
+                    final order = await _future;
+                    if (mounted) _promptRefund(order);
+                  },
+            style: OutlinedButton.styleFrom(
+              foregroundColor: AppColors.dangerSoft,
+              side: BorderSide(color: AppColors.danger.withValues(alpha: 0.4)),
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+            ),
+            icon: const Icon(Icons.currency_exchange_rounded, size: 18),
+            label: const Text('Refund order', style: TextStyle(fontWeight: FontWeight.w700)),
+          ),
+        ),
+      );
 
   @override
   Widget build(BuildContext context) {
@@ -161,8 +305,24 @@ class _OrderDetailScreenState extends State<OrderDetailScreen> {
                     _row('Delivery', '₦${order.deliveryFee}'),
                     _row('Total', '₦${order.total}', strong: true),
                   ]),
+                  if (order.isRefunded) ...[
+                    const SizedBox(height: 14),
+                    _card('Refund', [
+                      _row('Refunded', '₦${order.refundAmount}', strong: true),
+                      if (order.refundReason != null && order.refundReason!.isNotEmpty)
+                        _row('Reason', order.refundReason!),
+                      const Padding(
+                        padding: EdgeInsets.only(top: 8),
+                        child: Text(
+                          'You send this to the customer directly — Collxct never held it.',
+                          style: TextStyle(color: AppColors.muted, fontSize: 12.5, height: 1.4),
+                        ),
+                      ),
+                    ]),
+                  ],
                   const SizedBox(height: 24),
                   ..._actionButtons(order),
+                  if (order.availableActions.contains('refund')) _refundButton(),
                   if (order.canCancel) _cancelButton(order),
                 ],
               );
@@ -208,17 +368,23 @@ class _OrderDetailScreenState extends State<OrderDetailScreen> {
   }
 
   List<Widget> _actionButtons(AppOrder order) {
-    if (order.availableActions.isEmpty) {
-      return const [
+    // Refund is always optional and gets its own quieter button, so it must not
+    // sit in the primary column or count towards "nothing left to do".
+    final primary = order.availableActions.where((a) => a != 'refund').toList();
+    if (primary.isEmpty) {
+      return [
         Center(
           child: Padding(
-            padding: EdgeInsets.all(8),
-            child: Text('No further action needed.', style: TextStyle(color: AppColors.muted)),
+            padding: const EdgeInsets.all(8),
+            child: Text(
+              order.isRefunded ? 'This order was refunded.' : 'No further action needed.',
+              style: const TextStyle(color: AppColors.muted),
+            ),
           ),
         ),
       ];
     }
-    return order.availableActions.map((action) {
+    return primary.map((action) {
       final label = actionLabels[action] ?? action;
       return Padding(
         padding: const EdgeInsets.only(bottom: 12),
@@ -244,6 +410,8 @@ class _OrderDetailScreenState extends State<OrderDetailScreen> {
         return Icons.delivery_dining_outlined;
       case 'mark_delivered':
         return Icons.task_alt_rounded;
+      case 'refund':
+        return Icons.currency_exchange_rounded;
       default:
         return Icons.check_rounded;
     }

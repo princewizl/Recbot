@@ -141,6 +141,8 @@ Color statusColor(String status) {
       return AppColors.emeraldBright;
     case 'delivered':
       return AppColors.muted;
+    case 'refunded':
+      return AppColors.dangerSoft;
     default:
       return AppColors.muted; // awaiting_payment etc. — waiting on the customer
   }

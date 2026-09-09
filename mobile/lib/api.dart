@@ -30,6 +30,8 @@ class ApiException implements Exception {
         return 'Your session expired. Please sign in again.';
       case 'not_found':
         return 'That order no longer exists.';
+      case 'not_refundable':
+        return 'Nothing has been paid on this order yet — cancel it instead.';
       default:
         return 'Something went wrong ($code).';
     }
@@ -131,13 +133,20 @@ class ApiClient {
     return AppOrder.fromJson(jsonDecode(res.body) as Map<String, dynamic>);
   }
 
-  Future<AppOrder> doAction(int id, String action, {int? deliveryFee}) async {
+  /// Run an order action. `acceptTerms` accompanies `set_delivery_fee`: pricing
+  /// an order accepts it and its refund liability, and the server records that
+  /// acceptance against the order (see Terms section 7).
+  Future<AppOrder> doAction(int id, String action,
+      {int? deliveryFee, bool acceptTerms = false, String? refundReason}) async {
     final res = await http.post(
       _uri('/api/orders/$id/action'),
       headers: _headers,
       body: jsonEncode({
         'action': action,
         if (deliveryFee != null) 'delivery_fee': deliveryFee,
+        if (acceptTerms) 'accept_terms': true,
+        if (refundReason != null && refundReason.trim().isNotEmpty)
+          'refund_reason': refundReason.trim(),
       }),
     );
     if (res.statusCode != 200) _raise(res);
