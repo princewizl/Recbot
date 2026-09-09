@@ -46,6 +46,10 @@ os.makedirs(MEDIA_DIR, exist_ok=True)
 # (default /data/recbot.apk, which lives in the persistent volume) to light up the
 # "Get the Android app" button on the landing page.
 APK_PATH = os.getenv("ANDROID_APK_PATH", os.path.join(_DATA_DIR, "recbot.apk"))
+# Landing-page promo video. Lives in MEDIA_DIR (persistent volume, served at
+# /media) so it survives rebuilds like the APK does. Drop the file there to
+# light up the video embed under "How it works"; until then it's hidden.
+PROMO_VIDEO_PATH = os.getenv("PROMO_VIDEO_PATH", os.path.join(MEDIA_DIR, "promo-video.mp4"))
 
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
@@ -2987,6 +2991,13 @@ def homepage(request: Request, sent: Optional[str] = None) -> HTMLResponse:
         '<a class="lp-btn" href="/download/android">📲 Get the Android app</a>'
         if os.path.exists(APK_PATH) else ""
     )
+    promo_video_html = (
+        '<div style="max-width:720px;margin:36px auto 0;border-radius:18px;overflow:hidden;'
+        'border:1px solid var(--border);box-shadow:0 20px 50px rgba(0,0,0,.4);">'
+        '<video controls preload="metadata" style="width:100%;display:block;background:#000;" '
+        'src="/media/promo-video.mp4"></video></div>'
+        if os.path.exists(PROMO_VIDEO_PATH) else ""
+    )
     app_section = ""
     if os.path.exists(APK_PATH):
         qr_url = f"{os.getenv('PUBLIC_BASE_URL', '').rstrip('/')}/download/android"
@@ -3252,6 +3263,7 @@ def homepage(request: Request, sent: Optional[str] = None) -> HTMLResponse:
               <div class="step"><h3>Test it together</h3><p>You place a real order end-to-end and watch it land on your dashboard with the alert chime.</p></div>
               <div class="step"><h3>Go live &amp; grow</h3><p>Once Meta approves your number (usually a few days), share it everywhere. Orders start flowing; you stay in control.</p></div>
             </div>
+            {promo_video_html}
           </div>
         </section>
 

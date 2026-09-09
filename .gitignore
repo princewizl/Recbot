@@ -21,3 +21,6 @@ firebase-service-account.json
 
 # Downloadable Android app (served at runtime, never committed)
 *.apk
+
+# Runtime media (catalogue images, promo video) — served from disk, never committed
+media/

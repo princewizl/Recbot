@@ -1,4 +1,6 @@
+import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 
 import 'package:http/http.dart' as http;
 import 'package:http_parser/http_parser.dart';
@@ -6,6 +8,21 @@ import 'package:http_parser/http_parser.dart';
 import 'config.dart';
 import 'models.dart';
 import 'storage.dart';
+
+/// How long any single API call waits before giving up.
+const _apiTimeout = Duration(seconds: 15);
+
+/// Runs [future], turning a slow or unreachable server into an [ApiException]
+/// instead of letting the caller hang indefinitely.
+Future<T> _timed<T>(Future<T> future) async {
+  try {
+    return await future.timeout(_apiTimeout);
+  } on TimeoutException {
+    throw ApiException(0, 'timeout');
+  } on SocketException {
+    throw ApiException(0, 'network_error');
+  }
+}
 
 class ApiException implements Exception {
   final int status;
@@ -32,6 +49,10 @@ class ApiException implements Exception {
         return 'That order no longer exists.';
       case 'not_refundable':
         return 'Nothing has been paid on this order yet — cancel it instead.';
+      case 'timeout':
+        return 'The server took too long to respond. Try again.';
+      case 'network_error':
+        return 'Can’t reach the server. Check your connection and try again.';
       default:
         return 'Something went wrong ($code).';
     }
@@ -80,7 +101,7 @@ class ApiClient {
     required String password,
     String? code,
   }) async {
-    final res = await http.post(
+    final res = await _timed(http.post(
       Uri.parse('$baseUrl/api/login'),
       headers: {'Content-Type': 'application/json'},
       body: jsonEncode({
@@ -88,7 +109,7 @@ class ApiClient {
         'password': password,
         if (code != null && code.isNotEmpty) 'code': code,
       }),
-    );
+    ));
     if (res.statusCode != 200) {
       String errCode = 'http_${res.statusCode}';
       try {
@@ -110,17 +131,17 @@ class ApiClient {
   /// (never revealing whether the address has an account), so this never throws
   /// on "unknown email".
   static Future<void> forgotPassword({required String baseUrl, required String email}) async {
-    await http.post(
+    await _timed(http.post(
       Uri.parse('$baseUrl/api/forgot-password'),
       headers: {'Content-Type': 'application/json'},
       body: jsonEncode({'email': email}),
-    );
+    ));
   }
 
   /// scope 'active' = orders still in flight (until delivered); '' = all recent.
   Future<List<AppOrder>> listOrders({String scope = ''}) async {
     final path = scope == 'active' ? '/api/orders?scope=active' : '/api/orders';
-    final res = await http.get(_uri(path), headers: _headers);
+    final res = await _timed(http.get(_uri(path), headers: _headers));
     if (res.statusCode != 200) _raise(res);
     final body = jsonDecode(res.body) as Map<String, dynamic>;
     final orders = (body['orders'] ?? []) as List;
@@ -128,7 +149,7 @@ class ApiClient {
   }
 
   Future<AppOrder> getOrder(int id) async {
-    final res = await http.get(_uri('/api/orders/$id'), headers: _headers);
+    final res = await _timed(http.get(_uri('/api/orders/$id'), headers: _headers));
     if (res.statusCode != 200) _raise(res);
     return AppOrder.fromJson(jsonDecode(res.body) as Map<String, dynamic>);
   }
@@ -138,7 +159,7 @@ class ApiClient {
   /// acceptance against the order (see Terms section 7).
   Future<AppOrder> doAction(int id, String action,
       {int? deliveryFee, bool acceptTerms = false, String? refundReason}) async {
-    final res = await http.post(
+    final res = await _timed(http.post(
       _uri('/api/orders/$id/action'),
       headers: _headers,
       body: jsonEncode({
@@ -148,14 +169,14 @@ class ApiClient {
         if (refundReason != null && refundReason.trim().isNotEmpty)
           'refund_reason': refundReason.trim(),
       }),
-    );
+    ));
     if (res.statusCode != 200) _raise(res);
     return AppOrder.fromJson(jsonDecode(res.body) as Map<String, dynamic>);
   }
 
   /// Whether this business is currently accepting orders (open/paused switch).
   Future<bool> getAcceptingOrders() async {
-    final res = await http.get(_uri('/api/business'), headers: _headers);
+    final res = await _timed(http.get(_uri('/api/business'), headers: _headers));
     if (res.statusCode != 200) _raise(res);
     final body = jsonDecode(res.body) as Map<String, dynamic>;
     return body['accepting_orders'] == true;
@@ -163,11 +184,11 @@ class ApiClient {
 
   /// Flip the open/paused switch; returns the new state.
   Future<bool> setAcceptingOrders(bool accepting) async {
-    final res = await http.post(
+    final res = await _timed(http.post(
       _uri('/api/business/accepting-orders'),
       headers: _headers,
       body: jsonEncode({'accepting_orders': accepting}),
-    );
+    ));
     if (res.statusCode != 200) _raise(res);
     final body = jsonDecode(res.body) as Map<String, dynamic>;
     return body['accepting_orders'] == true;
@@ -176,7 +197,7 @@ class ApiClient {
   // --- Dashboard ---
 
   Future<Map<String, dynamic>> getStats() async {
-    final res = await http.get(_uri('/api/stats'), headers: _headers);
+    final res = await _timed(http.get(_uri('/api/stats'), headers: _headers));
     if (res.statusCode != 200) _raise(res);
     return jsonDecode(res.body) as Map<String, dynamic>;
   }
@@ -184,7 +205,7 @@ class ApiClient {
   // --- Catalogue ---
 
   Future<({List<CatalogueCategory> categories, List<CatalogueItem> items})> getCatalogue() async {
-    final res = await http.get(_uri('/api/catalogue'), headers: _headers);
+    final res = await _timed(http.get(_uri('/api/catalogue'), headers: _headers));
     if (res.statusCode != 200) _raise(res);
     final body = jsonDecode(res.body) as Map<String, dynamic>;
     return (
@@ -194,7 +215,7 @@ class ApiClient {
   }
 
   Future<CatalogueCategory> createCategory(String name) async {
-    final res = await http.post(_uri('/api/categories'), headers: _headers, body: jsonEncode({'name': name}));
+    final res = await _timed(http.post(_uri('/api/categories'), headers: _headers, body: jsonEncode({'name': name})));
     if (res.statusCode != 200) _raise(res);
     return CatalogueCategory.fromJson(jsonDecode(res.body));
   }
@@ -224,49 +245,49 @@ class ApiClient {
       final sub = ext == 'png' ? 'png' : (ext == 'webp' ? 'webp' : 'jpeg');
       req.files.add(await http.MultipartFile.fromPath('image', imagePath, contentType: MediaType('image', sub)));
     }
-    final res = await http.Response.fromStream(await req.send());
+    final res = await http.Response.fromStream(await _timed(req.send()));
     if (res.statusCode != 200) _raise(res);
     return CatalogueItem.fromJson(jsonDecode(res.body));
   }
 
   Future<void> setItemStock(int id, bool outOfStock) async {
-    final res = await http.post(_uri('/api/items/$id/stock'), headers: _headers, body: jsonEncode({'is_out_of_stock': outOfStock}));
+    final res = await _timed(http.post(_uri('/api/items/$id/stock'), headers: _headers, body: jsonEncode({'is_out_of_stock': outOfStock})));
     if (res.statusCode != 200) _raise(res);
   }
 
   Future<void> deleteItem(int id) async {
-    final res = await http.delete(_uri('/api/items/$id'), headers: _headers);
+    final res = await _timed(http.delete(_uri('/api/items/$id'), headers: _headers));
     if (res.statusCode != 200) _raise(res);
   }
 
   // --- Business config ---
 
   Future<Map<String, dynamic>> getBusinessConfig() async {
-    final res = await http.get(_uri('/api/business/config'), headers: _headers);
+    final res = await _timed(http.get(_uri('/api/business/config'), headers: _headers));
     if (res.statusCode != 200) _raise(res);
     return jsonDecode(res.body) as Map<String, dynamic>;
   }
 
   Future<Map<String, dynamic>> saveBusinessConfig(Map<String, dynamic> data) async {
-    final res = await http.post(_uri('/api/business/config'), headers: _headers, body: jsonEncode(data));
+    final res = await _timed(http.post(_uri('/api/business/config'), headers: _headers, body: jsonEncode(data)));
     if (res.statusCode != 200) _raise(res);
     return jsonDecode(res.body) as Map<String, dynamic>;
   }
 
   Future<void> registerDevice(String fcmToken) async {
-    final res = await http.post(
+    final res = await _timed(http.post(
       _uri('/api/devices'),
       headers: _headers,
       body: jsonEncode({'token': fcmToken, 'platform': 'android'}),
-    );
+    ));
     if (res.statusCode != 200) _raise(res);
   }
 
   Future<void> unregisterDevice(String fcmToken) async {
-    await http.delete(
+    await _timed(http.delete(
       _uri('/api/devices'),
       headers: _headers,
       body: jsonEncode({'token': fcmToken}),
-    );
+    ));
   }
 }

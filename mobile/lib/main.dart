@@ -1,4 +1,5 @@
 import 'package:firebase_core/firebase_core.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
 import 'push.dart';
@@ -14,9 +15,14 @@ final GlobalKey<NavigatorState> navigatorKey = GlobalKey<NavigatorState>();
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   // Firebase must init before any messaging call. If google-services.json is
-  // missing this throws — see mobile/README.md for setup.
-  await Firebase.initializeApp();
-  await PushService.init(onOpenOrder: _openOrder);
+  // missing or misconfigured this throws — don't let that take the whole app
+  // down; push notifications just won't work for this session.
+  try {
+    await Firebase.initializeApp();
+    await PushService.init(onOpenOrder: _openOrder);
+  } catch (e) {
+    debugPrint('Push notification setup failed, continuing without it: $e');
+  }
 
   final token = await Storage.readToken();
   runApp(RecbotApp(loggedIn: token != null));
