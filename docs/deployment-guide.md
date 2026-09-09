@@ -197,14 +197,19 @@ The landing page shows a "Download for Android" hero button + QR band **only whe
 The APK is **not** in git (`.gitignore` excludes `*.apk`), so `git pull` never carries it. Copy it manually — once. It lives in the `recbot_data` named volume, so it survives every rebuild/restart and only needs re-copying when you ship a new build.
 
 ```bash
-# on your machine — upload the signed release APK to the server
-scp "C:\Users\Olufemi\Desktop\recbot-release.apk" root@158.220.84.21:/opt/recbot/recbot-release.apk
+# on your machine — upload the signed release APK straight from the build output
+scp "C:\Users\Olufemi\Documents\PROJECTS\Recbot\mobile\build\app\outputs\flutter-apk\app-release.apk" \
+    root@158.220.84.21:/opt/recbot/recbot-release.apk
 
 # on the server — copy it into the container's data volume
 ssh root@158.220.84.21
 docker cp /opt/recbot/recbot-release.apk collxct-recbot:/data/recbot.apk
-docker exec collxct-recbot chown appuser:appuser /data/recbot.apk   # container runs as appuser
 ```
+
+No chown is needed. `docker cp` lands the file owned by root and world-readable, which is all the app
+does with it — it only reads. `docker exec ... chown` fails with "Operation not permitted", because
+`docker exec` runs as the non-root `appuser`; use `docker exec -u root` if you ever genuinely need to
+change ownership.
 
 No restart needed — the download route and landing section check for the file per request. Verify:
 
