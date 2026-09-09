@@ -157,6 +157,16 @@ class Order(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     # Messages exchanged while placing this order — drives the platform charge.
     message_count = Column(Integer, nullable=False, default=0)
+    # Refund trail. Setting the delivery fee is the point of no return: it prices
+    # the order and sends the customer a payment request, so that is where the
+    # business accepts the order and its refund liability (Terms section 7). We
+    # record the acceptance rather than only displaying it, so it can be shown
+    # back in a dispute.
+    fee_terms_accepted_at = Column(DateTime, nullable=True)
+    fee_terms_version = Column(String(40), nullable=True)
+    refunded_at = Column(DateTime, nullable=True)
+    refund_amount = Column(Integer, nullable=False, default=0)
+    refund_reason = Column(Text, nullable=True)
 
 
 class User(Base):
@@ -328,6 +338,16 @@ def ensure_schema() -> None:
             conn.execute(text("ALTER TABLE orders ADD COLUMN action_reminder_count INTEGER NOT NULL DEFAULT 0"))
         if not has_column("orders", "action_reminded_at"):
             conn.execute(text("ALTER TABLE orders ADD COLUMN action_reminded_at DATETIME"))
+        if not has_column("orders", "fee_terms_accepted_at"):
+            conn.execute(text("ALTER TABLE orders ADD COLUMN fee_terms_accepted_at DATETIME"))
+        if not has_column("orders", "fee_terms_version"):
+            conn.execute(text("ALTER TABLE orders ADD COLUMN fee_terms_version VARCHAR(40)"))
+        if not has_column("orders", "refunded_at"):
+            conn.execute(text("ALTER TABLE orders ADD COLUMN refunded_at DATETIME"))
+        if not has_column("orders", "refund_amount"):
+            conn.execute(text("ALTER TABLE orders ADD COLUMN refund_amount INTEGER NOT NULL DEFAULT 0"))
+        if not has_column("orders", "refund_reason"):
+            conn.execute(text("ALTER TABLE orders ADD COLUMN refund_reason TEXT"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_orders_business_id ON orders(business_id)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_orders_status ON orders(status)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_orders_customer_phone ON orders(customer_phone)"))
@@ -1149,6 +1169,14 @@ def render_page(title: str, body: str, nav_html: Optional[str] = None,
                     dialog.modal h3 {{ margin-top:0; }}
                     dialog.modal .modal-actions {{ display:flex; gap:10px; margin-top:18px; }}
                     dialog.modal .modal-actions button {{ margin-right:0; }}
+                    /* Acceptance notice in the delivery-fee dialog — deliberately
+                       readable rather than fine print, since it carries liability. */
+                    .accept-terms {{ display:flex; gap:10px; align-items:flex-start; margin-top:14px;
+                        padding:12px; border:1px solid var(--border-strong); border-radius:var(--radius);
+                        background:var(--surface-2, rgba(255,255,255,.03)); font-size:.85rem; line-height:1.45; }}
+                    .accept-terms input {{ margin:2px 0 0; width:auto; flex:0 0 auto; }}
+                    .accept-terms span {{ color:var(--muted); }}
+                    .accept-terms a {{ color:var(--brand, #10b981); }}
 
                     /* ---------- plans ---------- */
                     .plan-grid {{ display:grid; grid-template-columns:repeat(auto-fit, minmax(230px, 1fr)); gap:16px; margin:6px 0; }}
@@ -2353,6 +2381,30 @@ def order_grand_total(business: Optional[Business], order: Order) -> int:
     return order.total + order_customer_fee(business, order)
 
 
+# Statuses where the customer's money has actually been taken, so a refund is
+# the right remedy. Before this the order is simply cancelled instead.
+REFUNDABLE_STATUSES = ("paid", "out_for_delivery", "delivered")
+
+
+def order_refund_breakdown(business: Optional[Business], order: Order) -> Dict[str, int]:
+    """Who gets what back when an order is refunded.
+
+    The goods and the delivery are refundable. The customer service fee is not:
+    it recovers WhatsApp messaging already sent, which we have been billed for
+    whatever happens to the order. Our commission is reversed — we do not earn a
+    margin on an order that fell through — which happens by itself, because the
+    refunded order leaves PAID_STATUSES and stops counting as revenue.
+    """
+    refundable = order.total or 0
+    retained = order_customer_fee(business, order)
+    return {
+        "customer_paid": refundable + retained,
+        "refundable": refundable,
+        "retained_service_fee": retained,
+        "commission_reversed": round((order.total or 0) * PLATFORM_COMMISSION_PERCENT / 100),
+    }
+
+
 def format_payment_request(order: Order, business: Optional[Business]) -> str:
     fee = order_customer_fee(business, order)
     grand = order.total + fee
@@ -3304,7 +3356,7 @@ def homepage(request: Request, sent: Optional[str] = None) -> HTMLResponse:
             <img src="/static/img/logo-white.svg" alt="Collxct" />
             <span>WhatsApp ordering, done properly.</span>
             <span class="spacer"></span>
-            <span><a href="mailto:{CONTACT_EMAIL}" style="color:var(--muted);">{CONTACT_EMAIL}</a> · <a href="/login" style="color:var(--muted);">Portal login</a> · <a href="/terms" style="color:var(--muted);">Terms</a> · <a href="/privacy" style="color:var(--muted);">Privacy</a></span>
+            <span><a href="mailto:{CONTACT_EMAIL}" style="color:var(--muted);">{CONTACT_EMAIL}</a> · <a href="/login" style="color:var(--muted);">Portal login</a> · <a href="/terms" style="color:var(--muted);">Terms</a> · <a href="/privacy" style="color:var(--muted);">Privacy</a> · <a href="/refunds" style="color:var(--muted);">Refunds</a></span>
           </div>
         </footer>
       </body>
@@ -3376,7 +3428,7 @@ def owner_portal(request: Request) -> HTMLResponse:
     return render_page("Owner Portal", body, nav_html=make_nav(current_user))
 
 
-LEGAL_LAST_UPDATED = "24 July 2026"
+LEGAL_LAST_UPDATED = "9 September 2026"
 
 
 @app.get("/terms", response_class=HTMLResponse)
@@ -3418,41 +3470,53 @@ def terms_page(request: Request) -> HTMLResponse:
       law requires otherwise, fees already collected are non-refundable, and we may change our rates on
       reasonable notice.</p>
 
-      <h3>7. Third-party services</h3>
+      <h3>7. Refunds, cancellations &amp; disputes</h3>
+      <p><strong>You are the seller.</strong> The contract for the goods is between you and your customer, and
+      refunds are your responsibility, not Collxct's. When you set a delivery fee on an order you accept that
+      order and its refund liability; we record the date and time you did so.</p>
+      <p>Customer payments do not pass through Collxct. They are split by Paystack at the moment of payment and
+      your share settles directly to your own bank account, so we cannot reverse a payment for you. Where a
+      refund is due you pay the customer yourself, and record it on the order so the customer is notified.</p>
+      <p>On a refunded order our commission is reversed. The customer service fee is not refunded, because it
+      recovers WhatsApp messaging that has already been sent and billed to us. Before payment, an order can be
+      cancelled at no cost to anyone.</p>
+      <p>See the <a href="/refunds">Refund Policy</a> for the customer-facing version of this.</p>
+
+      <h3>8. Third-party services</h3>
       <p>Recbot relies on third parties including Meta/WhatsApp, Twilio, Paystack, Google Firebase and
       OpenStreetMap. Your use of features that depend on them is also subject to their terms, and we are not
       responsible for their acts or omissions.</p>
 
-      <h3>8. Intellectual property</h3>
+      <h3>9. Intellectual property</h3>
       <p>Collxct owns the service, its software, and its branding. We grant you a limited, non-exclusive,
       non-transferable licence to use it while your account is active. Your business content remains yours.</p>
 
-      <h3>9. Availability &amp; “as is”</h3>
+      <h3>10. Availability &amp; “as is”</h3>
       <p>The service is provided “as is” and “as available” without warranties of any kind. We do not
       guarantee uninterrupted or error-free operation, or that every message or notification will be delivered.</p>
 
-      <h3>10. Limitation of liability</h3>
+      <h3>11. Limitation of liability</h3>
       <p>To the maximum extent permitted by law, Collxct is not liable for indirect, incidental, or
       consequential losses, or for lost profits, revenue, goodwill, or data. Our total liability for any claim is
       limited to the fees you paid us in the 3 months before the claim.</p>
 
-      <h3>11. Indemnity</h3>
+      <h3>12. Indemnity</h3>
       <p>You agree to indemnify Collxct against claims arising from your use of the service, your goods or
       services, or your breach of these Terms or of the law.</p>
 
-      <h3>12. Suspension &amp; termination</h3>
+      <h3>13. Suspension &amp; termination</h3>
       <p>We may suspend or terminate access for breach of these Terms or non-payment. You may stop using the
       service at any time; certain terms survive termination.</p>
 
-      <h3>13. Governing law</h3>
+      <h3>14. Governing law</h3>
       <p>These Terms are governed by the laws of the Federal Republic of Nigeria, and disputes are subject to the
       jurisdiction of the courts of Lagos State, without prejudice to any mandatory consumer rights you have where
       you live.</p>
 
-      <h3>14. Changes</h3>
+      <h3>15. Changes</h3>
       <p>We may update these Terms; the “last updated” date will change and continued use means acceptance.</p>
 
-      <h3>15. Contact</h3>
+      <h3>16. Contact</h3>
       <p>Questions? Email <a href="mailto:{CONTACT_EMAIL}">{CONTACT_EMAIL}</a>. See also our
       <a href="/privacy">Privacy Policy</a>.</p>
     </div>
@@ -3544,6 +3608,58 @@ def privacy_page(request: Request) -> HTMLResponse:
     </div>
     """
     return render_page("Privacy Policy", body, nav_html=make_nav(get_current_user(request)))
+
+
+@app.get("/refunds", response_class=HTMLResponse)
+def refunds_page(request: Request) -> HTMLResponse:
+    """Customer-facing refund policy. Customers never see the business Terms, so
+    the same rules are restated here in the second person, and linked from the
+    footer and from the acceptance notice the business ticks when pricing an order."""
+    body = f"""
+    <div class="card" style="max-width:820px;margin:0 auto;">
+      <h1>Refund Policy</h1>
+      <p class="form-hint">Last updated: {LEGAL_LAST_UPDATED}</p>
+
+      <p>Recbot is the ordering software the business you ordered from uses to take orders over WhatsApp.
+      <strong>The business sells to you directly</strong> &mdash; it prepares your order, delivers it, and handles
+      any refund. Collxct operates the software and does not sell the goods.</p>
+
+      <h3>Before you pay</h3>
+      <p>You can cancel at any point before payment, at no cost. Reply <em>cancel</em> in the same WhatsApp chat.
+      Nothing is charged until you choose to pay.</p>
+
+      <h3>After you pay</h3>
+      <p>Once you have paid, you are entitled to a refund where the order is not delivered, is materially
+      different from what you ordered, or where the business agrees to cancel it. Ask the business in the same
+      WhatsApp chat &mdash; that thread is the record of your order.</p>
+
+      <h3>What you get back</h3>
+      <p>A refund returns the <strong>cost of the items and the delivery fee</strong>. The small service fee shown
+      separately at checkout is not refunded: it pays for the WhatsApp messages already sent for your order,
+      which are charged whether or not the order completes.</p>
+
+      <h3>How the money reaches you</h3>
+      <p>Your payment is split at the moment you pay, and the business's share goes straight to the business's own
+      bank account &mdash; Collxct never holds it. This means <strong>the business sends your refund</strong>, to
+      the account you paid from. Refunds normally arrive within 3&ndash;5 working days. When a business records a
+      refund in Recbot, you get a WhatsApp message confirming the amount.</p>
+
+      <h3>If something goes wrong</h3>
+      <p>Contact the business first &mdash; it holds the money and can resolve it fastest. If you cannot reach
+      them, or believe a business is misusing Recbot, email <a href="mailto:{CONTACT_EMAIL}">{CONTACT_EMAIL}</a>
+      with your order number. We can see the order and the messages, and will help you get the business to
+      resolve it. We cannot issue the refund ourselves, and we are not the seller. If your payment was made by
+      card you may also have chargeback rights with your bank.</p>
+
+      <h3>Businesses using Recbot</h3>
+      <p>Your obligations are in section 7 of the <a href="/terms">Terms of Use</a>. Pricing an order accepts it
+      and its refund liability, and that acceptance is recorded against the order.</p>
+
+      <p class="form-hint">Questions? Email <a href="mailto:{CONTACT_EMAIL}">{CONTACT_EMAIL}</a>. See also our
+      <a href="/terms">Terms of Use</a> and <a href="/privacy">Privacy Policy</a>.</p>
+    </div>
+    """
+    return render_page("Refund Policy", body, nav_html=make_nav(get_current_user(request)))
 
 
 @app.get("/forgot-password", response_class=HTMLResponse)
@@ -4806,7 +4922,7 @@ def format_age(dt: Optional[datetime]) -> str:
 
 def render_order_row(order: Order, show_business_name: bool = False, business_name: str = "") -> str:
     business_cell = f"<td>{escape(business_name)}</td>" if show_business_name else ""
-    is_pending = order.status not in {"delivered", "cancelled"}
+    is_pending = order.status not in {"delivered", "cancelled", "refunded"}
     is_stale = is_pending and order.created_at and (datetime.utcnow() - order.created_at) > timedelta(hours=2)
     age_cell = f"<td class='{'age-stale' if is_stale else 'age-normal'}'>{format_age(order.created_at)}</td>"
     status_cell = order_status_pill(order.status, stale=is_stale)
@@ -4829,6 +4945,7 @@ STATUS_CHART_COLORS = {
     "out_for_delivery": "#34d399",
     "delivered": "#6ee7b7",
     "cancelled": "#ff5e7a",
+    "refunded": "#c084fc",
 }
 
 
@@ -4842,6 +4959,7 @@ STATUS_PILL_TONE = {
     "out_for_delivery": "info",
     "delivered": "ok",
     "cancelled": "neutral",
+    "refunded": "neutral",
 }
 
 
@@ -5048,13 +5166,19 @@ def render_action_queue(orders: List[Order], business_names: Optional[Dict[int, 
 # mobile JSON API (/api/orders/{id}/action). Each mutates the order, commits,
 # and fires the customer-facing WhatsApp message. Returns (ok, error_code).
 def apply_order_action(db, order: Order, business: Optional[Business], action: str,
-                       delivery_fee: Optional[int] = None) -> "tuple[bool, str]":
+                       delivery_fee: Optional[int] = None, accept_terms: bool = False,
+                       refund_reason: Optional[str] = None) -> "tuple[bool, str]":
     if action == "set_delivery_fee":
         if delivery_fee is None:
             return False, "missing_delivery_fee"
         items_subtotal = cart_total(load_cart(order.items_json))
         order.delivery_fee = delivery_fee
         order.total = items_subtotal + delivery_fee
+        # Pricing the order is the business accepting it, and with it the refund
+        # liability. Stamp the acceptance so a later dispute has a record of it.
+        if accept_terms:
+            order.fee_terms_accepted_at = datetime.utcnow()
+            order.fee_terms_version = LEGAL_LAST_UPDATED
         set_order_status(order, "awaiting_payment")
         if business and business.payment_method == "paystack":
             create_paystack_order_link(business, order)
@@ -5115,6 +5239,34 @@ def apply_order_action(db, order: Order, business: Optional[Business], action: s
                 from_number=business.whatsapp_number if business else None,
             )
         return True, ""
+    if action == "refund":
+        # Only orders whose money was actually taken can be refunded; anything
+        # earlier is a cancellation, which costs the customer nothing.
+        if order.status not in REFUNDABLE_STATUSES:
+            return False, "not_refundable"
+        breakdown = order_refund_breakdown(business, order)
+        order.refund_amount = breakdown["refundable"]
+        order.refund_reason = (refund_reason or "").strip() or None
+        order.refunded_at = datetime.utcnow()
+        set_order_status(order, "refunded")
+        db.commit()
+        # The business's share settled straight to its own bank via the Paystack
+        # split, so we cannot claw it back — the business pays the customer
+        # directly. Say so plainly rather than implying we hold the money.
+        retained = breakdown["retained_service_fee"]
+        fee_line = (
+            f"\n\nThe N{retained} service fee covers messaging already sent and is not refunded."
+            if retained else ""
+        )
+        send_whatsapp_message(
+            order.customer_phone,
+            f"Order *#{order.id}* has been refunded by *{business.name if business else 'the business'}*.\n\n"
+            f"*Refund amount:* N{breakdown['refundable']} (items + delivery){fee_line}\n\n"
+            f"The refund is sent by the business to the account you paid from, and usually lands within "
+            f"3–5 working days. Any questions about it go to the business directly.",
+            from_number=business.whatsapp_number if business else None,
+        )
+        return True, ""
     return False, "unknown_action"
 
 
@@ -5125,7 +5277,33 @@ def _order_action_dashboard_redirect(current_user: User, business_id: int) -> Re
 
 
 @app.post("/orders/{order_id}/delivery-fee")
-def set_order_delivery_fee(request: Request, order_id: int, delivery_fee: int = Form(...)) -> RedirectResponse:
+def set_order_delivery_fee(request: Request, order_id: int, delivery_fee: int = Form(...),
+                           accept_terms: Optional[str] = Form(None)) -> RedirectResponse:
+    current_user = get_current_user(request)
+    db = SessionLocal()
+    try:
+        order = db.query(Order).filter(Order.id == order_id).one_or_none()
+        if not order:
+            return RedirectResponse(url="/admin/orders", status_code=303)
+        if not current_user or (current_user.role != "admin" and current_user.business_id != order.business_id):
+            return RedirectResponse(url="/login", status_code=303)
+        # The checkbox is `required` in the dialog, but a form post can skip the
+        # browser entirely — so the acceptance is enforced here too. Without it
+        # nothing is priced and no payment request goes out.
+        if not accept_terms:
+            return RedirectResponse(url=f"/orders/{order_id}?error=accept_required", status_code=303)
+        business = get_business(db, order.business_id)
+        apply_order_action(db, order, business, "set_delivery_fee",
+                           delivery_fee=delivery_fee, accept_terms=True)
+        business_id = order.business_id
+    finally:
+        db.close()
+    return _order_action_dashboard_redirect(current_user, business_id)
+
+
+@app.post("/orders/{order_id}/refund")
+def refund_order(request: Request, order_id: int,
+                 refund_reason: Optional[str] = Form(None)) -> RedirectResponse:
     current_user = get_current_user(request)
     db = SessionLocal()
     try:
@@ -5135,11 +5313,12 @@ def set_order_delivery_fee(request: Request, order_id: int, delivery_fee: int = 
         if not current_user or (current_user.role != "admin" and current_user.business_id != order.business_id):
             return RedirectResponse(url="/login", status_code=303)
         business = get_business(db, order.business_id)
-        apply_order_action(db, order, business, "set_delivery_fee", delivery_fee=delivery_fee)
-        business_id = order.business_id
+        ok, err = apply_order_action(db, order, business, "refund", refund_reason=refund_reason)
+        if not ok:
+            return RedirectResponse(url=f"/orders/{order_id}?error={err}", status_code=303)
     finally:
         db.close()
-    return _order_action_dashboard_redirect(current_user, business_id)
+    return RedirectResponse(url=f"/orders/{order_id}", status_code=303)
 
 
 @app.post("/orders/{order_id}/mark-paid")
@@ -5265,6 +5444,7 @@ ORDER_STATUS_LABELS = {
     "out_for_delivery": "Out for delivery",
     "delivered": "Delivered",
     "cancelled": "Cancelled",
+    "refunded": "Refunded",
 }
 
 
@@ -5321,6 +5501,8 @@ def order_to_json(order: Order, business: Optional[Business]) -> dict:
         available.append("dispatch")
     if order.status == "out_for_delivery":
         available.append("mark_delivered")
+    if order.status in REFUNDABLE_STATUSES:
+        available.append("refund")
     return {
         "id": order.id,
         "business_id": order.business_id,
@@ -5341,6 +5523,11 @@ def order_to_json(order: Order, business: Optional[Business]) -> dict:
         "created_at": order.created_at.isoformat() if order.created_at else None,
         "message_count": order.message_count or 0,
         "platform_charge": order_platform_charge(order),
+        "refund": order_refund_breakdown(business, order),
+        "refunded_at": order.refunded_at.isoformat() if order.refunded_at else None,
+        "refund_amount": order.refund_amount or 0,
+        "refund_reason": order.refund_reason,
+        "terms_accepted_at": order.fee_terms_accepted_at.isoformat() if order.fee_terms_accepted_at else None,
     }
 
 
@@ -5511,9 +5698,14 @@ async def api_order_action(request: Request, order_id: int) -> JSONResponse:
     except Exception:
         return JSONResponse({"error": "invalid_json"}, status_code=400)
     action = (data.get("action") or "").strip()
-    if action not in {"set_delivery_fee", "mark_paid", "dispatch", "mark_delivered", "cancel"}:
+    if action not in {"set_delivery_fee", "mark_paid", "dispatch", "mark_delivered", "cancel", "refund"}:
         return JSONResponse({"error": "unknown_action"}, status_code=400)
     delivery_fee = None
+    # `accept_terms` is optional so the already-sideloaded Android build, which
+    # does not send it, keeps working. When it is missing we simply record no
+    # acceptance — inventing one would put a signature on file that the business
+    # never actually gave. The app should send it from the next release.
+    accept_terms = bool(data.get("accept_terms"))
     if action == "set_delivery_fee":
         try:
             delivery_fee = int(data.get("delivery_fee"))
@@ -5527,7 +5719,9 @@ async def api_order_action(request: Request, order_id: int) -> JSONResponse:
         if user.role != "admin" and user.business_id != order.business_id:
             return JSONResponse({"error": "forbidden"}, status_code=403)
         business = get_business(db, order.business_id)
-        ok, err = apply_order_action(db, order, business, action, delivery_fee=delivery_fee)
+        ok, err = apply_order_action(db, order, business, action, delivery_fee=delivery_fee,
+                                     accept_terms=accept_terms,
+                                     refund_reason=data.get("refund_reason"))
         if not ok:
             return JSONResponse({"error": err}, status_code=400)
         result = order_to_json(order, business)
@@ -5942,8 +6136,14 @@ def order_detail(request: Request, order_id: int) -> HTMLResponse:
             <p class="form-hint">Subtotal is N{subtotal}. Enter the delivery fee to send the customer their full total and your bank details.</p>
             <form method="post" action="/orders/{order.id}/delivery-fee">
               <input name="delivery_fee" type="number" min="0" placeholder="Delivery fee" required autofocus />
+              <label class="accept-terms">
+                <input type="checkbox" name="accept_terms" value="1" required />
+                <span>Pricing this order accepts it. Once the customer pays, refunds for it are
+                mine to make &mdash; the money settles to my bank, not Collxct's.
+                <a href="/refunds" target="_blank" rel="noopener">Refund policy</a></span>
+              </label>
               <div class="modal-actions">
-                <button type="submit" class="btn primary">Send total to customer</button>
+                <button type="submit" class="btn primary">Accept &amp; send total</button>
                 <button type="button" class="btn secondary" onclick="document.getElementById('delivery-fee-modal').close()">Cancel</button>
               </div>
             </form>
@@ -6008,6 +6208,59 @@ def order_detail(request: Request, order_id: int) -> HTMLResponse:
             f"<button type='submit' class='btn' style='border-color:rgba(255,94,122,.4);color:var(--danger);'>Cancel order</button></form>"
         )
 
+    # Refund sits alongside the main action rather than in the status chain: an
+    # order can be refunded while it is paid, out for delivery, or delivered.
+    refund_button = ""
+    refund_modal = ""
+    if order.status in REFUNDABLE_STATUSES:
+        breakdown = order_refund_breakdown(business, order)
+        retained = breakdown["retained_service_fee"]
+        retained_line = (
+            f"<p class='form-hint'>The N{retained} service fee is not refunded &mdash; it covers "
+            f"WhatsApp messages already sent. Our commission is reversed automatically.</p>"
+            if retained else
+            "<p class='form-hint'>Our commission is reversed automatically.</p>"
+        )
+        refund_button = ("<button type='button' class='btn' style='border-color:rgba(192,132,252,.45);color:#c084fc;' "
+                         "onclick=\"document.getElementById('refund-modal').showModal()\">Refund</button>")
+        refund_modal = f"""
+        <dialog id="refund-modal" class="modal">
+          <div class="modal-body">
+            <h3>Refund order #{order.id}?</h3>
+            <p class="form-hint">This refunds <strong>N{breakdown['refundable']}</strong> (items + delivery)
+            of the N{breakdown['customer_paid']} the customer paid.</p>
+            {retained_line}
+            <p class="form-hint"><strong>You send the money.</strong> The customer's payment settled to your
+            bank through the Paystack split, so Collxct cannot return it for you. Marking it here records
+            the refund and tells the customer to expect it from you.</p>
+            <form method="post" action="/orders/{order.id}/refund">
+              <input name="refund_reason" type="text" maxlength="200" placeholder="Reason (optional, kept on the order)" />
+              <div class="modal-actions">
+                <button type="submit" class="btn primary">Record refund &amp; notify customer</button>
+                <button type="button" class="btn secondary" onclick="document.getElementById('refund-modal').close()">Close</button>
+              </div>
+            </form>
+          </div>
+        </dialog>
+        """
+
+    # Audit rows: what the business agreed to, and what was refunded.
+    accepted_row = ""
+    if order.fee_terms_accepted_at:
+        stamp = order.fee_terms_accepted_at.strftime("%d %b %Y, %H:%M")
+        version = f" &middot; terms {escape(order.fee_terms_version)}" if order.fee_terms_version else ""
+        accepted_row = (
+            "<div class='kv-row'><span class='kv-label'>Order accepted</span>"
+            f"<span class='kv-value'>{stamp} UTC{version}</span></div>"
+        )
+    refunded_row = ""
+    if order.status == "refunded":
+        reason = f" &middot; {escape(order.refund_reason)}" if order.refund_reason else ""
+        refunded_row = (
+            "<div class='kv-row'><span class='kv-label'>Refunded</span>"
+            f"<span class='kv-value'>N{order.refund_amount or 0}{reason}</span></div>"
+        )
+
     body = f"""
     <div class="hero-panel">
       <div>
@@ -6019,6 +6272,7 @@ def order_detail(request: Request, order_id: int) -> HTMLResponse:
         <span class="status-pill">{escape(status_label)}</span>
         {verify_button}
         {action_button}
+        {refund_button}
         {cancel_button}
       </div>
     </div>
@@ -6035,6 +6289,8 @@ def order_detail(request: Request, order_id: int) -> HTMLResponse:
           <div class="kv-row"><span class="kv-label">Subtotal</span><span class="kv-value">N{subtotal}</span></div>
           <div class="kv-row"><span class="kv-label">Delivery fee</span><span class="kv-value">N{order.delivery_fee}</span></div>
           <div class="kv-row"><span class="kv-label">Total</span><span class="kv-value">N{order.total}</span></div>
+          {accepted_row}
+          {refunded_row}
           <div class="kv-row"><span class="kv-label">Delivery address</span><span class="kv-value">{escape(order.address)}{" ⚠️ <em>not found on map</em>" if order.address_unverified else ""}</span></div>
         </div>
       </div>
@@ -6044,6 +6300,7 @@ def order_detail(request: Request, order_id: int) -> HTMLResponse:
       {proof_html}
     </div>
     {action_modal}
+    {refund_modal}
     """
     return render_page(f"Order #{order.id}", body, nav_html=make_nav(current_user))
 

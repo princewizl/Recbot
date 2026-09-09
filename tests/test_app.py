@@ -159,7 +159,11 @@ def test_action_required_alerts_for_new_order(tmp_path, monkeypatch):
     assert order["customer"] == "Ada"
 
     # Setting the delivery fee resolves the alert.
-    fee_response = client.post(f"/orders/{order['id']}/delivery-fee", data={"delivery_fee": "500"}, follow_redirects=False)
+    fee_response = client.post(
+        f"/orders/{order['id']}/delivery-fee",
+        data={"delivery_fee": "500", "accept_terms": "1"},
+        follow_redirects=False,
+    )
     assert fee_response.status_code == 303
     payload = client.get("/api/action-required").json()
     assert payload["count"] == 0
@@ -494,15 +498,18 @@ def test_mobile_api_login_and_order_lifecycle(tmp_path, monkeypatch):
 
     paid = client.post(f"/api/orders/{order_id}/action", headers=auth, json={"action": "mark_paid"}).json()
     assert paid["status"] == "paid"
-    assert paid["available_actions"] == ["dispatch"]
+    # Refund rides alongside the status action once the money has been taken.
+    assert paid["available_actions"] == ["dispatch", "refund"]
 
     dispatched = client.post(f"/api/orders/{order_id}/action", headers=auth, json={"action": "dispatch"}).json()
     assert dispatched["status"] == "out_for_delivery"
-    assert dispatched["available_actions"] == ["mark_delivered"]
+    assert dispatched["available_actions"] == ["mark_delivered", "refund"]
 
     delivered = client.post(f"/api/orders/{order_id}/action", headers=auth, json={"action": "mark_delivered"}).json()
     assert delivered["status"] == "delivered"
-    assert delivered["available_actions"] == []
+    # Delivered is not the end of the line: a refund is still possible, which is
+    # the usual case (goods wrong, missing, or unacceptable on arrival).
+    assert delivered["available_actions"] == ["refund"]
 
     # A fee action needs a fee; unknown actions are rejected.
     assert client.post(f"/api/orders/{order_id}/action", headers=auth, json={"action": "teleport"}).status_code == 400
@@ -563,10 +570,17 @@ def test_legal_pages_render(tmp_path, monkeypatch):
     importlib.reload(main)
     client = TestClient(main.app)
 
-    for path, needle in [("/terms", "Terms of Use"), ("/privacy", "Privacy Policy")]:
+    for path, needle in [("/terms", "Terms of Use"), ("/privacy", "Privacy Policy"),
+                         ("/refunds", "Refund Policy")]:
         r = client.get(path)
         assert r.status_code == 200
         assert needle in r.text
+
+    # The refund policy must say who actually sends the money, since Collxct
+    # never holds it — a customer reading otherwise would chase the wrong party.
+    refunds = client.get("/refunds").text
+    assert "the business sends your refund" in refunds.lower()
+    assert "/terms" in refunds
 
 
 def test_password_reset_flow(tmp_path, monkeypatch):
@@ -916,3 +930,117 @@ def test_open_close_toggle_web_and_mobile(tmp_path, monkeypatch):
     web.post("/login", data={"email": "admin@example.com", "password": "test-admin-password"}, follow_redirects=False)
     assert web.post(f"/business/{business_id}/toggle-orders", follow_redirects=False).status_code == 303
     assert api.get("/api/business", headers=auth).json()["accepting_orders"] is True
+
+
+def test_delivery_fee_requires_accepting_refund_liability(tmp_path, monkeypatch):
+    """Pricing an order is the moment the business takes it on, so the server
+    refuses to price (and to bill the customer) without an explicit acceptance —
+    a form post that skips the browser must not slip past the checkbox."""
+    db_path = tmp_path / "test_bot.db"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
+    monkeypatch.setenv("ADMIN_EMAIL", "admin@example.com")
+    monkeypatch.setenv("ADMIN_PASSWORD", "test-admin-password")
+
+    import app.main as main
+    importlib.reload(main)
+    client = TestClient(main.app)
+
+    _place_demo_order(client)
+    client.post("/login", data={"email": "admin@example.com", "password": "test-admin-password"},
+                follow_redirects=False)
+    order_id = client.get("/api/action-required").json()["orders"][0]["id"]
+
+    # No acceptance: bounced back to the order, still unpriced and unbilled.
+    refused = client.post(f"/orders/{order_id}/delivery-fee", data={"delivery_fee": "500"},
+                          follow_redirects=False)
+    assert refused.status_code == 303
+    assert "accept_required" in refused.headers["location"]
+
+    db = main.SessionLocal()
+    order = db.query(main.Order).filter(main.Order.id == order_id).one()
+    assert order.status == "awaiting_delivery_fee"
+    assert order.fee_terms_accepted_at is None
+    db.close()
+
+    # While the order still awaits pricing, the dialog carries the acceptance
+    # checkbox and links the policy it refers to.
+    detail = client.get(f"/orders/{order_id}").text
+    assert "accept_terms" in detail
+    assert "/refunds" in detail
+
+    # With acceptance: priced, and the acceptance is stamped against the order.
+    ok = client.post(f"/orders/{order_id}/delivery-fee",
+                     data={"delivery_fee": "500", "accept_terms": "1"}, follow_redirects=False)
+    assert ok.status_code == 303
+
+    db = main.SessionLocal()
+    order = db.query(main.Order).filter(main.Order.id == order_id).one()
+    assert order.status == "awaiting_payment"
+    assert order.fee_terms_accepted_at is not None
+    assert order.fee_terms_version == main.LEGAL_LAST_UPDATED
+    db.close()
+
+
+def test_refund_requires_payment_and_is_recorded(tmp_path, monkeypatch):
+    db_path = tmp_path / "test_bot.db"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
+    monkeypatch.setenv("ADMIN_EMAIL", "admin@example.com")
+    monkeypatch.setenv("ADMIN_PASSWORD", "test-admin-password")
+
+    import app.main as main
+    importlib.reload(main)
+    client = TestClient(main.app)
+
+    _place_demo_order(client)
+    token = client.post("/api/login", json={"email": "admin@example.com",
+                                            "password": "test-admin-password"}).json()["token"]
+    auth = {"Authorization": f"Bearer {token}"}
+    order_id = client.get("/api/action-required", headers=auth).json()["orders"][0]["id"]
+    action_url = f"/api/orders/{order_id}/action"
+
+    # Nothing has been paid yet, so there is nothing to refund — that is a cancel.
+    too_early = client.post(action_url, headers=auth, json={"action": "refund"})
+    assert too_early.status_code == 400
+    assert too_early.json()["error"] == "not_refundable"
+
+    fee = client.post(action_url, headers=auth,
+                      json={"action": "set_delivery_fee", "delivery_fee": 500,
+                            "accept_terms": True}).json()
+    assert fee["terms_accepted_at"] is not None
+    paid = client.post(action_url, headers=auth, json={"action": "mark_paid"}).json()
+    assert "refund" in paid["available_actions"]
+
+    refunded = client.post(action_url, headers=auth,
+                           json={"action": "refund", "refund_reason": "Kitchen ran out"}).json()
+    assert refunded["status"] == "refunded"
+    assert refunded["refund_amount"] == refunded["total"]
+    assert refunded["refund_reason"] == "Kitchen ran out"
+    assert refunded["refunded_at"] is not None
+    # A refunded order must stop counting as money earned.
+    assert refunded["status"] not in main.PAID_STATUSES
+    # And it cannot be refunded a second time.
+    assert client.post(action_url, headers=auth, json={"action": "refund"}).status_code == 400
+
+
+def test_refund_breakdown_keeps_messaging_fee_and_reverses_commission(tmp_path, monkeypatch):
+    db_path = tmp_path / "test_bot.db"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
+
+    import app.main as main
+    importlib.reload(main)
+
+    db = main.SessionLocal()
+    business = db.query(main.Business).first()
+    business.payment_method = "paystack"          # customer service fee only applies here
+    order = main.Order(business_id=business.id, customer_phone="2348012345678", items_json="[]",
+                       total=5000, delivery_fee=500, address="12 Marina Road", status="paid",
+                       message_count=4)
+    db.close()
+
+    breakdown = main.order_refund_breakdown(business, order)
+    expected_fee = main.PLATFORM_SERVICE_CHARGE_NGN + 4 * main.PLATFORM_PER_MESSAGE_NGN
+    # Goods and delivery go back; the messaging we were already billed for does not.
+    assert breakdown["refundable"] == 5000
+    assert breakdown["retained_service_fee"] == expected_fee
+    assert breakdown["customer_paid"] == 5000 + expected_fee
+    assert breakdown["commission_reversed"] == round(5000 * main.PLATFORM_COMMISSION_PERCENT / 100)
