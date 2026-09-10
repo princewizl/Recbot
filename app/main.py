@@ -4729,7 +4729,8 @@ def business_detail(request: Request, business_id: int, notice: Optional[str] = 
     categories_rows = "".join(f"<tr><td>{escape(category.name)}</td></tr>" for category in context["categories"])
     branches_rows = "".join(f"<tr><td>{escape(branch.name)}</td><td>{escape(branch.address or '')}</td></tr>" for branch in context["branches"])
     riders_rows = "".join(
-        f"<tr><td>{escape(r.name)}</td><td>{escape(r.phone or '')}</td><td>{escape(r.bank_name or '')}</td>"
+        f"<tr><td><a href='/admin/businesses/{business_id}/riders/{r.id}'>{escape(r.name)}</a></td>"
+        f"<td>{escape(r.phone or '')}</td><td>{escape(r.bank_name or '')}</td>"
         f"<td>{'✅ Linked' if r.paystack_subaccount_code else '—'}</td></tr>"
         for r in riders
     )
@@ -4767,6 +4768,15 @@ def business_detail(request: Request, business_id: int, notice: Optional[str] = 
         bank_field = (
             f"<input name='bank_code' value='{escape(business.bank_code or '')}' "
             "placeholder='Bank code for payouts (e.g. 058 = GTBank, 044 = Access)' />"
+        )
+    if banks:
+        rider_bank_field = (
+            "<label>Rider's bank <select name='bank_code'>"
+            f"<option value=''>Select bank…</option>{bank_options}</select></label>"
+        )
+    else:
+        rider_bank_field = (
+            "<input name='bank_code' placeholder='Bank code (e.g. 058 = GTBank, 044 = Access)' />"
         )
     key_mode = paystack_key_mode(business.paystack_secret_key)
     key_badges = {
@@ -4904,10 +4914,10 @@ def business_detail(request: Request, business_id: int, notice: Optional[str] = 
         <form method="post" action="/admin/businesses/{business.id}/riders">
           <input name="name" placeholder="Rider name" required />
           <input name="phone" placeholder="Phone" />
-          <input name="bank_name" placeholder="Bank name" />
+          <input name="bank_name" placeholder="Bank name (for display)" />
           <input name="bank_account_number" placeholder="Account number" />
           <input name="bank_account_name" placeholder="Account holder name" />
-          <input name="bank_code" placeholder="Bank code (e.g. 058 = GTBank, 044 = Access)" />
+          {rider_bank_field}
           <div class="form-actions">
             <button type="submit">Add Rider</button>
           </div>
@@ -5130,8 +5140,90 @@ def create_rider(
             bank_account_name=bank_account_name or None, bank_code=bank_code.strip() or None,
         )
         db.add(rider)
+        db.flush()  # assigns rider.id, so a failed subaccount attempt below logs a real id
         ensure_rider_paystack_subaccount(rider)  # eager, so a bad bank detail surfaces now, not on the first order
         db.commit()
+    finally:
+        db.close()
+    return RedirectResponse(url=f"/admin/businesses/{business_id}", status_code=303)
+
+
+@app.get("/admin/businesses/{business_id}/riders/{rider_id}", response_class=HTMLResponse)
+def edit_rider_page(request: Request, business_id: int, rider_id: int) -> HTMLResponse:
+    current_user = get_current_user(request)
+    if not current_user or (current_user.role != "admin" and current_user.business_id != business_id):
+        return RedirectResponse(url="/login", status_code=303)
+    db = SessionLocal()
+    try:
+        rider = db.query(Rider).filter(Rider.id == rider_id, Rider.business_id == business_id).one_or_none()
+        if not rider:
+            return render_page("Rider Not Found", "<p>Rider not found.</p>", nav_html=make_nav(current_user))
+        banks = list_paystack_banks()
+        if banks:
+            bank_options = "".join(
+                f"<option value='{escape(code)}' {'selected' if rider.bank_code == code else ''}>{escape(name)}</option>"
+                for name, code in banks
+            )
+            bank_field = f"<label>Bank <select name='bank_code'><option value=''>Select bank…</option>{bank_options}</select></label>"
+        else:
+            rider_bank_code = rider.bank_code or ""
+            bank_field = f"<input name='bank_code' value='{escape(rider_bank_code)}' placeholder='Bank code' />"
+        link_note = (
+            "<p class='form-hint'>✅ Payout account linked.</p>" if rider.paystack_subaccount_code
+            else "<p class='form-hint' style='color:var(--danger, #e11d48);'>⚠️ Not linked yet — check the bank details and save again.</p>"
+        )
+        body = f"""
+        <div class="card">
+          <h3>Edit rider: {escape(rider.name)}</h3>
+          {link_note}
+          <form method="post" action="/admin/businesses/{business_id}/riders/{rider.id}">
+            <input name="name" value="{escape(rider.name)}" required />
+            <input name="phone" value="{escape(rider.phone or '')}" placeholder="Phone" />
+            <input name="bank_name" value="{escape(rider.bank_name or '')}" placeholder="Bank name (for display)" />
+            <input name="bank_account_number" value="{escape(rider.bank_account_number or '')}" placeholder="Account number" />
+            <input name="bank_account_name" value="{escape(rider.bank_account_name or '')}" placeholder="Account holder name" />
+            {bank_field}
+            <div class="form-actions">
+              <button type="submit">Save</button>
+              <a class="btn secondary" href="/admin/businesses/{business_id}">Back</a>
+            </div>
+          </form>
+        </div>
+        """
+    finally:
+        db.close()
+    return render_page("Edit Rider", body, nav_html=make_nav(current_user))
+
+
+@app.post("/admin/businesses/{business_id}/riders/{rider_id}")
+def update_rider(
+    request: Request, business_id: int, rider_id: int,
+    name: str = Form(...),
+    phone: str = Form(default=""),
+    bank_name: str = Form(default=""),
+    bank_account_number: str = Form(default=""),
+    bank_account_name: str = Form(default=""),
+    bank_code: str = Form(default=""),
+) -> RedirectResponse:
+    current_user = get_current_user(request)
+    if not current_user or (current_user.role != "admin" and current_user.business_id != business_id):
+        return RedirectResponse(url="/login", status_code=303)
+    db = SessionLocal()
+    try:
+        rider = db.query(Rider).filter(Rider.id == rider_id, Rider.business_id == business_id).one_or_none()
+        if rider:
+            prev_acct, prev_code = rider.bank_account_number, rider.bank_code
+            rider.name = name
+            rider.phone = phone or None
+            rider.bank_name = bank_name or None
+            rider.bank_account_number = bank_account_number or None
+            rider.bank_account_name = bank_account_name or None
+            rider.bank_code = bank_code.strip() or None
+            # Bank details changed → the old subaccount (if any) no longer applies.
+            if rider.bank_account_number != prev_acct or rider.bank_code != prev_code:
+                rider.paystack_subaccount_code = None
+            ensure_rider_paystack_subaccount(rider)
+            db.commit()
     finally:
         db.close()
     return RedirectResponse(url=f"/admin/businesses/{business_id}", status_code=303)
