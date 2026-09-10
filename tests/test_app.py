@@ -303,7 +303,7 @@ def test_auto_delivery_fee_and_paystack_flow(tmp_path, monkeypatch):
     # ~2.2 km away; no real network calls in tests.
     monkeypatch.setattr(main, "geocode_address", lambda address: (6.47, 3.40))
 
-    def fake_link(business, order):
+    def fake_link(db, business, order):
         order.payment_reference = f"RBORD-{order.id}-test"
         order.payment_link = "https://checkout.paystack.com/test123"
         return order.payment_link
@@ -1167,3 +1167,93 @@ def test_affiliate_admin_flow_and_mobile_login(tmp_path, monkeypatch):
     summary_after = mobile.get("/api/affiliate/summary", headers={"Authorization": f"Bearer {token}"}).json()
     assert summary_after["paid_total"] == expected_share
     assert summary_after["outstanding"] == 0
+
+
+def test_rider_split_shares_preserve_platform_charge(tmp_path, monkeypatch):
+    db_path = tmp_path / "test_bot.db"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
+
+    import app.main as main
+    importlib.reload(main)
+
+    order = main.Order(business_id=1, customer_phone="1", items_json="[]",
+                       total=8500, delivery_fee=1500, address="x", status="awaiting_payment",
+                       message_count=6)
+    business_share, rider_share = main.rider_split_shares(order)
+    assert rider_share == 1500  # the full delivery fee, untouched
+    # Whatever's left after both flat shares must equal exactly what Collxct
+    # would have taken anyway — the rider only intercepts the delivery portion.
+    remainder = order.total - business_share - rider_share
+    assert remainder == main.order_commission(order)
+    assert business_share == order.total - order.delivery_fee - main.order_commission(order)
+
+
+def test_apply_order_action_assigns_rider_and_rejects_foreign_rider(tmp_path, monkeypatch):
+    db_path = tmp_path / "test_bot.db"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
+
+    import app.main as main
+    importlib.reload(main)
+
+    db = main.SessionLocal()
+    business = db.query(main.Business).first()
+    other_business = main.Business(name="Other Shop", whatsapp_number="+2348099999999")
+    rider = main.Rider(business_id=business.id, name="Chidi", phone="080...")
+    db.add_all([other_business, rider])
+    db.commit()
+    db.refresh(other_business)
+    db.refresh(rider)
+    foreign_rider = main.Rider(business_id=other_business.id, name="Not Yours")
+    db.add(foreign_rider)
+    db.commit()
+    db.refresh(foreign_rider)
+
+    order = main.Order(business_id=business.id, customer_phone="1", items_json="[]",
+                       total=0, delivery_fee=0, address="x", status="awaiting_delivery_fee")
+    db.add(order)
+    db.commit()
+
+    # A rider that actually belongs to this business gets assigned.
+    main.apply_order_action(db, order, business, "set_delivery_fee",
+                            delivery_fee=1000, rider_id=rider.id)
+    assert order.rider_id == rider.id
+
+    # A rider belonging to a DIFFERENT business is silently ignored, not assigned.
+    order2 = main.Order(business_id=business.id, customer_phone="2", items_json="[]",
+                        total=0, delivery_fee=0, address="x", status="awaiting_delivery_fee")
+    db.add(order2)
+    db.commit()
+    main.apply_order_action(db, order2, business, "set_delivery_fee",
+                            delivery_fee=1000, rider_id=foreign_rider.id)
+    assert order2.rider_id is None
+    db.close()
+
+
+def test_admin_creates_rider(tmp_path, monkeypatch):
+    db_path = tmp_path / "test_bot.db"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
+    monkeypatch.setenv("ADMIN_EMAIL", "admin@example.com")
+    monkeypatch.setenv("ADMIN_PASSWORD", "test-admin-password")
+
+    import app.main as main
+    importlib.reload(main)
+    client = TestClient(main.app)
+
+    client.post("/login", data={"email": "admin@example.com", "password": "test-admin-password"},
+               follow_redirects=False)
+    db = main.SessionLocal()
+    business = db.query(main.Business).first()
+    business_id = business.id
+    db.close()
+
+    created = client.post(f"/admin/businesses/{business_id}/riders", data={
+        "name": "Chidi", "phone": "08011112222", "bank_name": "GTBank",
+        "bank_account_number": "0123456789", "bank_code": "058",
+    }, follow_redirects=False)
+    assert created.status_code == 303
+
+    db = main.SessionLocal()
+    rider = db.query(main.Rider).filter(main.Rider.business_id == business_id).one()
+    assert rider.name == "Chidi"
+    assert rider.bank_account_number == "0123456789"
+    db.close()

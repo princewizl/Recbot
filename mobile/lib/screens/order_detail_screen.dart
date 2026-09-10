@@ -28,12 +28,12 @@ class _OrderDetailScreenState extends State<OrderDetailScreen> {
   }
 
   Future<void> _runAction(String action,
-      {int? deliveryFee, bool acceptTerms = false, String? refundReason}) async {
+      {int? deliveryFee, bool acceptTerms = false, String? refundReason, int? riderId}) async {
     setState(() => _acting = true);
     try {
       final client = await ApiClient.current();
       final updated = await client.doAction(widget.orderId, action,
-          deliveryFee: deliveryFee, acceptTerms: acceptTerms, refundReason: refundReason);
+          deliveryFee: deliveryFee, acceptTerms: acceptTerms, refundReason: refundReason, riderId: riderId);
       setState(() => _future = Future.value(updated));
       _toast('Done — ${updated.statusLabel}.');
     } on ApiException catch (e) {
@@ -106,7 +106,16 @@ class _OrderDetailScreenState extends State<OrderDetailScreen> {
   Future<void> _promptDeliveryFee() async {
     final controller = TextEditingController();
     var accepted = false;
-    final fee = await showDialog<int>(
+    RiderOption? selectedRider;
+    List<RiderOption> riders = [];
+    try {
+      final client = await ApiClient.current();
+      riders = await client.getRiders();
+    } catch (_) {
+      // Non-fatal: the rider picker just won't show. Pricing still works.
+    }
+    if (!mounted) return;
+    final result = await showDialog<(int, int?)>(
       context: context,
       builder: (ctx) => StatefulBuilder(
         builder: (ctx, setLocal) => AlertDialog(
@@ -123,6 +132,18 @@ class _OrderDetailScreenState extends State<OrderDetailScreen> {
                 keyboardType: TextInputType.number,
                 decoration: const InputDecoration(prefixText: '₦ ', hintText: 'e.g. 500'),
               ),
+              if (riders.isNotEmpty) ...[
+                const SizedBox(height: 14),
+                DropdownButtonFormField<RiderOption?>(
+                  initialValue: selectedRider,
+                  decoration: const InputDecoration(labelText: 'Pay delivery fee to a rider? (optional)'),
+                  items: [
+                    const DropdownMenuItem<RiderOption?>(value: null, child: Text('No — keep it with my payout')),
+                    for (final r in riders) DropdownMenuItem<RiderOption?>(value: r, child: Text(r.name)),
+                  ],
+                  onChanged: (v) => setLocal(() => selectedRider = v),
+                ),
+              ],
               const SizedBox(height: 16),
               InkWell(
                 onTap: () => setLocal(() => accepted = !accepted),
@@ -166,8 +187,12 @@ class _OrderDetailScreenState extends State<OrderDetailScreen> {
                 onPressed: () => Navigator.pop(ctx),
                 child: const Text('Cancel', style: TextStyle(color: AppColors.muted))),
             TextButton(
-              onPressed:
-                  accepted ? () => Navigator.pop(ctx, int.tryParse(controller.text.trim())) : null,
+              onPressed: accepted
+                  ? () {
+                      final fee = int.tryParse(controller.text.trim());
+                      Navigator.pop(ctx, fee != null ? (fee, selectedRider?.id) : null);
+                    }
+                  : null,
               child: Text(
                 'Accept & send',
                 style: TextStyle(
@@ -182,7 +207,9 @@ class _OrderDetailScreenState extends State<OrderDetailScreen> {
         ),
       ),
     );
-    if (fee != null) _runAction('set_delivery_fee', deliveryFee: fee, acceptTerms: true);
+    if (result != null) {
+      _runAction('set_delivery_fee', deliveryFee: result.$1, acceptTerms: true, riderId: result.$2);
+    }
   }
 
   Future<void> _promptRefund(AppOrder order) async {

@@ -176,6 +176,29 @@ class Order(Base):
     refunded_at = Column(DateTime, nullable=True)
     refund_amount = Column(Integer, nullable=False, default=0)
     refund_reason = Column(Text, nullable=True)
+    # Optional rider payout: NULL means this order behaves exactly as before
+    # (delivery fee settles to the business like everything else). Set only
+    # when the business opts in by assigning a rider while pricing the order.
+    rider_id = Column(Integer, nullable=True)
+    # Cached Paystack split-group code for this order, so a retried/duplicate
+    # payment-init reuses it instead of creating a new group every time.
+    paystack_split_code = Column(String(64), nullable=True)
+
+
+class Rider(Base):
+    """A business's delivery rider with their own bank details. Assigning one to
+    an order (Order.rider_id) diverts that order's delivery fee straight to the
+    rider's own Paystack subaccount instead of the business's payout."""
+    __tablename__ = "riders"
+    id = Column(Integer, primary_key=True, index=True)
+    business_id = Column(Integer, nullable=False)
+    name = Column(String(255), nullable=False)
+    phone = Column(String(50), nullable=True)
+    bank_name = Column(String(255), nullable=True)
+    bank_account_number = Column(String(50), nullable=True)
+    bank_account_name = Column(String(255), nullable=True)
+    bank_code = Column(String(10), nullable=True)
+    paystack_subaccount_code = Column(String(64), nullable=True)
 
 
 class User(Base):
@@ -374,6 +397,10 @@ def ensure_schema() -> None:
             conn.execute(text("ALTER TABLE businesses ADD COLUMN referred_by_user_id INTEGER"))
         if not has_column("businesses", "referred_at"):
             conn.execute(text("ALTER TABLE businesses ADD COLUMN referred_at DATETIME"))
+        if not has_column("orders", "rider_id"):
+            conn.execute(text("ALTER TABLE orders ADD COLUMN rider_id INTEGER"))
+        if not has_column("orders", "paystack_split_code"):
+            conn.execute(text("ALTER TABLE orders ADD COLUMN paystack_split_code VARCHAR(64)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_orders_business_id ON orders(business_id)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_orders_status ON orders(status)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_orders_customer_phone ON orders(customer_phone)"))
@@ -1538,7 +1565,91 @@ def ensure_paystack_subaccount(business: Business) -> Optional[str]:
     return None
 
 
-def create_paystack_order_link(business: Business, order: Order) -> Optional[str]:
+def ensure_rider_paystack_subaccount(rider: "Rider") -> Optional[str]:
+    """Create (once) a Paystack subaccount for a rider from their bank details, so
+    a business can opt an order into paying the rider directly. Mirrors
+    ensure_paystack_subaccount(); the caller commits the stored code."""
+    if rider.paystack_subaccount_code:
+        return rider.paystack_subaccount_code
+    key = central_paystack_key()
+    if not key or not rider.bank_code or not rider.bank_account_number:
+        return None
+    try:
+        response = httpx.post(
+            "https://api.paystack.co/subaccount",
+            json={
+                "business_name": rider.name,
+                "settlement_bank": rider.bank_code,
+                "account_number": rider.bank_account_number,
+                "percentage_charge": 0,  # unused: this subaccount is only ever referenced from a split group, whose flat shares govern the split, not this default.
+            },
+            headers={"Authorization": f"Bearer {key}"}, timeout=15.0,
+        )
+        data = response.json()
+        if data.get("status"):
+            rider.paystack_subaccount_code = data["data"]["subaccount_code"]
+            return rider.paystack_subaccount_code
+        logger.error("paystack rider subaccount rejected (rider=%s): %s", rider.id, data.get("message"))
+    except Exception as exc:
+        logger.error("paystack rider subaccount failed (rider=%s): %s", rider.id, exc)
+    return None
+
+
+def rider_split_shares(order: Order) -> "tuple[int, int]":
+    """(business_share_ngn, rider_share_ngn) for a rider-assigned order's flat
+    Paystack split group. Verified by hand against order_platform_charge()/
+    create_paystack_order_link() so this preserves today's economics exactly —
+    the remainder (grand_total - business_share - rider_share) that flows to
+    Collxct's main account equals order_platform_charge(order), unchanged."""
+    business_share = (order.total or 0) - (order.delivery_fee or 0) - order_commission(order)
+    rider_share = order.delivery_fee or 0
+    return max(business_share, 0), max(rider_share, 0)
+
+
+def ensure_paystack_split_group(business: Business, rider: "Rider", order: Order) -> Optional[str]:
+    """Create a one-off Paystack split group for this specific rider-assigned
+    order (delivery fee and totals vary order to order, so groups aren't shared
+    across orders) and cache its code on the order. bearer_type/bearer_subaccount
+    here is our best-effort match to today's bearer="subaccount" behavior (the
+    business still carries Paystack's processing fee) — confirm this against a
+    real test charge before the first live rider payout; if it's wrong, Collxct's
+    own settlement is still whole (the remainder always lands on the main
+    account), only who eats Paystack's fee could differ from today."""
+    if order.paystack_split_code:
+        return order.paystack_split_code
+    key = central_paystack_key()
+    business_subaccount = ensure_paystack_subaccount(business)
+    rider_subaccount = ensure_rider_paystack_subaccount(rider)
+    if not key or not business_subaccount or not rider_subaccount:
+        return None
+    business_share, rider_share = rider_split_shares(order)
+    try:
+        response = httpx.post(
+            "https://api.paystack.co/split",
+            json={
+                "name": f"recbot-order-{order.id}",
+                "type": "flat",
+                "currency": "NGN",
+                "subaccounts": [
+                    {"subaccount": business_subaccount, "share": business_share * 100},
+                    {"subaccount": rider_subaccount, "share": rider_share * 100},
+                ],
+                "bearer_type": "subaccount",
+                "bearer_subaccount": business_subaccount,
+            },
+            headers={"Authorization": f"Bearer {key}"}, timeout=15.0,
+        )
+        data = response.json()
+        if data.get("status"):
+            order.paystack_split_code = data["data"]["split_code"]
+            return order.paystack_split_code
+        logger.error("paystack split group rejected (order=%s): %s", order.id, data.get("message"))
+    except Exception as exc:
+        logger.error("paystack split group failed (order=%s): %s", order.id, exc)
+    return None
+
+
+def create_paystack_order_link(db, business: Business, order: Order) -> Optional[str]:
     """Hosted Paystack checkout for an order via Collxct's central account, split so
     the platform charge goes to Collxct and the rest settles to the business's
     subaccount. Returns None (→ bank-transfer fallback) when central Paystack or the
@@ -1556,7 +1667,19 @@ def create_paystack_order_link(business: Business, order: Order) -> Optional[str
         "currency": "NGN",
         "metadata": {"order_id": order.id, "business_id": business.id, "customer_phone": order.customer_phone},
     }
-    if subaccount:
+    split_code = None
+    if order.rider_id and subaccount:
+        rider = db.query(Rider).filter(Rider.id == order.rider_id, Rider.business_id == business.id).one_or_none()
+        if rider:
+            split_code = ensure_paystack_split_group(business, rider, order)
+            if not split_code:
+                logger.error("rider split setup failed (order=%s, rider=%s) — falling back to normal payout", order.id, rider.id)
+    if split_code:
+        # Rider-assigned order: the split group already accounts for the platform
+        # charge, business share, and rider's delivery-fee share — no separate
+        # subaccount/transaction_charge (Paystack doesn't allow combining them).
+        payload["split_code"] = split_code
+    elif subaccount:
         # Collxct keeps the FULL platform charge (flat + commission + messaging) as a
         # flat transaction_charge. The customer only added the service fee (flat +
         # messaging) to their total, so the commission portion is effectively drawn
@@ -2872,7 +2995,7 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
         notify_order_cap_usage(db, business)
         if auto:
             if business.payment_method == "paystack":
-                create_paystack_order_link(business, order)
+                create_paystack_order_link(db, business, order)
                 db.commit()
             push_to_business(
                 business.id,
@@ -4594,6 +4717,7 @@ def business_detail(request: Request, business_id: int, notice: Optional[str] = 
         business = context["business"]
         plans = db.query(Plan).order_by(Plan.price_ngn).all()
         affiliates = db.query(User).filter(User.role == "affiliate").order_by(User.email).all() if current_user.role == "admin" else []
+        riders = db.query(Rider).filter(Rider.business_id == business_id).order_by(Rider.name).all()
     finally:
         db.close()
     if not business:
@@ -4604,6 +4728,11 @@ def business_detail(request: Request, business_id: int, notice: Optional[str] = 
     plan_expiry_label = plan_due_label(business)
     categories_rows = "".join(f"<tr><td>{escape(category.name)}</td></tr>" for category in context["categories"])
     branches_rows = "".join(f"<tr><td>{escape(branch.name)}</td><td>{escape(branch.address or '')}</td></tr>" for branch in context["branches"])
+    riders_rows = "".join(
+        f"<tr><td>{escape(r.name)}</td><td>{escape(r.phone or '')}</td><td>{escape(r.bank_name or '')}</td>"
+        f"<td>{'✅ Linked' if r.paystack_subaccount_code else '—'}</td></tr>"
+        for r in riders
+    )
     def _thumb(item):
         if item.image_url:
             return f"<img src='{escape(item.image_url)}' alt='' style='width:44px;height:44px;object-fit:cover;border-radius:8px;' />"
@@ -4765,6 +4894,25 @@ def business_detail(request: Request, business_id: int, notice: Optional[str] = 
           </div>
         </form>
         <div class="table-wrap"><table><tr><th>Name</th><th>Address</th></tr>{branches_rows}</table></div>
+      </div>
+      <div class="card">
+        <div class="section-head">
+          <h3>Riders</h3>
+          <span class="status-pill">Optional</span>
+        </div>
+        <p class="form-hint">Assign a rider while pricing an order to pay that order's delivery fee straight to them instead of your own payout.</p>
+        <form method="post" action="/admin/businesses/{business.id}/riders">
+          <input name="name" placeholder="Rider name" required />
+          <input name="phone" placeholder="Phone" />
+          <input name="bank_name" placeholder="Bank name" />
+          <input name="bank_account_number" placeholder="Account number" />
+          <input name="bank_account_name" placeholder="Account holder name" />
+          <input name="bank_code" placeholder="Bank code (e.g. 058 = GTBank, 044 = Access)" />
+          <div class="form-actions">
+            <button type="submit">Add Rider</button>
+          </div>
+        </form>
+        <div class="table-wrap"><table><tr><th>Name</th><th>Phone</th><th>Bank</th><th>Payout account</th></tr>{riders_rows}</table></div>
       </div>
     </div>
     <div class="panel-grid">
@@ -4956,6 +5104,34 @@ def update_business(
                     if new_referrer_id and not business.referred_at:
                         business.referred_at = datetime.utcnow()
             db.commit()
+    finally:
+        db.close()
+    return RedirectResponse(url=f"/admin/businesses/{business_id}", status_code=303)
+
+
+@app.post("/admin/businesses/{business_id}/riders")
+def create_rider(
+    request: Request, business_id: int,
+    name: str = Form(...),
+    phone: str = Form(default=""),
+    bank_name: str = Form(default=""),
+    bank_account_number: str = Form(default=""),
+    bank_account_name: str = Form(default=""),
+    bank_code: str = Form(default=""),
+) -> RedirectResponse:
+    current_user = get_current_user(request)
+    if not current_user or (current_user.role != "admin" and current_user.business_id != business_id):
+        return RedirectResponse(url="/login", status_code=303)
+    db = SessionLocal()
+    try:
+        rider = Rider(
+            business_id=business_id, name=name, phone=phone or None,
+            bank_name=bank_name or None, bank_account_number=bank_account_number or None,
+            bank_account_name=bank_account_name or None, bank_code=bank_code.strip() or None,
+        )
+        db.add(rider)
+        ensure_rider_paystack_subaccount(rider)  # eager, so a bad bank detail surfaces now, not on the first order
+        db.commit()
     finally:
         db.close()
     return RedirectResponse(url=f"/admin/businesses/{business_id}", status_code=303)
@@ -5391,13 +5567,19 @@ def render_action_queue(orders: List[Order], business_names: Optional[Dict[int, 
 # and fires the customer-facing WhatsApp message. Returns (ok, error_code).
 def apply_order_action(db, order: Order, business: Optional[Business], action: str,
                        delivery_fee: Optional[int] = None, accept_terms: bool = False,
-                       refund_reason: Optional[str] = None) -> "tuple[bool, str]":
+                       refund_reason: Optional[str] = None, rider_id: Optional[int] = None) -> "tuple[bool, str]":
     if action == "set_delivery_fee":
         if delivery_fee is None:
             return False, "missing_delivery_fee"
         items_subtotal = cart_total(load_cart(order.items_json))
         order.delivery_fee = delivery_fee
         order.total = items_subtotal + delivery_fee
+        # Optional: pay this order's delivery fee straight to a rider instead of
+        # the business. Only accept a rider that actually belongs to this
+        # business; anything else is silently ignored (order stays unassigned).
+        if rider_id and business:
+            rider = db.query(Rider).filter(Rider.id == rider_id, Rider.business_id == business.id).one_or_none()
+            order.rider_id = rider.id if rider else None
         # Pricing the order is the business accepting it, and with it the refund
         # liability. Stamp the acceptance so a later dispute has a record of it.
         if accept_terms:
@@ -5405,7 +5587,7 @@ def apply_order_action(db, order: Order, business: Optional[Business], action: s
             order.fee_terms_version = LEGAL_LAST_UPDATED
         set_order_status(order, "awaiting_payment")
         if business and business.payment_method == "paystack":
-            create_paystack_order_link(business, order)
+            create_paystack_order_link(db, business, order)
         # If the customer's chat drifted back to idle/menu (e.g. they said "hi"
         # while waiting), snap it to the payment stage so their next reply —
         # even a bare "ok" — is treated as payment confirmation, not menu input.
@@ -5502,7 +5684,8 @@ def _order_action_dashboard_redirect(current_user: User, business_id: int) -> Re
 
 @app.post("/orders/{order_id}/delivery-fee")
 def set_order_delivery_fee(request: Request, order_id: int, delivery_fee: int = Form(...),
-                           accept_terms: Optional[str] = Form(None)) -> RedirectResponse:
+                           accept_terms: Optional[str] = Form(None),
+                           rider_id: Optional[int] = Form(default=None)) -> RedirectResponse:
     current_user = get_current_user(request)
     db = SessionLocal()
     try:
@@ -5518,7 +5701,7 @@ def set_order_delivery_fee(request: Request, order_id: int, delivery_fee: int = 
             return RedirectResponse(url=f"/orders/{order_id}?error=accept_required", status_code=303)
         business = get_business(db, order.business_id)
         apply_order_action(db, order, business, "set_delivery_fee",
-                           delivery_fee=delivery_fee, accept_terms=True)
+                           delivery_fee=delivery_fee, accept_terms=True, rider_id=rider_id)
         business_id = order.business_id
     finally:
         db.close()
@@ -5752,6 +5935,7 @@ def order_to_json(order: Order, business: Optional[Business]) -> dict:
         "refund_amount": order.refund_amount or 0,
         "refund_reason": order.refund_reason,
         "terms_accepted_at": order.fee_terms_accepted_at.isoformat() if order.fee_terms_accepted_at else None,
+        "rider_id": order.rider_id,
     }
 
 
@@ -5930,11 +6114,17 @@ async def api_order_action(request: Request, order_id: int) -> JSONResponse:
     # acceptance — inventing one would put a signature on file that the business
     # never actually gave. The app should send it from the next release.
     accept_terms = bool(data.get("accept_terms"))
+    rider_id = None
     if action == "set_delivery_fee":
         try:
             delivery_fee = int(data.get("delivery_fee"))
         except (TypeError, ValueError):
             return JSONResponse({"error": "missing_delivery_fee"}, status_code=400)
+        if data.get("rider_id") is not None:
+            try:
+                rider_id = int(data.get("rider_id"))
+            except (TypeError, ValueError):
+                rider_id = None
     db = SessionLocal()
     try:
         order = db.query(Order).filter(Order.id == order_id).one_or_none()
@@ -5945,7 +6135,7 @@ async def api_order_action(request: Request, order_id: int) -> JSONResponse:
         business = get_business(db, order.business_id)
         ok, err = apply_order_action(db, order, business, action, delivery_fee=delivery_fee,
                                      accept_terms=accept_terms,
-                                     refund_reason=data.get("refund_reason"))
+                                     refund_reason=data.get("refund_reason"), rider_id=rider_id)
         if not ok:
             return JSONResponse({"error": err}, status_code=400)
         result = order_to_json(order, business)
@@ -6115,6 +6305,19 @@ def api_catalogue(request: Request) -> JSONResponse:
             "categories": [{"id": c.id, "name": c.name} for c in cats],
             "items": [item_to_json(i) for i in items],
         })
+    finally:
+        db.close()
+
+
+@app.get("/api/riders")
+def api_riders(request: Request) -> JSONResponse:
+    user = _api_owner(request)
+    if not user:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    db = SessionLocal()
+    try:
+        riders = db.query(Rider).filter(Rider.business_id == user.business_id).order_by(Rider.name).all()
+        return JSONResponse({"riders": [{"id": r.id, "name": r.name} for r in riders]})
     finally:
         db.close()
 
@@ -6487,6 +6690,13 @@ def order_detail(request: Request, order_id: int) -> HTMLResponse:
         )
         refund_button = ("<button type='button' class='btn' style='border-color:rgba(192,132,252,.45);color:#c084fc;' "
                          "onclick=\"document.getElementById('refund-modal').showModal()\">Refund</button>")
+        rider_line = (
+            "<p class='form-hint'><strong>A rider was assigned to this order.</strong> Their share of the "
+            "delivery fee settled straight to them through the Paystack split — Recbot has no visibility into "
+            "whether that's landed yet, so recovering it from the rider (if needed) is a separate conversation "
+            "with them, outside this refund.</p>"
+            if order.rider_id else ""
+        )
         refund_modal = f"""
         <dialog id="refund-modal" class="modal">
           <div class="modal-body">
@@ -6494,6 +6704,7 @@ def order_detail(request: Request, order_id: int) -> HTMLResponse:
             <p class="form-hint">This refunds <strong>N{breakdown['refundable']}</strong> (items + delivery)
             of the N{breakdown['customer_paid']} the customer paid.</p>
             {retained_line}
+            {rider_line}
             <p class="form-hint"><strong>You send the money.</strong> The customer's payment settled to your
             bank through the Paystack split, so Collxct cannot return it for you. Marking it here records
             the refund and tells the customer to expect it from you.</p>

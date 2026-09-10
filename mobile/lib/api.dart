@@ -156,9 +156,11 @@ class ApiClient {
 
   /// Run an order action. `acceptTerms` accompanies `set_delivery_fee`: pricing
   /// an order accepts it and its refund liability, and the server records that
-  /// acceptance against the order (see Terms section 7).
+  /// acceptance against the order (see Terms section 7). `riderId` is optional
+  /// and only meaningful with `set_delivery_fee` — pay that order's delivery
+  /// fee straight to a saved rider instead of this business's own payout.
   Future<AppOrder> doAction(int id, String action,
-      {int? deliveryFee, bool acceptTerms = false, String? refundReason}) async {
+      {int? deliveryFee, bool acceptTerms = false, String? refundReason, int? riderId}) async {
     final res = await _timed(http.post(
       _uri('/api/orders/$id/action'),
       headers: _headers,
@@ -168,10 +170,18 @@ class ApiClient {
         if (acceptTerms) 'accept_terms': true,
         if (refundReason != null && refundReason.trim().isNotEmpty)
           'refund_reason': refundReason.trim(),
+        if (riderId != null) 'rider_id': riderId,
       }),
     ));
     if (res.statusCode != 200) _raise(res);
     return AppOrder.fromJson(jsonDecode(res.body) as Map<String, dynamic>);
+  }
+
+  Future<List<RiderOption>> getRiders() async {
+    final res = await _timed(http.get(_uri('/api/riders'), headers: _headers));
+    if (res.statusCode != 200) _raise(res);
+    final body = jsonDecode(res.body) as Map<String, dynamic>;
+    return ((body['riders'] ?? []) as List).map((e) => RiderOption.fromJson(e as Map<String, dynamic>)).toList();
   }
 
   /// Whether this business is currently accepting orders (open/paused switch).

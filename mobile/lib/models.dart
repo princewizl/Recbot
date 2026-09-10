@@ -187,6 +187,16 @@ class CatalogueItem {
       );
 }
 
+/// A business's saved delivery rider — just enough to populate a picker when
+/// pricing an order. Mirrors an entry in GET /api/riders.
+class RiderOption {
+  final int id;
+  final String name;
+  RiderOption({required this.id, required this.name});
+  factory RiderOption.fromJson(Map<String, dynamic> j) =>
+      RiderOption(id: j['id'] as int, name: (j['name'] ?? '').toString());
+}
+
 /// One business this affiliate referred, and what it's earned them so far.
 /// Mirrors an entry in GET /api/affiliate/summary's `referred_businesses`.
 class ReferredBusiness {
