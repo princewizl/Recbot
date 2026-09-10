@@ -6559,6 +6559,8 @@ def order_detail(request: Request, order_id: int) -> HTMLResponse:
         if not current_user or (current_user.role != "admin" and current_user.business_id != order.business_id):
             return RedirectResponse(url="/login", status_code=303)
         business = get_business(db, order.business_id)
+        riders = db.query(Rider).filter(Rider.business_id == order.business_id).order_by(Rider.name).all()
+        rider_options = "".join(f"<option value='{r.id}'>{escape(r.name)}</option>" for r in riders)
     finally:
         db.close()
 
@@ -6603,6 +6605,12 @@ def order_detail(request: Request, order_id: int) -> HTMLResponse:
             <p class="form-hint">Subtotal is N{subtotal}. Enter the delivery fee to send the customer their full total and your bank details.</p>
             <form method="post" action="/orders/{order.id}/delivery-fee">
               <input name="delivery_fee" type="number" min="0" placeholder="Delivery fee" required autofocus />
+              {f'''<label>Pay delivery fee to a rider? (optional)
+                <select name="rider_id">
+                  <option value="">No — keep it with my payout</option>
+                  {rider_options}
+                </select>
+              </label>''' if rider_options else ''}
               <label class="accept-terms">
                 <input type="checkbox" name="accept_terms" value="1" required />
                 <span>Pricing this order accepts it. Once the customer pays, refunds for it are
