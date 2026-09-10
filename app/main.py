@@ -89,6 +89,11 @@ class Business(Base):
     # 1 = accepting orders; 0 = paused (customers can't start new orders). This
     # is independent of scheduled opening hours (open_time/close_time).
     accepting_orders = Column(Integer, nullable=False, default=1)
+    # Affiliate program: which User (role="affiliate") referred this business, and
+    # when — referred_at anchors the one-year earning window and is stamped once,
+    # the first time a referrer is linked (never overwritten by later edits).
+    referred_by_user_id = Column(Integer, nullable=True)
+    referred_at = Column(DateTime, nullable=True)
 
 
 class Category(Base):
@@ -207,6 +212,19 @@ class Payment(Base):
     billing_cycle = Column(String(10), nullable=False, default="monthly")
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow)
+
+
+class AffiliatePayout(Base):
+    """A manual payout Collxct has already made to a referring affiliate. Rows are
+    only created after the transfer happens (this is a log, not a queue) — an
+    affiliate's outstanding balance is accrued earnings minus the sum of these."""
+    __tablename__ = "affiliate_payouts"
+    id = Column(Integer, primary_key=True, index=True)
+    affiliate_user_id = Column(Integer, nullable=False)
+    amount = Column(Integer, nullable=False)
+    note = Column(Text, nullable=True)
+    paid_at = Column(DateTime, default=datetime.utcnow)
+    logged_by_user_id = Column(Integer, nullable=True)
 
 
 class DeviceToken(Base):
@@ -352,6 +370,10 @@ def ensure_schema() -> None:
             conn.execute(text("ALTER TABLE orders ADD COLUMN refund_amount INTEGER NOT NULL DEFAULT 0"))
         if not has_column("orders", "refund_reason"):
             conn.execute(text("ALTER TABLE orders ADD COLUMN refund_reason TEXT"))
+        if not has_column("businesses", "referred_by_user_id"):
+            conn.execute(text("ALTER TABLE businesses ADD COLUMN referred_by_user_id INTEGER"))
+        if not has_column("businesses", "referred_at"):
+            conn.execute(text("ALTER TABLE businesses ADD COLUMN referred_at DATETIME"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_orders_business_id ON orders(business_id)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_orders_status ON orders(status)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_orders_customer_phone ON orders(customer_phone)"))
@@ -696,6 +718,7 @@ def make_nav(current_user: Optional[User] = None) -> str:
                 ("/admin/messages", "Leads", "leads"),
                 ("/admin/users", "Users", "users"),
                 ("/register", "Create Owners", "userplus"),
+                ("/admin/affiliates", "Affiliates", "users"),
             ]))
         is_business_owner = current_user.role in {"business_owner", "business-owner", "owner"}
         if is_business_owner:
@@ -1864,12 +1887,51 @@ PLATFORM_SERVICE_CHARGE_NGN = int(os.getenv("PLATFORM_SERVICE_CHARGE_NGN", "50")
 PLATFORM_COMMISSION_PERCENT = float(os.getenv("PLATFORM_COMMISSION_PERCENT", "5.0"))
 PLATFORM_PER_MESSAGE_NGN = int(os.getenv("PLATFORM_PER_MESSAGE_NGN", "10"))
 PLATFORM_MAX_BILLED_MESSAGES = int(os.getenv("PLATFORM_MAX_BILLED_MESSAGES", "25"))
+# Affiliate program: a referrer earns this fraction of Collxct's own commission
+# (not of the order total) on every order a business they referred makes, for
+# one year from when the referral was linked (Business.referred_at).
+AFFILIATE_SHARE_PERCENT = float(os.getenv("AFFILIATE_SHARE_PERCENT", "5.0"))
+AFFILIATE_WINDOW_DAYS = 365
+
+
+def order_commission(order: Order) -> int:
+    return round((order.total or 0) * PLATFORM_COMMISSION_PERCENT / 100)
 
 
 def order_platform_charge(order: Order) -> int:
     billed = min(order.message_count or 0, PLATFORM_MAX_BILLED_MESSAGES)
-    commission = round((order.total or 0) * PLATFORM_COMMISSION_PERCENT / 100)
-    return PLATFORM_SERVICE_CHARGE_NGN + commission + PLATFORM_PER_MESSAGE_NGN * billed
+    return PLATFORM_SERVICE_CHARGE_NGN + order_commission(order) + PLATFORM_PER_MESSAGE_NGN * billed
+
+
+def affiliate_share(order: Order) -> int:
+    """The referring affiliate's cut of Collxct's commission on this order."""
+    return round(order_commission(order) * AFFILIATE_SHARE_PERCENT / 100)
+
+
+def business_affiliate_accrual(db, business: Business) -> int:
+    """Commission-share earned so far from this one referred business, within
+    its one-year referral window. 0 if it has no referrer linked."""
+    if not business.referred_at:
+        return 0
+    window_end = business.referred_at + timedelta(days=AFFILIATE_WINDOW_DAYS)
+    orders = db.query(Order).filter(
+        Order.business_id == business.id,
+        Order.created_at <= window_end,
+        Order.status.in_(PAID_STATUSES),
+    ).all()
+    return sum(affiliate_share(o) for o in orders)
+
+
+def affiliate_accrued_balance(db, affiliate_user_id: int) -> int:
+    """Total commission-share earned so far by this affiliate, across every
+    business they referred, within each business's one-year referral window."""
+    businesses = db.query(Business).filter(Business.referred_by_user_id == affiliate_user_id).all()
+    return sum(business_affiliate_accrual(db, b) for b in businesses)
+
+
+def affiliate_paid_out(db, affiliate_user_id: int) -> int:
+    rows = db.query(AffiliatePayout).filter(AffiliatePayout.affiliate_user_id == affiliate_user_id).all()
+    return sum(p.amount for p in rows)
 
 
 # Orders in these statuses are blocked on the business/admin, not the customer.
@@ -4054,18 +4116,22 @@ def register_page(request: Request) -> HTMLResponse:
       </div>
       <div class="card auth-form">
         <h2>New owner setup</h2>
-        <p class="form-hint">Provide an email, password, and optionally attach an existing business.</p>
+        <p class="form-hint">Provide an email, password, and optionally attach an existing business. Affiliates don't attach to a business — link the businesses they referred from each business's own page instead.</p>
         <form method="post" action="/register">
           <div class="form-row">
             <input name="email" type="email" placeholder="Owner email" required />
             <input name="password" type="password" placeholder="Temporary password" required />
+            <select name="role">
+              <option value="business_owner">Business owner</option>
+              <option value="affiliate">Affiliate / referrer</option>
+            </select>
             <select name="business_id">
               <option value="">No business yet (attach later)</option>
               {business_options}
             </select>
           </div>
           <div class="form-actions">
-            <button type="submit">Create owner</button>
+            <button type="submit">Create account</button>
           </div>
         </form>
       </div>
@@ -4079,18 +4145,23 @@ def register_submit(
     request: Request,
     email: str = Form(...),
     password: str = Form(...),
+    role: str = Form(default="business_owner"),
     business_id: Optional[int] = Form(default=None),
 ) -> RedirectResponse:
     current_user = get_current_user(request)
     if not current_user or current_user.role != "admin":
         return RedirectResponse(url="/login", status_code=303)
+    if role not in {"business_owner", "affiliate"}:
+        role = "business_owner"
+    if role == "affiliate":
+        business_id = None  # affiliates aren't attached to a single business
 
     db = SessionLocal()
     try:
         if get_user_by_email(db, email):
             return RedirectResponse(url="/register", status_code=303)
         password_hash = hash_password(password)
-        user = User(email=email, password_hash=password_hash, role="business_owner", business_id=business_id)
+        user = User(email=email, password_hash=password_hash, role=role, business_id=business_id)
         db.add(user)
         db.commit()
     finally:
@@ -4280,7 +4351,7 @@ def edit_user_page(request: Request, user_id: int) -> HTMLResponse:
         businesses = db.query(Business).order_by(Business.name).all()
         role_options = "".join(
             f"<option value='{role}' {'selected' if user.role == role else ''}>{role.replace('_', ' ').title()}</option>"
-            for role in ("admin", "business_owner", "customer")
+            for role in ("admin", "business_owner", "affiliate", "customer")
         )
         reset_2fa_html = (
             "<label><input type='checkbox' name='reset_2fa' /> Reset two-factor authentication (user has 2FA enabled — use this if they lost their device)</label>"
@@ -4332,6 +4403,114 @@ def update_user(
     finally:
         db.close()
     return RedirectResponse(url="/admin/users", status_code=303)
+
+
+@app.get("/admin/affiliates", response_class=HTMLResponse)
+def admin_affiliates(request: Request) -> HTMLResponse:
+    current_user = get_current_user(request)
+    if not current_user or current_user.role != "admin":
+        return RedirectResponse(url="/login", status_code=303)
+    db = SessionLocal()
+    try:
+        affiliates = db.query(User).filter(User.role == "affiliate").order_by(User.email).all()
+        rows = ""
+        for affiliate in affiliates:
+            referred_count = db.query(Business).filter(Business.referred_by_user_id == affiliate.id).count()
+            accrued = affiliate_accrued_balance(db, affiliate.id)
+            paid = affiliate_paid_out(db, affiliate.id)
+            rows += (
+                f"<tr><td><a href='/admin/affiliates/{affiliate.id}'>{escape(affiliate.email)}</a></td>"
+                f"<td>{referred_count}</td><td>₦{accrued:,}</td><td>₦{paid:,}</td><td>₦{accrued - paid:,}</td></tr>"
+            )
+        body = f"""
+        <div class="card">
+          <h3>Create an affiliate</h3>
+          <p class="form-hint">Affiliate accounts are created from <a href="/register">Create Owners</a> — pick "Affiliate / referrer" as the role there.</p>
+        </div>
+        <div class="card">
+          <h3>Affiliates</h3>
+          <div class="table-wrap"><table><tr><th>Email</th><th>Businesses referred</th><th>Accrued</th><th>Paid out</th><th>Outstanding</th></tr>{rows}</table></div>
+        </div>
+        """
+    finally:
+        db.close()
+    return render_page("Affiliates", body, nav_html=make_nav(current_user), subtitle="Referral earnings and manual payouts")
+
+
+@app.get("/admin/affiliates/{user_id}", response_class=HTMLResponse)
+def admin_affiliate_detail(request: Request, user_id: int) -> HTMLResponse:
+    current_user = get_current_user(request)
+    if not current_user or current_user.role != "admin":
+        return RedirectResponse(url="/login", status_code=303)
+    db = SessionLocal()
+    try:
+        affiliate = db.query(User).filter(User.id == user_id, User.role == "affiliate").one_or_none()
+        if not affiliate:
+            return render_page("Affiliate Not Found", "<p>Affiliate not found.</p>", nav_html=make_nav(current_user))
+        businesses = db.query(Business).filter(Business.referred_by_user_id == affiliate.id).order_by(Business.name).all()
+        business_rows = "".join(
+            f"<tr><td>{escape(b.name)}</td><td>{b.referred_at.strftime('%Y-%m-%d') if b.referred_at else ''}</td>"
+            f"<td>₦{business_affiliate_accrual(db, b):,}</td></tr>"
+            for b in businesses
+        )
+        accrued = affiliate_accrued_balance(db, affiliate.id)
+        paid = affiliate_paid_out(db, affiliate.id)
+        payouts = db.query(AffiliatePayout).filter(AffiliatePayout.affiliate_user_id == affiliate.id).order_by(AffiliatePayout.paid_at.desc()).all()
+        payout_rows = "".join(
+            f"<tr><td>{p.paid_at.strftime('%Y-%m-%d') if p.paid_at else ''}</td><td>₦{p.amount:,}</td><td>{escape(p.note or '')}</td></tr>"
+            for p in payouts
+        )
+        body = f"""
+        <div class="card">
+          <h3>{escape(affiliate.email)}</h3>
+          <p><strong>Accrued:</strong> ₦{accrued:,} &nbsp; <strong>Paid out:</strong> ₦{paid:,} &nbsp; <strong>Outstanding:</strong> ₦{accrued - paid:,}</p>
+        </div>
+        <div class="card">
+          <h3>Referred businesses</h3>
+          <div class="table-wrap"><table><tr><th>Business</th><th>Referred on</th><th>Accrued from this business</th></tr>{business_rows}</table></div>
+        </div>
+        <div class="card">
+          <h3>Log a payout</h3>
+          <p class="form-hint">Only add this after you've actually sent the money — this is a record, not a request.</p>
+          <form method="post" action="/admin/affiliates/{affiliate.id}/payouts">
+            <input name="amount" type="number" min="1" placeholder="Amount (₦)" required />
+            <input name="note" placeholder="Note (e.g. bank transfer reference)" />
+            <button type="submit">Log payout</button>
+          </form>
+        </div>
+        <div class="card">
+          <h3>Payout history</h3>
+          <div class="table-wrap"><table><tr><th>Date</th><th>Amount</th><th>Note</th></tr>{payout_rows}</table></div>
+        </div>
+        """
+    finally:
+        db.close()
+    return render_page(f"Affiliate — {affiliate.email}", body, nav_html=make_nav(current_user), subtitle="Referral earnings and payout log")
+
+
+@app.post("/admin/affiliates/{user_id}/payouts")
+def log_affiliate_payout(
+    request: Request,
+    user_id: int,
+    amount: int = Form(...),
+    note: str = Form(default=""),
+) -> RedirectResponse:
+    current_user = get_current_user(request)
+    if not current_user or current_user.role != "admin":
+        return RedirectResponse(url="/login", status_code=303)
+    if amount > 0:
+        db = SessionLocal()
+        try:
+            affiliate = db.query(User).filter(User.id == user_id, User.role == "affiliate").one_or_none()
+            if affiliate:
+                db.add(AffiliatePayout(
+                    affiliate_user_id=affiliate.id, amount=amount,
+                    note=note.strip() or None, logged_by_user_id=current_user.id,
+                ))
+                db.commit()
+        finally:
+            db.close()
+    return RedirectResponse(url=f"/admin/affiliates/{user_id}", status_code=303)
 
 
 @app.get("/admin/businesses", response_class=HTMLResponse)
@@ -4414,6 +4593,7 @@ def business_detail(request: Request, business_id: int, notice: Optional[str] = 
         context = get_business_context(business_id)
         business = context["business"]
         plans = db.query(Plan).order_by(Plan.price_ngn).all()
+        affiliates = db.query(User).filter(User.role == "affiliate").order_by(User.email).all() if current_user.role == "admin" else []
     finally:
         db.close()
     if not business:
@@ -4467,6 +4647,26 @@ def business_detail(request: Request, business_id: int, notice: Optional[str] = 
         "missing": "",
     }
     key_badge = key_badges.get(key_mode, "")
+    affiliate_field = ""
+    if current_user.role == "admin":
+        affiliate_options = "".join(
+            f"<option value='{a.id}' {'selected' if business.referred_by_user_id == a.id else ''}>{escape(a.email)}</option>"
+            for a in affiliates
+        )
+        referred_note = (
+            f"<p class='form-hint'>Referred on {business.referred_at.strftime('%Y-%m-%d')}. Changing the affiliate here does not reset the one-year earning window.</p>"
+            if business.referred_at else ""
+        )
+        affiliate_field = f"""
+            <hr style="border:none;border-top:1px solid var(--border);margin:14px 0;" />
+            <label>Referred by (affiliate)
+              <select name="referred_by_user_id">
+                <option value="">No referrer</option>
+                {affiliate_options}
+              </select>
+            </label>
+            {referred_note}
+        """
     if business.delivery_autocalc:
         if business.geo_lat is not None and business.geo_lng is not None:
             geo_hint = f"📍 Pickup point located ({business.geo_lat:.4f}, {business.geo_lng:.4f})."
@@ -4520,6 +4720,7 @@ def business_detail(request: Request, business_id: int, notice: Optional[str] = 
             <input name="delivery_base_fee" type="number" min="0" value="{business.delivery_base_fee or 0}" placeholder="Base delivery fee (₦)" />
             <input name="delivery_per_km" type="number" min="0" value="{business.delivery_per_km or 0}" placeholder="Additional fee per km (₦)" />
             <p class="form-hint">Fee = base + per-km × distance, rounded to the nearest ₦50 — like dispatch apps price rides (e.g. ₦1,000 base + ₦200/km). {geo_hint} If a customer's address can't be found on the map, the order falls back to you setting the fee manually, with a note on the alert.</p>
+            {affiliate_field}
           </div>
           <div class="form-actions">
             <button type="submit">Save</button>
@@ -4699,6 +4900,7 @@ def update_business(
     location_address: str = Form(default=""),
     delivery_base_fee: int = Form(default=0),
     delivery_per_km: int = Form(default=0),
+    referred_by_user_id: Optional[int] = Form(default=None),
 ) -> RedirectResponse:
     current_user = get_current_user(request)
     if not current_user or (current_user.role != "admin" and current_user.business_id != business_id):
@@ -4743,6 +4945,16 @@ def update_business(
                 coords = geocode_address(new_location) if new_location else None
                 business.geo_lat = coords[0] if coords else None
                 business.geo_lng = coords[1] if coords else None
+            if current_user.role == "admin":
+                affiliate = db.query(User).filter(User.id == referred_by_user_id, User.role == "affiliate").one_or_none() if referred_by_user_id else None
+                new_referrer_id = affiliate.id if affiliate else None
+                if new_referrer_id != business.referred_by_user_id:
+                    business.referred_by_user_id = new_referrer_id
+                    # Stamp once, on first link, and never clear it — even if the
+                    # referrer is later removed, past orders already accrued
+                    # earnings for them and that history shouldn't be erased.
+                    if new_referrer_id and not business.referred_at:
+                        business.referred_at = datetime.utcnow()
             db.commit()
     finally:
         db.close()
@@ -5561,7 +5773,7 @@ async def api_login(request: Request) -> JSONResponse:
         if not user or not verify_password(password, user.password_hash):
             record_login_failure(throttle_key)
             return JSONResponse({"error": "invalid_credentials"}, status_code=401)
-        if user.role not in STAFF_ROLES:
+        if user.role not in STAFF_ROLES and user.role != "affiliate":
             return JSONResponse({"error": "forbidden"}, status_code=403)
         if user.totp_enabled and user.totp_secret:
             if not code or not verify_totp(user.totp_secret, code):
@@ -5817,6 +6029,46 @@ def _api_owner(request: Request) -> Optional[User]:
     if not user or user.role not in STAFF_ROLES or not user.business_id:
         return None
     return user
+
+
+def _api_affiliate(request: Request) -> Optional[User]:
+    user = get_current_user(request)
+    if not user or user.role != "affiliate":
+        return None
+    return user
+
+
+@app.get("/api/affiliate/summary")
+def api_affiliate_summary(request: Request) -> JSONResponse:
+    user = _api_affiliate(request)
+    if not user:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    db = SessionLocal()
+    try:
+        businesses = db.query(Business).filter(Business.referred_by_user_id == user.id).order_by(Business.name).all()
+        referred = [
+            {
+                "business_name": b.name,
+                "referred_at": b.referred_at.isoformat() if b.referred_at else None,
+                "accrued": business_affiliate_accrual(db, b),
+            }
+            for b in businesses
+        ]
+        accrued_total = sum(r["accrued"] for r in referred)
+        paid_total = affiliate_paid_out(db, user.id)
+        payouts = db.query(AffiliatePayout).filter(AffiliatePayout.affiliate_user_id == user.id).order_by(AffiliatePayout.paid_at.desc()).all()
+        return JSONResponse({
+            "accrued_total": accrued_total,
+            "paid_total": paid_total,
+            "outstanding": accrued_total - paid_total,
+            "referred_businesses": referred,
+            "payouts": [
+                {"amount": p.amount, "note": p.note, "paid_at": p.paid_at.isoformat() if p.paid_at else None}
+                for p in payouts
+            ],
+        })
+    finally:
+        db.close()
 
 
 @app.get("/api/stats")

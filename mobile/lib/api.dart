@@ -283,6 +283,14 @@ class ApiClient {
     if (res.statusCode != 200) _raise(res);
   }
 
+  // --- Affiliate ---
+
+  Future<AffiliateSummary> getAffiliateSummary() async {
+    final res = await _timed(http.get(_uri('/api/affiliate/summary'), headers: _headers));
+    if (res.statusCode != 200) _raise(res);
+    return AffiliateSummary.fromJson(jsonDecode(res.body) as Map<String, dynamic>);
+  }
+
   Future<void> unregisterDevice(String fcmToken) async {
     await _timed(http.delete(
       _uri('/api/devices'),

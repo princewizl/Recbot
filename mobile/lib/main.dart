@@ -1,8 +1,8 @@
 import 'package:firebase_core/firebase_core.dart';
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
 import 'push.dart';
+import 'screens/affiliate_dashboard_screen.dart';
 import 'screens/login_screen.dart';
 import 'screens/main_shell.dart';
 import 'screens/order_detail_screen.dart';
@@ -25,7 +25,8 @@ Future<void> main() async {
   }
 
   final token = await Storage.readToken();
-  runApp(RecbotApp(loggedIn: token != null));
+  final role = token != null ? await Storage.readRole() : null;
+  runApp(RecbotApp(loggedIn: token != null, role: role));
 }
 
 void _openOrder(int orderId) {
@@ -36,16 +37,21 @@ void _openOrder(int orderId) {
 
 class RecbotApp extends StatelessWidget {
   final bool loggedIn;
-  const RecbotApp({super.key, required this.loggedIn});
+  final String? role;
+  const RecbotApp({super.key, required this.loggedIn, this.role});
 
   @override
   Widget build(BuildContext context) {
+    Widget home = const LoginScreen();
+    if (loggedIn) {
+      home = role == 'affiliate' ? const AffiliateDashboardScreen() : const MainShell();
+    }
     return MaterialApp(
       title: 'Recbot',
       navigatorKey: navigatorKey,
       debugShowCheckedModeBanner: false,
       theme: buildAppTheme(),
-      home: loggedIn ? const MainShell() : const LoginScreen(),
+      home: home,
     );
   }
 }

@@ -186,3 +186,63 @@ class CatalogueItem {
         imageUrl: j['image_url'] as String?,
       );
 }
+
+/// One business this affiliate referred, and what it's earned them so far.
+/// Mirrors an entry in GET /api/affiliate/summary's `referred_businesses`.
+class ReferredBusiness {
+  final String businessName;
+  final String? referredAt;
+  final int accrued;
+
+  ReferredBusiness({required this.businessName, required this.referredAt, required this.accrued});
+
+  factory ReferredBusiness.fromJson(Map<String, dynamic> j) => ReferredBusiness(
+        businessName: (j['business_name'] ?? '').toString(),
+        referredAt: j['referred_at'] as String?,
+        accrued: (j['accrued'] ?? 0) as int,
+      );
+}
+
+/// One payout Collxct has already logged as paid to this affiliate.
+class AffiliatePayoutEntry {
+  final int amount;
+  final String? note;
+  final String? paidAt;
+
+  AffiliatePayoutEntry({required this.amount, required this.note, required this.paidAt});
+
+  factory AffiliatePayoutEntry.fromJson(Map<String, dynamic> j) => AffiliatePayoutEntry(
+        amount: (j['amount'] ?? 0) as int,
+        note: j['note'] as String?,
+        paidAt: j['paid_at'] as String?,
+      );
+}
+
+/// An affiliate's own earnings snapshot. Mirrors GET /api/affiliate/summary.
+class AffiliateSummary {
+  final int accruedTotal;
+  final int paidTotal;
+  final int outstanding;
+  final List<ReferredBusiness> referredBusinesses;
+  final List<AffiliatePayoutEntry> payouts;
+
+  AffiliateSummary({
+    required this.accruedTotal,
+    required this.paidTotal,
+    required this.outstanding,
+    required this.referredBusinesses,
+    required this.payouts,
+  });
+
+  factory AffiliateSummary.fromJson(Map<String, dynamic> j) => AffiliateSummary(
+        accruedTotal: (j['accrued_total'] ?? 0) as int,
+        paidTotal: (j['paid_total'] ?? 0) as int,
+        outstanding: (j['outstanding'] ?? 0) as int,
+        referredBusinesses: ((j['referred_businesses'] ?? []) as List)
+            .map((e) => ReferredBusiness.fromJson(e as Map<String, dynamic>))
+            .toList(),
+        payouts: ((j['payouts'] ?? []) as List)
+            .map((e) => AffiliatePayoutEntry.fromJson(e as Map<String, dynamic>))
+            .toList(),
+      );
+}

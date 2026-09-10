@@ -1044,3 +1044,126 @@ def test_refund_breakdown_keeps_messaging_fee_and_reverses_commission(tmp_path, 
     assert breakdown["retained_service_fee"] == expected_fee
     assert breakdown["customer_paid"] == 5000 + expected_fee
     assert breakdown["commission_reversed"] == round(5000 * main.PLATFORM_COMMISSION_PERCENT / 100)
+
+
+def test_affiliate_share_math(tmp_path, monkeypatch):
+    db_path = tmp_path / "test_bot.db"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
+
+    import app.main as main
+    importlib.reload(main)
+
+    order = main.Order(business_id=1, customer_phone="2348012345678", items_json="[]",
+                       total=5000, delivery_fee=0, address="x", status="paid")
+    commission = main.order_commission(order)
+    assert commission == round(5000 * main.PLATFORM_COMMISSION_PERCENT / 100)
+    assert main.affiliate_share(order) == round(commission * main.AFFILIATE_SHARE_PERCENT / 100)
+    # order_platform_charge must still agree with order_commission (single source of truth).
+    assert main.order_platform_charge(order) == main.PLATFORM_SERVICE_CHARGE_NGN + commission
+
+
+def test_affiliate_accrual_respects_window_and_refunds(tmp_path, monkeypatch):
+    db_path = tmp_path / "test_bot.db"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
+
+    import app.main as main
+    importlib.reload(main)
+
+    db = main.SessionLocal()
+    business = db.query(main.Business).first()
+    affiliate = main.User(email="ref@example.com", password_hash="x", role="affiliate")
+    db.add(affiliate)
+    db.commit()
+    db.refresh(affiliate)
+    referred_at = main.datetime.utcnow() - main.timedelta(days=100)
+    business.referred_by_user_id = affiliate.id
+    business.referred_at = referred_at
+    db.commit()
+
+    # In-window, paid: counts.
+    in_window = main.Order(business_id=business.id, customer_phone="1", items_json="[]",
+                           total=10000, address="x", status="paid",
+                           created_at=referred_at + main.timedelta(days=10))
+    # Past the one-year window: does not count even though paid.
+    expired = main.Order(business_id=business.id, customer_phone="1", items_json="[]",
+                         total=10000, address="x", status="paid",
+                         created_at=referred_at + main.timedelta(days=400))
+    # Refunded: does not count even though within the window.
+    refunded = main.Order(business_id=business.id, customer_phone="1", items_json="[]",
+                          total=10000, address="x", status="refunded",
+                          created_at=referred_at + main.timedelta(days=20))
+    db.add_all([in_window, expired, refunded])
+    db.commit()
+
+    balance = main.affiliate_accrued_balance(db, affiliate.id)
+    assert balance == main.affiliate_share(in_window)
+    assert balance > 0
+    db.close()
+
+
+def test_affiliate_admin_flow_and_mobile_login(tmp_path, monkeypatch):
+    db_path = tmp_path / "test_bot.db"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
+    monkeypatch.setenv("ADMIN_EMAIL", "admin@example.com")
+    monkeypatch.setenv("ADMIN_PASSWORD", "test-admin-password")
+
+    import app.main as main
+    importlib.reload(main)
+    client = TestClient(main.app)
+
+    login = client.post("/login", data={"email": "admin@example.com", "password": "test-admin-password"},
+                       follow_redirects=False)
+    assert login.status_code == 303
+
+    reg = client.post("/register", data={
+        "email": "ref@example.com", "password": "affpass123", "role": "affiliate",
+    }, follow_redirects=False)
+    assert reg.status_code == 303
+
+    db = main.SessionLocal()
+    business = db.query(main.Business).first()
+    affiliate = db.query(main.User).filter(main.User.email == "ref@example.com").one()
+    assert affiliate.role == "affiliate"
+    db.close()
+
+    link = client.post(f"/admin/businesses/{business.id}", data={
+        "name": business.name, "whatsapp_number": business.whatsapp_number,
+        "referred_by_user_id": str(affiliate.id),
+    }, follow_redirects=False)
+    assert link.status_code == 303
+
+    db = main.SessionLocal()
+    business = db.query(main.Business).filter(main.Business.id == business.id).one()
+    assert business.referred_by_user_id == affiliate.id
+    assert business.referred_at is not None
+    business_name = business.name  # captured before commit() expires the instance
+    order = main.Order(business_id=business.id, customer_phone="1", items_json="[]",
+                       total=8000, address="x", status="paid")
+    db.add(order)
+    db.commit()
+    expected_share = main.affiliate_share(order)
+    db.close()
+
+    # Separate client for the affiliate's mobile-app session — a real phone never
+    # carries the admin's browser cookie, and get_current_user() prefers a cookie
+    # over the bearer header when both are present, so reusing `client` here would
+    # silently authenticate as the admin instead of the affiliate.
+    mobile = TestClient(main.app)
+    aff_login = mobile.post("/api/login", json={"email": "ref@example.com", "password": "affpass123"})
+    assert aff_login.status_code == 200
+    token = aff_login.json()["token"]
+    assert aff_login.json()["user"]["role"] == "affiliate"
+
+    summary = mobile.get("/api/affiliate/summary", headers={"Authorization": f"Bearer {token}"}).json()
+    assert summary["accrued_total"] == expected_share
+    assert summary["outstanding"] == expected_share
+    assert summary["referred_businesses"][0]["business_name"] == business_name
+
+    payout = client.post(f"/admin/affiliates/{affiliate.id}/payouts",
+                         data={"amount": str(expected_share), "note": "bank transfer"},
+                         follow_redirects=False)
+    assert payout.status_code == 303
+
+    summary_after = mobile.get("/api/affiliate/summary", headers={"Authorization": f"Bearer {token}"}).json()
+    assert summary_after["paid_total"] == expected_share
+    assert summary_after["outstanding"] == 0

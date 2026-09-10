@@ -6,6 +6,7 @@ import '../config.dart';
 import '../push.dart';
 import '../storage.dart';
 import '../theme.dart';
+import 'affiliate_dashboard_screen.dart';
 import 'main_shell.dart';
 
 class LoginScreen extends StatefulWidget {
@@ -47,9 +48,11 @@ class _LoginScreenState extends State<LoginScreen> {
       );
       await Storage.writeToken(result.token);
       await Storage.writeProfile(email: _email.text.trim(), businessName: result.businessName);
+      await Storage.writeRole(result.role);
       await PushService.registerWithBackend();
       if (!mounted) return;
-      Navigator.of(context).pushReplacement(MaterialPageRoute(builder: (_) => const MainShell()));
+      final home = result.role == 'affiliate' ? const AffiliateDashboardScreen() : const MainShell();
+      Navigator.of(context).pushReplacement(MaterialPageRoute(builder: (_) => home));
     } on ApiException catch (e) {
       setState(() {
         if (e.code == 'totp_required') {

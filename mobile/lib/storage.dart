@@ -11,6 +11,7 @@ class Storage {
   static const _kBaseUrl = 'base_url';
   static const _kEmail = 'email';
   static const _kBusinessName = 'business_name';
+  static const _kRole = 'role';
 
   static Future<String?> readToken() => _storage.read(key: _kToken);
 
@@ -38,5 +39,15 @@ class Storage {
   static Future<String?> readBusinessName() async {
     final prefs = await SharedPreferences.getInstance();
     return prefs.getString(_kBusinessName);
+  }
+
+  static Future<void> writeRole(String role) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_kRole, role);
+  }
+
+  static Future<String?> readRole() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getString(_kRole);
   }
 }
