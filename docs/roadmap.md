@@ -37,7 +37,7 @@ WhatsApp — visual products need visuals.
 ## 2. Platform fee per transaction (instead of / alongside subscriptions)
 
 **✅ Shipped (2026-07-24) — commission-only, subscriptions removed.** Model:
-**2% per order + ₦10/message** (cost recovery; capped at 25 msgs) — see
+**5% per order + ₦10/message** (cost recovery; capped at 25 msgs) — see
 `order_platform_charge()` and `PLATFORM_COMMISSION_PERCENT` / `PLATFORM_PER_MESSAGE_NGN`.
 Per-order messages are counted through the conversation and snapshotted onto the
 order. Payments moved to **one central Paystack account with a subaccount per

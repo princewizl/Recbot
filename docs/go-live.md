@@ -98,7 +98,7 @@ Full detail: **[../mobile/IOS-SETUP.md](../mobile/IOS-SETUP.md)**. Summary:
       2023 and GDPR-style rights for global users.
 - [ ] Nigeria: if you process personal data at scale, check whether you must file
       with the **Nigeria Data Protection Commission (NDPC)** and/or appoint a DPO.
-- [ ] Payment terms accurate: **2% per-order commission (business) + per-order
+- [ ] Payment terms accurate: **5% per-order commission (business) + per-order
       service fee (customer)**, no subscriptions; optional one-time setup fee.
 - [ ] Account & data deletion path in place (email now; in-app recommended).
 - [ ] Store listings link the Privacy Policy URL (required by both stores).

@@ -11,7 +11,7 @@
 > No `:8443`, no sidecar container.
 >
 > **Authoritative, up-to-date steps: [push-deploy.md](push-deploy.md).** Pricing is
-> now **commission-only** — 2% per order (business) + a small per-order service fee
+> now **commission-only** — 5% per order (business) + a small per-order service fee
 > (customer), no subscriptions. Everything below describes the *original*
 > sidecar-on-8443 approach and is kept for history only.
 

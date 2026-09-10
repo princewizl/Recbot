@@ -1861,7 +1861,7 @@ def send_item_catalogue_images(business: Business, to_number: str, items: List[M
 # + per-message   WhatsApp cost recovery (a pure % is underwater on small orders).
 # Billed messages are capped so a long/fumbled chat can't run the fee away.
 PLATFORM_SERVICE_CHARGE_NGN = int(os.getenv("PLATFORM_SERVICE_CHARGE_NGN", "50"))
-PLATFORM_COMMISSION_PERCENT = float(os.getenv("PLATFORM_COMMISSION_PERCENT", "2.0"))
+PLATFORM_COMMISSION_PERCENT = float(os.getenv("PLATFORM_COMMISSION_PERCENT", "5.0"))
 PLATFORM_PER_MESSAGE_NGN = int(os.getenv("PLATFORM_PER_MESSAGE_NGN", "10"))
 PLATFORM_MAX_BILLED_MESSAGES = int(os.getenv("PLATFORM_MAX_BILLED_MESSAGES", "25"))
 
