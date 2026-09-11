@@ -3361,11 +3361,13 @@ def homepage(request: Request, sent: Optional[str] = None) -> HTMLResponse:
         <meta property="og:url" content="{LANDING_URL}" />
         <meta property="og:title" content="Collxct — Turn WhatsApp into your ordering machine" />
         <meta property="og:description" content="A WhatsApp ordering bot for Nigerian businesses: menus, carts, automatic delivery fees, instant Paystack payment links, and a live dashboard. No subscriptions — pay only when you sell." />
-        <meta property="og:image" content="{LANDING_URL}/static/img/logo-white.svg" />
-        <meta name="twitter:card" content="summary" />
+        <meta property="og:image" content="{LANDING_URL}/static/img/og-image.png" />
+        <meta property="og:image:width" content="1200" />
+        <meta property="og:image:height" content="630" />
+        <meta name="twitter:card" content="summary_large_image" />
         <meta name="twitter:title" content="Collxct — Turn WhatsApp into your ordering machine" />
         <meta name="twitter:description" content="A WhatsApp ordering bot for Nigerian businesses: menus, carts, automatic delivery fees, instant Paystack payment links, and a live dashboard." />
-        <meta name="twitter:image" content="{LANDING_URL}/static/img/logo-white.svg" />
+        <meta name="twitter:image" content="{LANDING_URL}/static/img/og-image.png" />
         <script type="application/ld+json">
         {{
           "@context": "https://schema.org",
@@ -3380,6 +3382,19 @@ def homepage(request: Request, sent: Optional[str] = None) -> HTMLResponse:
             "priceCurrency": "NGN",
             "description": "Commission-only pricing — {PLATFORM_COMMISSION_PERCENT:g}% per order, no subscriptions."
           }}
+        }}
+        </script>
+        <script type="application/ld+json">
+        {{
+          "@context": "https://schema.org",
+          "@type": "Organization",
+          "name": "Collxct",
+          "url": "{LANDING_URL}",
+          "logo": "{LANDING_URL}/static/img/logo-white.svg",
+          "sameAs": [
+            "https://www.tiktok.com/@collxct.ng",
+            "https://www.instagram.com/collxct.ng"
+          ]
         }}
         </script>
         <link rel="icon" type="image/svg+xml" href="/static/img/logo-icon.svg" />
@@ -3693,7 +3708,7 @@ def homepage(request: Request, sent: Optional[str] = None) -> HTMLResponse:
             <img src="/static/img/logo-white.svg" alt="Collxct" />
             <span>WhatsApp ordering, done properly.</span>
             <span class="spacer"></span>
-            <span><a href="mailto:{CONTACT_EMAIL}" style="color:var(--muted);">{CONTACT_EMAIL}</a> · <a href="/login" style="color:var(--muted);">Portal login</a> · <a href="/terms" style="color:var(--muted);">Terms</a> · <a href="/privacy" style="color:var(--muted);">Privacy</a> · <a href="/refunds" style="color:var(--muted);">Refunds</a></span>
+            <span><a href="mailto:{CONTACT_EMAIL}" style="color:var(--muted);">{CONTACT_EMAIL}</a> · <a href="https://www.tiktok.com/@collxct.ng" target="_blank" rel="noopener noreferrer" style="color:var(--muted);">TikTok</a> · <a href="https://www.instagram.com/collxct.ng" target="_blank" rel="noopener noreferrer" style="color:var(--muted);">Instagram</a> · <a href="/login" style="color:var(--muted);">Portal login</a> · <a href="/terms" style="color:var(--muted);">Terms</a> · <a href="/privacy" style="color:var(--muted);">Privacy</a> · <a href="/refunds" style="color:var(--muted);">Refunds</a></span>
           </div>
         </footer>
       </body>
