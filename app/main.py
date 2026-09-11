@@ -18,7 +18,7 @@ from typing import Dict, List, Optional
 import httpx
 import qrcode
 from fastapi import FastAPI, File, Form, Request, Response, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import Column, DateTime, Float, Integer, String, Text, UniqueConstraint, create_engine, text
 from sqlalchemy.orm import declarative_base, sessionmaker
@@ -584,6 +584,25 @@ def send_password_reset_email(user: "User") -> None:
     )
 
 
+def send_affiliate_welcome_email(user: "User", temp_password: str) -> None:
+    """No-op-safe when SMTP is unconfigured, same as send_password_reset_email."""
+    send_email(
+        "You're set up as a Recbot affiliate",
+        (
+            "You've been added as a Recbot affiliate — you'll earn a share of Collxct's "
+            "commission on every order from businesses referred to you, for one year from "
+            "when each referral is linked.\n\n"
+            "Sign in from the Recbot mobile app (not the web portal — affiliate accounts "
+            "use the app) with:\n"
+            f"  Email: {user.email}\n"
+            f"  Temporary password: {temp_password}\n\n"
+            "Change your password after signing in — from the app's login screen, use "
+            "\"Forgot password\" to set your own."
+        ),
+        user.email,
+    )
+
+
 # Login brute-force throttle: max attempts per (ip, email) inside the window.
 # In-memory is fine for a single-process deployment.
 LOGIN_MAX_ATTEMPTS = 5
@@ -978,6 +997,47 @@ window.addEventListener("DOMContentLoaded", function () {
 """
 
 
+# Auto-fills an "account holder name" field from Paystack's account-resolve
+# API once a bank + account number are both entered. A no-op on any page that
+# doesn't have these element ids, so it's safe to load globally (see head).
+BANK_RESOLVE_SCRIPT = """
+<script>
+function wireBankResolve(bankId, numId, nameId) {
+  var bankEl = document.getElementById(bankId);
+  var numEl = document.getElementById(numId);
+  var nameEl = document.getElementById(nameId);
+  if (!bankEl || !numEl || !nameEl) return;
+  var hint = document.createElement('div');
+  hint.style.cssText = 'font-size:12px;margin:-6px 0 6px;';
+  numEl.insertAdjacentElement('afterend', hint);
+  function tryResolve() {
+    var num = numEl.value.trim();
+    var code = bankEl.value.trim();
+    hint.textContent = '';
+    if (num.length < 10 || !code) return;
+    hint.textContent = 'Checking…';
+    hint.style.color = 'var(--muted)';
+    fetch('/api/resolve-account?account_number=' + encodeURIComponent(num) + '&bank_code=' + encodeURIComponent(code), { credentials: 'same-origin' })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (data) {
+        if (data && data.account_name) {
+          nameEl.value = data.account_name;
+          hint.textContent = '✓ ' + data.account_name;
+          hint.style.color = 'var(--success)';
+        } else {
+          hint.textContent = "Couldn't verify — check the account number and bank.";
+          hint.style.color = 'var(--danger)';
+        }
+      })
+      .catch(function () { hint.textContent = ''; });
+  }
+  numEl.addEventListener('blur', tryResolve);
+  bankEl.addEventListener('change', tryResolve);
+}
+</script>
+"""
+
+
 PORTAL_SCRIPTS = """
 <script>
 (function () {
@@ -1020,6 +1080,7 @@ def render_page(title: str, body: str, nav_html: Optional[str] = None,
         <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
         <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js" defer></script>
         {CHART_THEME_SCRIPT}
+        {BANK_RESOLVE_SCRIPT}
         <style>
                     /* ============================================================
                        Collxct portal — design system
@@ -1531,6 +1592,28 @@ def list_paystack_banks() -> "List[tuple]":
     except Exception as exc:
         logger.error("paystack bank list failed: %s", exc)
     return _paystack_banks_cache["banks"]  # type: ignore[return-value]
+
+
+def resolve_paystack_account_name(account_number: str, bank_code: str) -> Optional[str]:
+    """The account holder's name for a given account number + bank, per Paystack's
+    NUBAN resolution (free, NG/GH only). None on any failure — caller falls back
+    to letting the person type the name in by hand."""
+    key = central_paystack_key()
+    if not key or not account_number or not bank_code:
+        return None
+    try:
+        resp = httpx.get(
+            "https://api.paystack.co/bank/resolve",
+            params={"account_number": account_number, "bank_code": bank_code},
+            headers={"Authorization": f"Bearer {key}"}, timeout=15.0,
+        )
+        data = resp.json()
+        if data.get("status"):
+            return data["data"]["account_name"]
+        logger.info("paystack account resolve rejected: %s", data.get("message"))
+    except Exception as exc:
+        logger.error("paystack account resolve failed: %s", exc)
+    return None
 
 
 def ensure_paystack_subaccount(business: Business) -> Optional[str]:
@@ -3170,16 +3253,44 @@ def download_android(request: Request):
     return FileResponse(APK_PATH, media_type="application/vnd.android.package-archive", filename="recbot.apk")
 
 
+@app.get("/robots.txt", response_class=PlainTextResponse)
+def robots_txt() -> PlainTextResponse:
+    base = os.getenv("PUBLIC_BASE_URL", "").rstrip("/") or "https://recbot.collxct.ng"
+    return PlainTextResponse(
+        "User-agent: *\n"
+        "Disallow: /admin/\n"
+        "Disallow: /business/\n"
+        "Disallow: /owner/\n"
+        "Disallow: /orders/\n"
+        "Disallow: /api/\n"
+        "Disallow: /register\n"
+        "Disallow: /login\n"
+        "Disallow: /account/\n"
+        f"Sitemap: {base}/sitemap.xml\n"
+    )
+
+
+@app.get("/sitemap.xml")
+def sitemap_xml() -> Response:
+    base = os.getenv("PUBLIC_BASE_URL", "").rstrip("/") or "https://recbot.collxct.ng"
+    pages = ["/", "/terms", "/privacy", "/refunds"]
+    urls = "".join(f"<url><loc>{base}{p}</loc></url>" for p in pages)
+    xml = f'<?xml version="1.0" encoding="UTF-8"?><urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">{urls}</urlset>'
+    return Response(content=xml, media_type="application/xml")
+
+
 @app.get("/", response_class=HTMLResponse)
 def homepage(request: Request, sent: Optional[str] = None) -> HTMLResponse:
+    LANDING_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/") or "https://recbot.collxct.ng"
     apk_button = (
         '<a class="lp-btn" href="/download/android">📲 Get the Android app</a>'
         if os.path.exists(APK_PATH) else ""
     )
     promo_video_html = (
-        '<div style="max-width:720px;margin:36px auto 0;border-radius:18px;overflow:hidden;'
+        '<div style="max-width:640px;max-height:70vh;margin:36px auto 0;border-radius:18px;overflow:hidden;'
         'border:1px solid var(--border);box-shadow:0 20px 50px rgba(0,0,0,.4);">'
-        '<video controls preload="metadata" style="width:100%;display:block;background:#000;" '
+        '<video controls preload="metadata" '
+        'style="width:100%;height:100%;max-height:70vh;display:block;background:#000;object-fit:contain;" '
         'src="/media/promo-video.mp4"></video></div>'
         if os.path.exists(PROMO_VIDEO_PATH) else ""
     )
@@ -3242,6 +3353,35 @@ def homepage(request: Request, sent: Optional[str] = None) -> HTMLResponse:
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <title>Collxct — Turn WhatsApp into your ordering machine</title>
         <meta name="description" content="Collxct gives Nigerian businesses a WhatsApp ordering bot: menus, carts, automatic delivery fees, instant Paystack payment links, and a live dashboard." />
+        <link rel="canonical" href="{LANDING_URL}" />
+        <meta name="robots" content="index, follow" />
+        <meta property="og:type" content="website" />
+        <meta property="og:site_name" content="Collxct" />
+        <meta property="og:locale" content="en_NG" />
+        <meta property="og:url" content="{LANDING_URL}" />
+        <meta property="og:title" content="Collxct — Turn WhatsApp into your ordering machine" />
+        <meta property="og:description" content="A WhatsApp ordering bot for Nigerian businesses: menus, carts, automatic delivery fees, instant Paystack payment links, and a live dashboard. No subscriptions — pay only when you sell." />
+        <meta property="og:image" content="{LANDING_URL}/static/img/logo-white.svg" />
+        <meta name="twitter:card" content="summary" />
+        <meta name="twitter:title" content="Collxct — Turn WhatsApp into your ordering machine" />
+        <meta name="twitter:description" content="A WhatsApp ordering bot for Nigerian businesses: menus, carts, automatic delivery fees, instant Paystack payment links, and a live dashboard." />
+        <meta name="twitter:image" content="{LANDING_URL}/static/img/logo-white.svg" />
+        <script type="application/ld+json">
+        {{
+          "@context": "https://schema.org",
+          "@type": "SoftwareApplication",
+          "name": "Collxct",
+          "applicationCategory": "BusinessApplication",
+          "operatingSystem": "Web, Android",
+          "description": "A WhatsApp ordering bot for Nigerian businesses: menus, carts, automatic delivery fees, instant Paystack payment links, and a live dashboard.",
+          "url": "{LANDING_URL}",
+          "offers": {{
+            "@type": "Offer",
+            "priceCurrency": "NGN",
+            "description": "Commission-only pricing — {PLATFORM_COMMISSION_PERCENT:g}% per order, no subscriptions."
+          }}
+        }}
+        </script>
         <link rel="icon" type="image/svg+xml" href="/static/img/logo-icon.svg" />
         <link rel="preconnect" href="https://fonts.googleapis.com" />
         <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
@@ -3396,7 +3536,7 @@ def homepage(request: Request, sent: Optional[str] = None) -> HTMLResponse:
                 {apk_button}
               </div>
               <div class="hero-facts">
-                <div><strong>24–48h</strong><span>to build &amp; test your bot</span></div>
+                <div><strong>24–120h</strong><span>to build &amp; test your bot</span></div>
                 <div><strong>24/7</strong><span>orders taken for you</span></div>
                 <div><strong>0 missed</strong><span>orders — loud alerts</span></div>
               </div>
@@ -3440,7 +3580,7 @@ def homepage(request: Request, sent: Optional[str] = None) -> HTMLResponse:
           <div class="wrap">
             <div class="sec-head">
               <h2>Live in four simple steps</h2>
-              <p>We build and test your bot in 24–48 hours. You can run on a trial while your own WhatsApp number and payments finish approval — exactly what that needs is below.</p>
+              <p>We build and test your bot in 24–120 hours. You can run on a trial while your own WhatsApp number and payments finish approval — exactly what that needs is below.</p>
             </div>
             <div class="steps">
               <div class="step"><h3>Tell us about your business</h3><p>Your WhatsApp number, menu with prices, opening hours, and how you want to get paid.</p></div>
@@ -3485,7 +3625,7 @@ def homepage(request: Request, sent: Optional[str] = None) -> HTMLResponse:
           <div class="wrap">
             <div class="sec-head">
               <h2>Going fully live: what you'll need</h2>
-              <p>Your bot is built and tested in 24–48 hours. Two things carry their own approval timelines — here's exactly what they need, and what to do if you don't have them yet.</p>
+              <p>Your bot is built and tested in 24–120 hours. Two things carry their own approval timelines — here's exactly what they need, and what to do if you don't have them yet.</p>
             </div>
             <div class="doc-grid">
               <div class="doc-card">
@@ -4027,6 +4167,16 @@ def login_submit(request: Request, email: str = Form(...), password: str = Form(
                 user.password_hash = hash_password(password)
                 db.commit()
             _login_attempts.pop(throttle_key, None)
+            if user.role == "affiliate":
+                body = """
+                <div class="card">
+                  <h3>Affiliate accounts use the mobile app</h3>
+                  <p class="form-hint">Your earnings dashboard lives in the Recbot mobile app, not this web portal.
+                  Download it from the landing page and sign in there with the same email and password.</p>
+                  <div class="form-actions"><a class="btn" href="/">Back home</a></div>
+                </div>
+                """
+                return render_page("Use the mobile app", body, nav_html=make_nav(None))
             if user.totp_enabled and user.totp_secret:
                 is_https = request.headers.get("x-forwarded-proto", request.url.scheme) == "https"
                 redirect = RedirectResponse(url="/login/verify", status_code=303)
@@ -4287,6 +4437,8 @@ def register_submit(
         user = User(email=email, password_hash=password_hash, role=role, business_id=business_id)
         db.add(user)
         db.commit()
+        if role == "affiliate":
+            send_affiliate_welcome_email(user, password)
     finally:
         db.close()
     return RedirectResponse(url="/admin/users", status_code=303)
@@ -4761,22 +4913,22 @@ def business_detail(request: Request, business_id: int, notice: Optional[str] = 
             for name, code in banks
         )
         bank_field = (
-            "<label>Payout bank <select name='bank_code'>"
+            "<label>Payout bank <select name='bank_code' id='biz_bank_code'>"
             f"<option value=''>Select your bank…</option>{bank_options}</select></label>"
         )
     else:
         bank_field = (
-            f"<input name='bank_code' value='{escape(business.bank_code or '')}' "
+            f"<input name='bank_code' id='biz_bank_code' value='{escape(business.bank_code or '')}' "
             "placeholder='Bank code for payouts (e.g. 058 = GTBank, 044 = Access)' />"
         )
     if banks:
         rider_bank_field = (
-            "<label>Rider's bank <select name='bank_code'>"
+            "<label>Rider's bank <select name='bank_code' id='rider_bank_code'>"
             f"<option value=''>Select bank…</option>{bank_options}</select></label>"
         )
     else:
         rider_bank_field = (
-            "<input name='bank_code' placeholder='Bank code (e.g. 058 = GTBank, 044 = Access)' />"
+            "<input name='bank_code' id='rider_bank_code' placeholder='Bank code (e.g. 058 = GTBank, 044 = Access)' />"
         )
     key_mode = paystack_key_mode(business.paystack_secret_key)
     key_badges = {
@@ -4838,8 +4990,8 @@ def business_detail(request: Request, business_id: int, notice: Optional[str] = 
             <input name="whatsapp_number" value="{escape(business.whatsapp_number)}" required />
             <input name="owner_notify_number" value="{escape(business.owner_notify_number or '')}" placeholder="Owner notify number (for order alerts)" />
             <input name="bank_name" value="{escape(business.bank_name or '')}" placeholder="Bank name (for customer payments)" />
-            <input name="bank_account_number" value="{escape(business.bank_account_number or '')}" placeholder="Bank account number" />
-            <input name="bank_account_name" value="{escape(business.bank_account_name or '')}" placeholder="Account holder name" />
+            <input name="bank_account_number" id="biz_bank_account_number" value="{escape(business.bank_account_number or '')}" placeholder="Bank account number" />
+            <input name="bank_account_name" id="biz_bank_account_name" value="{escape(business.bank_account_name or '')}" placeholder="Account holder name" />
             <label>Opens at <input name="open_time" type="time" value="{escape(business.open_time or '')}" /></label>
             <label>Closes at <input name="close_time" type="time" value="{escape(business.close_time or '')}" /></label>
             <p class="form-hint">Leave both times empty to take orders 24/7. Outside these hours the bot politely tells customers you're closed (status checks and pending payments still work). Overnight windows like 18:00–02:00 are supported. Times are in your local time (WAT).</p>
@@ -4915,8 +5067,8 @@ def business_detail(request: Request, business_id: int, notice: Optional[str] = 
           <input name="name" placeholder="Rider name" required />
           <input name="phone" placeholder="Phone" />
           <input name="bank_name" placeholder="Bank name (for display)" />
-          <input name="bank_account_number" placeholder="Account number" />
-          <input name="bank_account_name" placeholder="Account holder name" />
+          <input name="bank_account_number" id="rider_bank_account_number" placeholder="Account number" />
+          <input name="bank_account_name" id="rider_bank_account_name" placeholder="Account holder name" />
           {rider_bank_field}
           <div class="form-actions">
             <button type="submit">Add Rider</button>
@@ -4959,6 +5111,10 @@ def business_detail(request: Request, business_id: int, notice: Optional[str] = 
         <div class="table-wrap"><table><tr><th>Order</th><th>Customer</th><th>Address</th><th>Total</th><th>Age</th><th>Status</th></tr>{orders_rows}</table></div>
       </div>
     </div>
+    <script>
+      wireBankResolve('biz_bank_code', 'biz_bank_account_number', 'biz_bank_account_name');
+      wireBankResolve('rider_bank_code', 'rider_bank_account_number', 'rider_bank_account_name');
+    </script>
     """
     return render_page(f"{business.name} Configuration", body, nav_html=make_nav(get_current_user(request)), subtitle="Menu, branches, hours and payment setup")
 
@@ -5164,10 +5320,10 @@ def edit_rider_page(request: Request, business_id: int, rider_id: int) -> HTMLRe
                 f"<option value='{escape(code)}' {'selected' if rider.bank_code == code else ''}>{escape(name)}</option>"
                 for name, code in banks
             )
-            bank_field = f"<label>Bank <select name='bank_code'><option value=''>Select bank…</option>{bank_options}</select></label>"
+            bank_field = f"<label>Bank <select name='bank_code' id='rider_bank_code'><option value=''>Select bank…</option>{bank_options}</select></label>"
         else:
             rider_bank_code = rider.bank_code or ""
-            bank_field = f"<input name='bank_code' value='{escape(rider_bank_code)}' placeholder='Bank code' />"
+            bank_field = f"<input name='bank_code' id='rider_bank_code' value='{escape(rider_bank_code)}' placeholder='Bank code' />"
         link_note = (
             "<p class='form-hint'>✅ Payout account linked.</p>" if rider.paystack_subaccount_code
             else "<p class='form-hint' style='color:var(--danger, #e11d48);'>⚠️ Not linked yet — check the bank details and save again.</p>"
@@ -5180,8 +5336,8 @@ def edit_rider_page(request: Request, business_id: int, rider_id: int) -> HTMLRe
             <input name="name" value="{escape(rider.name)}" required />
             <input name="phone" value="{escape(rider.phone or '')}" placeholder="Phone" />
             <input name="bank_name" value="{escape(rider.bank_name or '')}" placeholder="Bank name (for display)" />
-            <input name="bank_account_number" value="{escape(rider.bank_account_number or '')}" placeholder="Account number" />
-            <input name="bank_account_name" value="{escape(rider.bank_account_name or '')}" placeholder="Account holder name" />
+            <input name="bank_account_number" id="rider_bank_account_number" value="{escape(rider.bank_account_number or '')}" placeholder="Account number" />
+            <input name="bank_account_name" id="rider_bank_account_name" value="{escape(rider.bank_account_name or '')}" placeholder="Account holder name" />
             {bank_field}
             <div class="form-actions">
               <button type="submit">Save</button>
@@ -5189,6 +5345,7 @@ def edit_rider_page(request: Request, business_id: int, rider_id: int) -> HTMLRe
             </div>
           </form>
         </div>
+        <script>wireBankResolve('rider_bank_code', 'rider_bank_account_number', 'rider_bank_account_name');</script>
         """
     finally:
         db.close()
@@ -5945,6 +6102,21 @@ ORDER_STATUS_LABELS = {
     "cancelled": "Cancelled",
     "refunded": "Refunded",
 }
+
+
+@app.get("/api/resolve-account")
+def api_resolve_account(request: Request, account_number: str = "", bank_code: str = "") -> JSONResponse:
+    """Looks up the account holder's name for a bank+account-number pair, so
+    business/rider bank-detail forms can auto-fill it instead of trusting a
+    typed-in name — used from the same web session (cookie-authenticated),
+    not the mobile bearer-token API."""
+    current_user = get_current_user(request)
+    if not current_user or current_user.role not in STAFF_ROLES:
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    name = resolve_paystack_account_name(account_number.strip(), bank_code.strip())
+    if not name:
+        return JSONResponse({"error": "not_found"}, status_code=404)
+    return JSONResponse({"account_name": name})
 
 
 @app.get("/api/action-required")

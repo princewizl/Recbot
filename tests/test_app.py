@@ -1257,3 +1257,54 @@ def test_admin_creates_rider(tmp_path, monkeypatch):
     assert rider.name == "Chidi"
     assert rider.bank_account_number == "0123456789"
     db.close()
+
+
+def test_affiliate_cannot_login_via_web(tmp_path, monkeypatch):
+    db_path = tmp_path / "test_bot.db"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
+
+    import app.main as main
+    importlib.reload(main)
+    client = TestClient(main.app)
+
+    db = main.SessionLocal()
+    db.add(main.User(email="ref2@example.com", password_hash=main.hash_password("affpass123"), role="affiliate"))
+    db.commit()
+    db.close()
+
+    resp = client.post("/login", data={"email": "ref2@example.com", "password": "affpass123"}, follow_redirects=False)
+    # No redirect to a dashboard and no session cookie — just an informational page.
+    assert resp.status_code == 200
+    assert "mobile app" in resp.text.lower()
+    assert "auth_token" not in resp.cookies
+
+
+def test_robots_and_sitemap(tmp_path, monkeypatch):
+    db_path = tmp_path / "test_bot.db"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
+
+    import app.main as main
+    importlib.reload(main)
+    client = TestClient(main.app)
+
+    robots = client.get("/robots.txt")
+    assert robots.status_code == 200
+    assert "Sitemap:" in robots.text
+    assert "Disallow: /admin/" in robots.text
+
+    sitemap = client.get("/sitemap.xml")
+    assert sitemap.status_code == 200
+    assert "<urlset" in sitemap.text
+    assert "<loc>" in sitemap.text
+
+
+def test_resolve_account_requires_staff_auth(tmp_path, monkeypatch):
+    db_path = tmp_path / "test_bot.db"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
+
+    import app.main as main
+    importlib.reload(main)
+    client = TestClient(main.app)
+
+    resp = client.get("/api/resolve-account?account_number=0123456789&bank_code=058")
+    assert resp.status_code == 401
