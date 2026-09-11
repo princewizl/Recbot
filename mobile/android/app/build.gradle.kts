@@ -36,6 +36,14 @@ android {
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
+        // Build for arm64 only — the build machine has just 3GB RAM, and
+        // compiling for every ABI (armeabi-v7a/x86/x86_64 too) is what pushed
+        // Gradle over its heap limit. arm64-v8a covers virtually all real
+        // Android phones from the last ~8 years; revisit if x86 support (e.g.
+        // emulators) is ever needed.
+        ndk {
+            abiFilters += "arm64-v8a"
+        }
     }
 
     signingConfigs {
