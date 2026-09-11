@@ -3253,6 +3253,13 @@ def download_android(request: Request):
     return FileResponse(APK_PATH, media_type="application/vnd.android.package-archive", filename="recbot.apk")
 
 
+@app.get("/google9590980ea76ba24d.html", response_class=PlainTextResponse)
+def google_site_verification() -> PlainTextResponse:
+    """Google Search Console ownership verification (HTML file method). Safe to
+    remove once verified — Google only re-checks this if verification is lost."""
+    return PlainTextResponse("google-site-verification: google9590980ea76ba24d.html")
+
+
 @app.get("/robots.txt", response_class=PlainTextResponse)
 def robots_txt() -> PlainTextResponse:
     base = os.getenv("PUBLIC_BASE_URL", "").rstrip("/") or "https://recbot.collxct.ng"
