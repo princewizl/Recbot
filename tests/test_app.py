@@ -135,6 +135,7 @@ def test_action_required_alerts_for_new_order(tmp_path, monkeypatch):
     client.post("/webhook", json={"from": phone, "message": "hi"})
     client.post("/webhook", json={"from": phone, "message": "1"})
     client.post("/webhook", json={"from": phone, "message": "1"})
+    client.post("/webhook", json={"from": phone, "message": "1"})  # quantity
     client.post("/webhook", json={"from": phone, "message": "checkout"})
     client.post("/webhook", json={"from": phone, "message": "Ada"})
     response = client.post("/webhook", json={"from": phone, "message": "12 Marina Road, Lagos"})
@@ -315,6 +316,7 @@ def test_auto_delivery_fee_and_paystack_flow(tmp_path, monkeypatch):
     client.post("/webhook", json={"from": phone, "message": "hi"})
     client.post("/webhook", json={"from": phone, "message": "1"})
     client.post("/webhook", json={"from": phone, "message": "1"})
+    client.post("/webhook", json={"from": phone, "message": "1"})  # quantity
     client.post("/webhook", json={"from": phone, "message": "checkout"})
     client.post("/webhook", json={"from": phone, "message": "Ada"})
     reply = client.post("/webhook", json={"from": phone, "message": "12 Marina Road, Lagos"}).json()["reply"]
@@ -458,6 +460,7 @@ def _place_demo_order(client):
     client.post("/webhook", json={"from": phone, "message": "hi"})
     client.post("/webhook", json={"from": phone, "message": "1"})
     client.post("/webhook", json={"from": phone, "message": "1"})
+    client.post("/webhook", json={"from": phone, "message": "1"})  # quantity
     client.post("/webhook", json={"from": phone, "message": "checkout"})
     client.post("/webhook", json={"from": phone, "message": "Ada"})
     client.post("/webhook", json={"from": phone, "message": "12 Marina Road, Lagos"})
@@ -696,7 +699,7 @@ def test_message_count_and_platform_charge(tmp_path, monkeypatch):
     client = TestClient(main.app)
 
     phone = "2348012345678"
-    for msg in ["hi", "1", "1", "checkout", "Ada", "12 Marina Road, Lagos"]:
+    for msg in ["hi", "1", "1", "1", "checkout", "Ada", "12 Marina Road, Lagos"]:
         client.post("/webhook", json={"from": phone, "message": msg})
 
     db = main.SessionLocal()
@@ -768,18 +771,72 @@ def test_see_and_remove_cart_commands(tmp_path, monkeypatch):
 
     # "see 1" previews the item without adding it to the cart.
     seen = client.post("/webhook", json={"from": phone, "message": "see 1"}).json()["reply"].lower()
-    assert "add it to your cart" in seen
+    assert "would you like to add it" in seen
     empty = client.post("/webhook", json={"from": phone, "message": "cart"}).json()["reply"].lower()
     assert "empty" in empty
 
     # Add an item, then the cart shows numbered lines with a remove hint.
     client.post("/webhook", json={"from": phone, "message": "1"})
+    client.post("/webhook", json={"from": phone, "message": "1"})  # quantity
     cart = client.post("/webhook", json={"from": phone, "message": "cart"}).json()["reply"].lower()
     assert "remove 1" in cart
 
     # "remove 1" empties the cart.
     removed = client.post("/webhook", json={"from": phone, "message": "remove 1"}).json()["reply"].lower()
     assert "removed" in removed and "empty" in removed
+
+
+def test_quantity_picker_and_remove_quantity_menu(tmp_path, monkeypatch):
+    db_path = tmp_path / "test_bot.db"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
+
+    import app.main as main
+    importlib.reload(main)
+    client = TestClient(main.app)
+
+    phone = "2348012345678"
+    client.post("/webhook", json={"from": phone, "message": "hi"})
+    client.post("/webhook", json={"from": phone, "message": "1"})  # open a category
+
+    # Selecting an item asks how many, rather than adding one immediately.
+    qty_prompt = client.post("/webhook", json={"from": phone, "message": "1"}).json()["reply"]
+    assert "how many" in qty_prompt.lower()
+
+    # A number outside 1-99, or non-digit text, re-prompts instead of crashing.
+    bad = client.post("/webhook", json={"from": phone, "message": "banana"}).json()["reply"]
+    assert "how many" in bad.lower() or "type the number" in bad.lower()
+
+    # Any positive quantity is accepted directly (no forced "5 = more" round trip).
+    added = client.post("/webhook", json={"from": phone, "message": "3"}).json()["reply"]
+    assert "3" in added and "jollof rice" in added.lower()
+
+    cart = client.post("/webhook", json={"from": phone, "message": "cart"}).json()["reply"]
+    assert "3 x jollof rice" in cart.lower()
+
+    # Selecting the same item again merges into the existing cart line.
+    client.post("/webhook", json={"from": phone, "message": "1"})
+    client.post("/webhook", json={"from": phone, "message": "2"})
+    cart = client.post("/webhook", json={"from": phone, "message": "cart"}).json()["reply"]
+    assert "5 x jollof rice" in cart.lower()
+
+    # Removing from a cart line with qty > 1 asks how much to remove first.
+    submenu = client.post("/webhook", json={"from": phone, "message": "remove 1"}).json()["reply"]
+    assert "remove 1" in submenu.lower() and "remove all 5" in submenu.lower() and "keep" in submenu.lower()
+
+    # "3" (keep them) leaves the cart untouched.
+    kept = client.post("/webhook", json={"from": phone, "message": "3"}).json()["reply"]
+    assert "5 x jollof rice" in kept.lower()
+
+    # "1" (remove one) drops the quantity by exactly one.
+    reduced = client.post("/webhook", json={"from": phone, "message": "remove 1"}).json()["reply"]
+    assert "remove all 5" in reduced.lower()
+    after_one = client.post("/webhook", json={"from": phone, "message": "1"}).json()["reply"]
+    assert "4 x jollof rice" in after_one.lower()
+
+    # "2" (remove all) empties that line entirely.
+    client.post("/webhook", json={"from": phone, "message": "remove 1"})
+    emptied = client.post("/webhook", json={"from": phone, "message": "2"}).json()["reply"]
+    assert "empty" in emptied.lower()
 
 
 def test_catalogue_and_business_config_api(tmp_path, monkeypatch):
@@ -1382,6 +1439,7 @@ def test_pickup_order_skips_address_and_still_needs_acceptance(tmp_path, monkeyp
     client.post("/webhook", json={"from": phone, "message": "hi"})
     client.post("/webhook", json={"from": phone, "message": "1"})
     client.post("/webhook", json={"from": phone, "message": "1"})
+    client.post("/webhook", json={"from": phone, "message": "1"})  # quantity
     client.post("/webhook", json={"from": phone, "message": "checkout"})
     reply = client.post("/webhook", json={"from": phone, "message": "Bola"}).json()["reply"]
     assert "delivery" in reply.lower() and "pickup" in reply.lower()
@@ -1427,6 +1485,7 @@ def test_delivery_still_default_when_business_has_not_opted_into_pickup(tmp_path
     client.post("/webhook", json={"from": phone, "message": "hi"})
     client.post("/webhook", json={"from": phone, "message": "1"})
     client.post("/webhook", json={"from": phone, "message": "1"})
+    client.post("/webhook", json={"from": phone, "message": "1"})  # quantity
     client.post("/webhook", json={"from": phone, "message": "checkout"})
     reply = client.post("/webhook", json={"from": phone, "message": "Chidi"}).json()["reply"]
     assert "delivery address" in reply.lower()

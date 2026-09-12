@@ -144,6 +144,11 @@ class Conversation(Base):
     # Running count of WhatsApp messages in the current order's conversation
     # (reset to 0 when an order is placed); snapshotted onto the order for billing.
     message_count = Column(Integer, nullable=False, default=0)
+    # MenuItem id awaiting a quantity reply (CONV_QUANTITY), and cart position
+    # (1-based) awaiting a remove-quantity choice (CONV_REMOVE_QTY). Both are
+    # transient — cleared as soon as their stage resolves.
+    pending_item_id = Column(Integer, nullable=True)
+    pending_cart_index = Column(Integer, nullable=True)
 
 
 class Order(Base):
@@ -413,6 +418,10 @@ def ensure_schema() -> None:
             conn.execute(text("ALTER TABLE orders ADD COLUMN fulfillment_type VARCHAR(20) NOT NULL DEFAULT 'delivery'"))
         if not has_column("businesses", "offers_pickup"):
             conn.execute(text("ALTER TABLE businesses ADD COLUMN offers_pickup INTEGER NOT NULL DEFAULT 0"))
+        if not has_column("conversations", "pending_item_id"):
+            conn.execute(text("ALTER TABLE conversations ADD COLUMN pending_item_id INTEGER"))
+        if not has_column("conversations", "pending_cart_index"):
+            conn.execute(text("ALTER TABLE conversations ADD COLUMN pending_cart_index INTEGER"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_orders_business_id ON orders(business_id)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_orders_status ON orders(status)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_orders_customer_phone ON orders(customer_phone)"))
@@ -423,11 +432,11 @@ def ensure_schema() -> None:
                 "id INTEGER PRIMARY KEY, phone_number VARCHAR(50) NOT NULL, business_id INTEGER NOT NULL, "
                 "branch_id INTEGER, category_id INTEGER, stage VARCHAR(50) NOT NULL DEFAULT 'new', "
                 "cart_json TEXT DEFAULT '[]', customer_name VARCHAR(255), address TEXT, updated_at DATETIME, "
-                "message_count INTEGER NOT NULL DEFAULT 0)"
+                "message_count INTEGER NOT NULL DEFAULT 0, pending_item_id INTEGER, pending_cart_index INTEGER)"
             ))
             conn.execute(text(
-                "INSERT INTO conversations_new (id, phone_number, business_id, branch_id, category_id, stage, cart_json, address, updated_at) "
-                "SELECT id, phone_number, business_id, branch_id, category_id, stage, cart_json, address, updated_at FROM conversations"
+                "INSERT INTO conversations_new (id, phone_number, business_id, branch_id, category_id, stage, cart_json, customer_name, address, updated_at, message_count) "
+                "SELECT id, phone_number, business_id, branch_id, category_id, stage, cart_json, customer_name, address, updated_at, message_count FROM conversations"
             ))
             conn.execute(text("DROP TABLE conversations"))
             conn.execute(text("ALTER TABLE conversations_new RENAME TO conversations"))
@@ -2095,6 +2104,8 @@ seed_data()
 CONV_NEW = "new"
 CONV_CATEGORY = "await_category"
 CONV_ITEM = "await_item"
+CONV_QUANTITY = "await_quantity"
+CONV_REMOVE_QTY = "await_remove_qty"
 CONV_NAME = "await_name"
 CONV_FULFILLMENT = "await_fulfillment"
 CONV_ADDRESS = "await_address"
@@ -2114,7 +2125,7 @@ PAYMENT_CLAIM_TOKENS = ("paid", "transfer", "sent", "receipt", "confirm", "done"
 PAYMENT_INFO_TOKENS = ("how much", "account", "bank", "details", "total", "amount")
 ACTIVE_ORDER_STATUSES = {"awaiting_delivery_fee", "awaiting_payment", "payment_claimed", "paid", "out_for_delivery"}
 STALE_CONVERSATION_AFTER = timedelta(hours=24)
-STALE_RESET_STAGES = {CONV_CATEGORY, CONV_ITEM, CONV_NAME, CONV_FULFILLMENT, CONV_ADDRESS}
+STALE_RESET_STAGES = {CONV_CATEGORY, CONV_ITEM, CONV_QUANTITY, CONV_REMOVE_QTY, CONV_NAME, CONV_FULFILLMENT, CONV_ADDRESS}
 
 
 def normalize_whatsapp_number(value: Optional[str]) -> str:
@@ -2819,6 +2830,8 @@ def build_help_reply(conversation: Conversation) -> str:
     step_lines = {
         CONV_CATEGORY: "Right now, reply a category number to browse. 👍",
         CONV_ITEM: "Right now, reply an item number to add it to your cart.",
+        CONV_QUANTITY: "Right now, reply with how many you'd like.",
+        CONV_REMOVE_QTY: "Right now, reply 1, 2 or 3 to choose what to remove.",
         CONV_NAME: "Right now, reply with the name for your order.",
         CONV_FULFILLMENT: "Right now, reply 1 for delivery or 2 for pickup.",
         CONV_ADDRESS: "Right now, reply with your delivery address.",
@@ -2900,6 +2913,8 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
         conversation.stage = CONV_NEW
         conversation.cart_json = "[]"
         conversation.category_id = None
+        conversation.pending_item_id = None
+        conversation.pending_cart_index = None
 
     conversation.updated_at = datetime.utcnow()
     db.commit()
@@ -2934,11 +2949,13 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
         db.commit()
         return build_help_reply(conversation)
 
-    if normalized in CANCEL_WORDS and conversation.stage in {CONV_CATEGORY, CONV_ITEM, CONV_NAME, CONV_ADDRESS}:
+    if normalized in CANCEL_WORDS and conversation.stage in {CONV_CATEGORY, CONV_ITEM, CONV_QUANTITY, CONV_REMOVE_QTY, CONV_NAME, CONV_ADDRESS}:
         conversation.cart_json = "[]"
         conversation.customer_name = None
         conversation.address = None
         conversation.category_id = None
+        conversation.pending_item_id = None
+        conversation.pending_cart_index = None
         conversation.stage = CONV_NEW
         db.commit()
         return "No problem — cancelled. 👋\nReply 'hi' whenever you'd like to start again."
@@ -2966,6 +2983,11 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
             "👋 Welcome back!\n\n" + format_order_status_reply(active_order, business)
             + "\n\nReply 'menu' to start a new order instead."
         )
+
+    if normalized in GREETING_WORDS and conversation.stage in {CONV_QUANTITY, CONV_REMOVE_QTY}:
+        conversation.stage = CONV_ITEM
+        conversation.pending_item_id = None
+        conversation.pending_cart_index = None
 
     if normalized in GREETING_WORDS and cart and conversation.stage in {CONV_CATEGORY, CONV_ITEM, CONV_NAME, CONV_FULFILLMENT, CONV_ADDRESS}:
         resume_prompts = {
@@ -3073,9 +3095,9 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
                 send_whatsapp_message(conversation.phone_number, caption, from_number=business.whatsapp_number, media_url=url)
                 conversation.message_count = (conversation.message_count or 0) + 1
                 db.commit()
-                return f"👆 That's *{target.name}*. Reply *{n}* to add it to your cart, 'see' another number, or 'checkout'."
+                return f"👆 That's *{target.name}*. Would you like to add it? Reply *{n}* to add it, 'see' another number, or 'back' for other items."
             db.commit()
-            return f"{caption}\n\n(No photo for this one.) Reply *{n}* to add it to your cart."
+            return f"{caption}\n\n(No photo for this one.) Would you like to add it? Reply *{n}* to add it."
         # "Remove N" — take cart item N out of the cart.
         remove_match = re.match(r"^remove\s+(\d+)$", normalized)
         if remove_match:
@@ -3084,6 +3106,16 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
             n = int(remove_match.group(1))
             if n < 1 or n > len(cart):
                 return f"There's no item {n} in your cart. Reply 'cart' to see it."
+            entry = cart[n - 1]
+            qty = int(entry.get("qty", 1))
+            if qty > 1:
+                conversation.pending_cart_index = n
+                conversation.stage = CONV_REMOVE_QTY
+                db.commit()
+                return (
+                    f"You currently have *{qty} × {entry.get('name', 'item')}*.\n\nWhat would you like to remove?\n\n"
+                    f"1️⃣ Remove 1\n2️⃣ Remove all {qty}\n3️⃣ Keep them\n\n👉 Reply 1, 2 or 3."
+                )
             removed = cart.pop(n - 1)
             conversation.cart_json = json.dumps(cart)
             db.commit()
@@ -3097,15 +3129,88 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
                 return "I can only read text here 🙂\nPlease reply with a number:\n\n" + format_item_menu(items, category.name if category else "Menu")
             return "Sorry, I didn't understand that. " + format_item_menu(items, category.name if category else "Menu")
         item = items[index - 1]
+        conversation.pending_item_id = item.id
+        conversation.stage = CONV_QUANTITY
+        db.commit()
+        return (
+            f"🍽️ *{item.name}* — ₦{item.price} each\n\nHow many would you like?\n\n"
+            "1️⃣ 1\n2️⃣ 2\n3️⃣ 3\n4️⃣ 4\n5️⃣ 5 or more — just type the number\n\n"
+            "👉 Reply with a number."
+        )
+
+    if conversation.stage == CONV_QUANTITY:
+        item = db.query(MenuItem).filter(MenuItem.id == conversation.pending_item_id).one_or_none()
+        if not item or not item.is_active:
+            conversation.stage = CONV_ITEM
+            conversation.pending_item_id = None
+            db.commit()
+            items = active_items_for_category(db, business.id, conversation.category_id) if conversation.category_id else []
+            category = db.query(Category).filter(Category.id == conversation.category_id).one_or_none()
+            return "Sorry, that item is no longer available. " + format_item_menu(items, category.name if category else "Menu")
+        if normalized in BACK_WORDS:
+            conversation.stage = CONV_ITEM
+            conversation.pending_item_id = None
+            db.commit()
+            category = db.query(Category).filter(Category.id == conversation.category_id).one_or_none()
+            items = active_items_for_category(db, business.id, conversation.category_id) if conversation.category_id else []
+            return "No problem — " + format_item_menu(items, category.name if category else "Menu")
+        if normalized in CART_WORDS:
+            cart_view = (
+                f"🛒 *Your cart*\n{format_cart_lines(cart)}\n\n*Total:* ₦{cart_total(cart)}"
+                if cart else "Your cart is empty so far."
+            )
+            return f"{cart_view}\n\nHow many *{item.name}* would you like to add?"
+        qty_match = re.match(r"^\d+$", normalized)
+        if not qty_match or int(normalized) < 1 or int(normalized) > 99:
+            return f"👉 Please type the number of *{item.name}* you'd like — for example: 2"
+        qty = int(normalized)
         for entry in cart:
             if entry.get("item_id") == item.id:
-                entry["qty"] = int(entry.get("qty", 1)) + 1
+                entry["qty"] = int(entry.get("qty", 1)) + qty
                 break
         else:
-            cart.append({"item_id": item.id, "name": item.name, "description": item.description or "", "price": item.price, "qty": 1})
+            cart.append({"item_id": item.id, "name": item.name, "description": item.description or "", "price": item.price, "qty": qty})
         conversation.cart_json = json.dumps(cart)
+        conversation.stage = CONV_ITEM
+        conversation.pending_item_id = None
         db.commit()
-        return f"✅ Added *{item.name}* to your cart. Reply with another number to add more, 'see 2' to view an item, 'cart' to view your cart, or 'checkout' to place your order."
+        line_total = item.price * qty
+        return (
+            f"✅ Added *{qty} × {item.name}* — ₦{line_total}\n\n"
+            "Reply another number to add more, 'cart' to view your cart, or 'checkout' to place your order."
+        )
+
+    if conversation.stage == CONV_REMOVE_QTY:
+        n = conversation.pending_cart_index or 0
+        if n < 1 or n > len(cart):
+            conversation.stage = CONV_ITEM
+            conversation.pending_cart_index = None
+            db.commit()
+            return "That item isn't in your cart anymore. Reply 'cart' to see what's there."
+        entry = cart[n - 1]
+        qty = int(entry.get("qty", 1))
+        if normalized in {"1", "remove 1"}:
+            entry["qty"] = qty - 1
+            conversation.cart_json = json.dumps(cart)
+            conversation.stage = CONV_ITEM
+            conversation.pending_cart_index = None
+            db.commit()
+            return f"🗑️ Removed 1 *{entry.get('name', 'item')}*.\n\n🛒 *Your cart*\n{format_cart_numbered(cart)}\n\n*Total:* ₦{cart_total(cart)}\n\nReply 'checkout' to order, or add another number."
+        if normalized in {"2", f"remove all {qty}", "remove all"}:
+            cart.pop(n - 1)
+            conversation.cart_json = json.dumps(cart)
+            conversation.stage = CONV_ITEM
+            conversation.pending_cart_index = None
+            db.commit()
+            if cart:
+                return f"🗑️ Removed *{entry.get('name', 'item')}*.\n\n🛒 *Your cart*\n{format_cart_numbered(cart)}\n\n*Total:* ₦{cart_total(cart)}\n\nReply 'checkout' to order, or add another number."
+            return f"🗑️ Removed *{entry.get('name', 'item')}*. Your cart is now empty — reply with a number to add an item."
+        if normalized in {"3", "keep", "keep them", "cancel", "no"}:
+            conversation.stage = CONV_ITEM
+            conversation.pending_cart_index = None
+            db.commit()
+            return f"👍 Kept as is.\n\n🛒 *Your cart*\n{format_cart_numbered(cart)}\n\n*Total:* ₦{cart_total(cart)}\n\nReply 'checkout' to order, or add another number."
+        return f"Sorry, I didn't understand that. Reply 1 to remove 1, 2 to remove all {qty}, or 3 to keep them."
 
     if conversation.stage == CONV_NAME:
         name = message.strip()
@@ -7256,6 +7361,8 @@ CONV_STAGE_LABELS = {
     CONV_NEW: "New / idle",
     CONV_CATEGORY: "Choosing category",
     CONV_ITEM: "Browsing items",
+    CONV_QUANTITY: "Choosing quantity",
+    CONV_REMOVE_QTY: "Choosing what to remove",
     CONV_NAME: "Entering name",
     CONV_FULFILLMENT: "Choosing delivery/pickup",
     CONV_ADDRESS: "Entering address",
