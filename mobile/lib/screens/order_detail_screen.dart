@@ -103,8 +103,9 @@ class _OrderDetailScreenState extends State<OrderDetailScreen> {
   /// commits the business to fulfilling (or refunding) it. So the confirm stays
   /// disabled until the liability notice is ticked, and the acceptance is sent
   /// with the fee for the server to record against the order.
-  Future<void> _promptDeliveryFee() async {
-    final controller = TextEditingController();
+  Future<void> _promptDeliveryFee(AppOrder order) async {
+    final hasSuggestion = order.deliveryFee > 0;
+    final controller = TextEditingController(text: hasSuggestion ? order.deliveryFee.toString() : '');
     var accepted = false;
     RiderOption? selectedRider;
     List<RiderOption> riders = [];
@@ -126,6 +127,13 @@ class _OrderDetailScreenState extends State<OrderDetailScreen> {
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
+              if (hasSuggestion) ...[
+                const Text(
+                  '📍 Suggested from the customer\'s address — review and adjust if needed.',
+                  style: TextStyle(color: AppColors.muted, fontSize: 12.5, height: 1.4),
+                ),
+                const SizedBox(height: 10),
+              ],
               TextField(
                 controller: controller,
                 autofocus: true,
@@ -421,7 +429,7 @@ class _OrderDetailScreenState extends State<OrderDetailScreen> {
           icon: _actionIcon(action),
           onPressed: _acting
               ? null
-              : () => action == 'set_delivery_fee' ? _promptDeliveryFee() : _runAction(action),
+              : () => action == 'set_delivery_fee' ? _promptDeliveryFee(order) : _runAction(action),
         ),
       );
     }).toList();

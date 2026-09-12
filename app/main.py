@@ -94,6 +94,9 @@ class Business(Base):
     # the first time a referrer is linked (never overwritten by later edits).
     referred_by_user_id = Column(Integer, nullable=True)
     referred_at = Column(DateTime, nullable=True)
+    # Opt-in: when set, customers are asked "delivery or pickup?" before being
+    # asked for an address. Off by default so existing businesses see no change.
+    offers_pickup = Column(Integer, nullable=False, default=0)
 
 
 class Category(Base):
@@ -183,6 +186,11 @@ class Order(Base):
     # Cached Paystack split-group code for this order, so a retried/duplicate
     # payment-init reuses it instead of creating a new group every time.
     paystack_split_code = Column(String(64), nullable=True)
+    # "delivery" (default, matches every order placed before this existed) or
+    # "pickup" — set when the business has offers_pickup on and the customer
+    # chooses to collect it themselves. Pickup orders skip the address
+    # question entirely and always carry a delivery_fee of 0.
+    fulfillment_type = Column(String(20), nullable=False, default="delivery")
 
 
 class Rider(Base):
@@ -401,6 +409,10 @@ def ensure_schema() -> None:
             conn.execute(text("ALTER TABLE orders ADD COLUMN rider_id INTEGER"))
         if not has_column("orders", "paystack_split_code"):
             conn.execute(text("ALTER TABLE orders ADD COLUMN paystack_split_code VARCHAR(64)"))
+        if not has_column("orders", "fulfillment_type"):
+            conn.execute(text("ALTER TABLE orders ADD COLUMN fulfillment_type VARCHAR(20) NOT NULL DEFAULT 'delivery'"))
+        if not has_column("businesses", "offers_pickup"):
+            conn.execute(text("ALTER TABLE businesses ADD COLUMN offers_pickup INTEGER NOT NULL DEFAULT 0"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_orders_business_id ON orders(business_id)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_orders_status ON orders(status)"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS ix_orders_customer_phone ON orders(customer_phone)"))
@@ -2080,6 +2092,7 @@ CONV_NEW = "new"
 CONV_CATEGORY = "await_category"
 CONV_ITEM = "await_item"
 CONV_NAME = "await_name"
+CONV_FULFILLMENT = "await_fulfillment"
 CONV_ADDRESS = "await_address"
 CONV_AWAITING_PAYMENT = "awaiting_payment"
 # Greetings are "soft": mid-order they get a resume reminder instead of silently
@@ -2097,7 +2110,7 @@ PAYMENT_CLAIM_TOKENS = ("paid", "transfer", "sent", "receipt", "confirm", "done"
 PAYMENT_INFO_TOKENS = ("how much", "account", "bank", "details", "total", "amount")
 ACTIVE_ORDER_STATUSES = {"awaiting_delivery_fee", "awaiting_payment", "payment_claimed", "paid", "out_for_delivery"}
 STALE_CONVERSATION_AFTER = timedelta(hours=24)
-STALE_RESET_STAGES = {CONV_CATEGORY, CONV_ITEM, CONV_NAME, CONV_ADDRESS}
+STALE_RESET_STAGES = {CONV_CATEGORY, CONV_ITEM, CONV_NAME, CONV_FULFILLMENT, CONV_ADDRESS}
 
 
 def normalize_whatsapp_number(value: Optional[str]) -> str:
@@ -2792,6 +2805,7 @@ def build_help_reply(conversation: Conversation) -> str:
         CONV_CATEGORY: "Right now: reply with a category number to browse items.",
         CONV_ITEM: "Right now: reply with an item number to add it to your cart.",
         CONV_NAME: "Right now: reply with the name to put on your order.",
+        CONV_FULFILLMENT: "Right now: reply 1 for delivery or 2 for pickup.",
         CONV_ADDRESS: "Right now: reply with your delivery address.",
         CONV_AWAITING_PAYMENT: "Right now: reply with payment confirmation or a photo of your receipt.",
     }
@@ -2938,11 +2952,12 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
             + "\n\nReply 'menu' to start a new order."
         )
 
-    if normalized in GREETING_WORDS and cart and conversation.stage in {CONV_CATEGORY, CONV_ITEM, CONV_NAME, CONV_ADDRESS}:
+    if normalized in GREETING_WORDS and cart and conversation.stage in {CONV_CATEGORY, CONV_ITEM, CONV_NAME, CONV_FULFILLMENT, CONV_ADDRESS}:
         resume_prompts = {
             CONV_CATEGORY: "Reply with a category number to keep shopping, or 'checkout' to place your order.",
             CONV_ITEM: "Reply with an item number to add more, or 'checkout' to place your order.",
             CONV_NAME: "What name should we put on this order?",
+            CONV_FULFILLMENT: "Reply 1 for delivery or 2 for pickup.",
             CONV_ADDRESS: "Please reply with your delivery address. 📍",
         }
         db.commit()
@@ -3100,9 +3115,65 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
         if name.isdigit():
             return "That looks like a number 🙂 — please reply with the name to put on this order."
         conversation.customer_name = name[:255]
+        if business.offers_pickup:
+            conversation.stage = CONV_FULFILLMENT
+            db.commit()
+            return f"Thanks, {conversation.customer_name}! Would you like *delivery* or *pickup*?\n\n*1.* Delivery\n*2.* Pickup"
         conversation.stage = CONV_ADDRESS
         db.commit()
         return f"Thanks, {conversation.customer_name}! Please reply with your delivery address. 📍"
+
+    if conversation.stage == CONV_FULFILLMENT:
+        if normalized in BACK_WORDS:
+            conversation.stage = CONV_NAME
+            db.commit()
+            return "Sure — what name should we put on this order?"
+        if normalized in CART_WORDS:
+            return f"*Your cart:*\n{format_cart_lines(cart)}\n\n*Total:* N{cart_total(cart)}\n\nWould you like *delivery* or *pickup*?\n\n*1.* Delivery\n*2.* Pickup"
+        choice = normalized
+        wants_pickup = choice in {"2", "pickup", "pick up", "collect", "collection"}
+        wants_delivery = choice in {"1", "delivery", "deliver"}
+        if wants_pickup:
+            subtotal = cart_total(cart)
+            order = Order(
+                business_id=business.id,
+                branch_id=conversation.branch_id,
+                customer_phone=conversation.phone_number,
+                customer_name=conversation.customer_name,
+                items_json=conversation.cart_json or "[]",
+                total=subtotal,
+                delivery_fee=0,
+                address="Customer pickup — no delivery address given.",
+                fulfillment_type="pickup",
+                status="awaiting_delivery_fee",
+                status_changed_at=datetime.utcnow(),
+                message_count=(conversation.message_count or 0) + 2,
+            )
+            db.add(order)
+            conversation.cart_json = "[]"
+            conversation.category_id = None
+            conversation.stage = CONV_AWAITING_PAYMENT
+            conversation.message_count = 0
+            db.commit()
+            name_prefix = f"Thanks, {conversation.customer_name}! " if conversation.customer_name else "Thanks! "
+            notify_order_cap_usage(db, business)
+            notify_owner_action(
+                business,
+                order.id,
+                f"🚨 *ACTION NEEDED — new pickup order #{order.id}*\n\n"
+                f"From: {conversation.customer_name or conversation.phone_number} ({conversation.phone_number})\n"
+                f"{format_cart_lines(cart)}\n*Subtotal:* N{subtotal}\n*Pickup order — no delivery.*\n\n"
+                f"Accept to send the customer their total, or cancel to reject.",
+            )
+            return (
+                f"{name_prefix}Here's your order:\n{format_cart_lines(cart)}\n\n*Subtotal:* N{subtotal}\n*Pickup order* — no delivery fee.\n\n"
+                f"We're confirming your order now and will send your total and payment details shortly.{COLLXCT_FOOTER}"
+            )
+        if wants_delivery:
+            conversation.stage = CONV_ADDRESS
+            db.commit()
+            return f"Please reply with your delivery address. 📍"
+        return "Sorry, I didn't understand that. Reply *1* for delivery or *2* for pickup."
 
     if conversation.stage == CONV_ADDRESS:
         address = message.strip()
@@ -3122,6 +3193,12 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
             return "That doesn't look like a full address 🙂 — please include your street and area so the rider can find you. 📍"
         subtotal = cart_total(cart)
         auto = compute_auto_delivery_fee(business, address)
+        # Even when the fee auto-calculates, the business still gets a chance to
+        # accept or reject before the customer is asked to pay — the order always
+        # lands in awaiting_delivery_fee, just pre-filled with the suggested fee
+        # instead of blank. Accepting (the existing "set delivery fee" action,
+        # unchanged) sends the payment link; cancelling rejects it. This is the
+        # same acceptance gate the fully-manual flow already had.
         order = Order(
             business_id=business.id,
             branch_id=conversation.branch_id,
@@ -3131,7 +3208,7 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
             total=subtotal + (auto["fee"] if auto else 0),
             delivery_fee=auto["fee"] if auto else 0,
             address=address,
-            status="awaiting_payment" if auto else "awaiting_delivery_fee",
+            status="awaiting_delivery_fee",
             status_changed_at=datetime.utcnow(),
             address_unverified=1 if (business.delivery_autocalc and not auto) else 0,
             # Browse+checkout messages so far, plus this round-trip; drives billing.
@@ -3147,46 +3224,25 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
         name_prefix = f"Thanks, {conversation.customer_name}! " if conversation.customer_name else "Thanks! "
         notify_order_cap_usage(db, business)
         if auto:
-            if business.payment_method == "paystack":
-                create_paystack_order_link(db, business, order)
-                db.commit()
-            push_to_business(
-                business.id,
-                "🆕 New order",
-                f"Order #{order.id} from {conversation.customer_name or conversation.phone_number} "
-                f"— auto-priced ₦{auto['fee']}. Waiting on the customer to pay.",
-                {"type": "new_order", "order_id": str(order.id), "business_id": str(business.id)},
+            suggestion_line = (
+                f"Suggested delivery fee: N{auto['fee']} ({auto['km']} km, auto-calculated). "
+                f"Accept it as-is or adjust it, then send — the customer can't pay until you do."
             )
-            if business.owner_notify_number:
-                link = order_link(order.id)
-                link_line = f"\nOpen: {link}" if link else ""
-                send_whatsapp_message(
-                    business.owner_notify_number,
-                    f"🆕 New order *#{order.id}* from {conversation.customer_name or conversation.phone_number} — "
-                    f"delivery auto-priced at N{auto['fee']} ({auto['km']} km). Payment details sent to the customer; "
-                    f"nothing to do until payment lands.{link_line}",
-                    from_number=business.whatsapp_number,
-                )
-            return (
-                f"{name_prefix}Here's your order:\n{format_cart_lines(cart)}\n\n"
-                f"*Subtotal:* N{subtotal}\n*Delivery ({auto['km']} km):* N{auto['fee']}\n*Total:* N{order.total}\n"
-                f"*Deliver to:* {address}\n\n" + format_payment_request(order, business) + COLLXCT_FOOTER
-            )
-        unlocated_note = (
-            "\n\n⚠️ This address couldn't be located on the map, so the fee wasn't auto-calculated."
-            if business.delivery_autocalc else ""
-        )
+        else:
+            suggestion_line = "Set the delivery fee now — the customer can't pay until you do."
+            if business.delivery_autocalc:
+                suggestion_line += "\n\n⚠️ This address couldn't be located on the map, so the fee wasn't auto-calculated."
         notify_owner_action(
             business,
             order.id,
             f"🚨 *ACTION NEEDED — new order #{order.id}*\n\n"
             f"From: {conversation.customer_name or conversation.phone_number} ({conversation.phone_number})\n"
             f"{format_cart_lines(cart)}\n*Subtotal:* N{subtotal}\n*Deliver to:* {address}\n\n"
-            f"Set the delivery fee now — the customer can't pay until you do.{unlocated_note}",
+            f"{suggestion_line}",
         )
         return (
             f"{name_prefix}Here's your order:\n{format_cart_lines(cart)}\n\n*Subtotal:* N{subtotal}\n*Delivery to:* {address}\n\n"
-            f"We're confirming your delivery fee now and will send your full total and payment details shortly.{COLLXCT_FOOTER}"
+            f"We're confirming your order now and will send your total and payment details shortly.{COLLXCT_FOOTER}"
         )
 
     if conversation.stage == CONV_AWAITING_PAYMENT:
@@ -5103,6 +5159,7 @@ def business_detail(request: Request, business_id: int, notice: Optional[str] = 
             <textarea name="location_address" placeholder="Pickup address — where deliveries leave from (defaults to your first branch's address)">{escape(business.location_address or '')}</textarea>
             <input name="delivery_base_fee" type="number" min="0" value="{business.delivery_base_fee or 0}" placeholder="Base delivery fee (₦)" />
             <input name="delivery_per_km" type="number" min="0" value="{business.delivery_per_km or 0}" placeholder="Additional fee per km (₦)" />
+            <label><input type="checkbox" name="offers_pickup" {"checked" if business.offers_pickup else ""} /> Offer customer pickup — the bot asks "delivery or pickup?" before asking for an address</label>
             <p class="form-hint">Fee = base + per-km × distance, rounded to the nearest ₦50 — like dispatch apps price rides (e.g. ₦1,000 base + ₦200/km). {geo_hint} If a customer's address can't be found on the map, the order falls back to you setting the fee manually, with a note on the alert.</p>
             {affiliate_field}
           </div>
@@ -5307,6 +5364,7 @@ def update_business(
     location_address: str = Form(default=""),
     delivery_base_fee: int = Form(default=0),
     delivery_per_km: int = Form(default=0),
+    offers_pickup: Optional[str] = Form(default=None),
     referred_by_user_id: Optional[int] = Form(default=None),
 ) -> RedirectResponse:
     current_user = get_current_user(request)
@@ -5341,6 +5399,7 @@ def update_business(
             business.delivery_autocalc = 1 if delivery_autocalc else 0
             business.delivery_base_fee = max(0, delivery_base_fee)
             business.delivery_per_km = max(0, delivery_per_km)
+            business.offers_pickup = 1 if offers_pickup else 0
             new_location = location_address.strip() or None
             if not new_location and business.delivery_autocalc:
                 # Fall back to the first branch's address as the pickup point.
@@ -6293,6 +6352,7 @@ def order_to_json(order: Order, business: Optional[Business]) -> dict:
         "refund_reason": order.refund_reason,
         "terms_accepted_at": order.fee_terms_accepted_at.isoformat() if order.fee_terms_accepted_at else None,
         "rider_id": order.rider_id,
+        "fulfillment_type": order.fulfillment_type,
     }
 
 
@@ -6828,6 +6888,7 @@ def _business_config_json(business: Business) -> dict:
         "delivery_base_fee": business.delivery_base_fee or 0,
         "delivery_per_km": business.delivery_per_km or 0,
         "location_address": business.location_address or "",
+        "offers_pickup": bool(business.offers_pickup),
         "accepting_orders": bool(business.accepting_orders),
         "subaccount_linked": bool(business.paystack_subaccount_code),
     }
@@ -6888,6 +6949,7 @@ async def api_update_business_config(request: Request) -> JSONResponse:
         business.delivery_autocalc = 1 if val("delivery_autocalc", bool(business.delivery_autocalc)) else 0
         business.delivery_base_fee = max(0, int(val("delivery_base_fee", business.delivery_base_fee) or 0))
         business.delivery_per_km = max(0, int(val("delivery_per_km", business.delivery_per_km) or 0))
+        business.offers_pickup = 1 if val("offers_pickup", bool(business.offers_pickup)) else 0
 
         new_location = (val("location_address", business.location_address or "") or "").strip() or None
         if new_location != (business.location_address or None) or (new_location and business.geo_lat is None):
@@ -6955,13 +7017,18 @@ def order_detail(request: Request, order_id: int) -> HTMLResponse:
     action_modal = ""
     if order.status == "awaiting_delivery_fee":
         action_button = "<button type='button' class='btn primary' onclick=\"document.getElementById('delivery-fee-modal').showModal()\">Set delivery fee</button>"
+        auto_suggestion_note = (
+            f"<p class='form-hint'>📍 Suggested from the customer's address — review and adjust if needed.</p>"
+            if order.delivery_fee else ""
+        )
         action_modal = f"""
         <dialog id="delivery-fee-modal" class="modal">
           <div class="modal-body">
             <h3>Set delivery fee</h3>
             <p class="form-hint">Subtotal is N{subtotal}. Enter the delivery fee to send the customer their full total and your bank details.</p>
+            {auto_suggestion_note}
             <form method="post" action="/orders/{order.id}/delivery-fee">
-              <input name="delivery_fee" type="number" min="0" placeholder="Delivery fee" required autofocus />
+              <input name="delivery_fee" type="number" min="0" value="{order.delivery_fee or ''}" placeholder="Delivery fee" required autofocus />
               {f'''<label>Pay delivery fee to a rider? (optional)
                 <select name="rider_id">
                   <option value="">No — keep it with my payout</option>
@@ -7166,6 +7233,7 @@ CONV_STAGE_LABELS = {
     CONV_CATEGORY: "Choosing category",
     CONV_ITEM: "Browsing items",
     CONV_NAME: "Entering name",
+    CONV_FULFILLMENT: "Choosing delivery/pickup",
     CONV_ADDRESS: "Entering address",
     CONV_AWAITING_PAYMENT: "Awaiting payment",
 }

@@ -138,7 +138,7 @@ def test_action_required_alerts_for_new_order(tmp_path, monkeypatch):
     client.post("/webhook", json={"from": phone, "message": "checkout"})
     client.post("/webhook", json={"from": phone, "message": "Ada"})
     response = client.post("/webhook", json={"from": phone, "message": "12 Marina Road, Lagos"})
-    assert "delivery fee" in response.json()["reply"].lower()
+    assert "confirming your order" in response.json()["reply"].lower()
 
     # The alert API requires a staff login.
     unauthenticated = client.get("/api/action-required")
@@ -320,15 +320,35 @@ def test_auto_delivery_fee_and_paystack_flow(tmp_path, monkeypatch):
     reply = client.post("/webhook", json={"from": phone, "message": "12 Marina Road, Lagos"}).json()["reply"]
 
     # Fee auto-calculated (base 1000 + ceil(2.2km) * 200 = 1600, rounded to N50)
-    # and the payment link sent immediately — no owner action needed.
-    assert "checkout.paystack.com" in reply
-    assert "Delivery (2.2 km)" in reply
+    # and pre-filled as a *suggestion* — but the business must still accept
+    # before any payment link is sent to the customer.
+    assert "checkout.paystack.com" not in reply
+    assert "confirming your order" in reply
 
     db = main.SessionLocal()
     order = db.query(main.Order).first()
-    assert order.status == "awaiting_payment"
+    assert order.status == "awaiting_delivery_fee"
     assert order.delivery_fee == 1600
+    assert order.payment_link is None
     db.close()
+
+    # It's sitting in the owner's action queue, suggested fee and all.
+    client.post("/login", data={"email": "admin@example.com", "password": "test-admin-password"}, follow_redirects=False)
+    queued = client.get("/api/action-required").json()
+    assert queued["count"] == 1
+
+    # Business accepts the suggested fee as-is (same action a fully-manual
+    # order would use) — only now does the payment link go out.
+    resp = client.post(f"/api/orders/{order.id}/action", json={
+        "action": "set_delivery_fee", "delivery_fee": 1600, "accept_terms": True,
+    })
+    assert resp.status_code == 200
+    db = main.SessionLocal()
+    order = db.query(main.Order).first()
+    assert order.status == "awaiting_payment"
+    assert order.payment_link == "https://checkout.paystack.com/test123"
+    db.close()
+    assert client.get("/api/action-required").json()["count"] == 0
 
     # Customer says "paid": Paystack verification confirms automatically.
     monkeypatch.setattr(main, "verify_paystack_order_payment", lambda business, order: True)
@@ -337,10 +357,6 @@ def test_auto_delivery_fee_and_paystack_flow(tmp_path, monkeypatch):
     db = main.SessionLocal()
     assert db.query(main.Order).first().status == "paid"
     db.close()
-
-    # Nothing ever entered the action queue.
-    client.post("/login", data={"email": "admin@example.com", "password": "test-admin-password"}, follow_redirects=False)
-    assert client.get("/api/action-required").json()["count"] == 0
 
 
 def test_annual_prepay_extends_expiry_a_year(tmp_path, monkeypatch):
@@ -1344,4 +1360,74 @@ def test_delivery_fee_prefers_osrm_road_distance_over_haversine(tmp_path, monkey
     result_fallback = main.compute_auto_delivery_fee(business, "12 Marina Road, Lagos")
     assert result_fallback is not None
     assert result_fallback["km"] < 3.0  # haversine's straight-line ~2.2 km
+
+
+def test_pickup_order_skips_address_and_still_needs_acceptance(tmp_path, monkeypatch):
+    db_path = tmp_path / "test_bot.db"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
+    monkeypatch.setenv("ADMIN_EMAIL", "admin@example.com")
+    monkeypatch.setenv("ADMIN_PASSWORD", "test-admin-password")
+
+    import app.main as main
+    importlib.reload(main)
+    client = TestClient(main.app)
+
+    db = main.SessionLocal()
+    business = db.query(main.Business).first()
+    business.offers_pickup = 1
+    db.commit()
     db.close()
+
+    phone = "2348022222222"
+    client.post("/webhook", json={"from": phone, "message": "hi"})
+    client.post("/webhook", json={"from": phone, "message": "1"})
+    client.post("/webhook", json={"from": phone, "message": "1"})
+    client.post("/webhook", json={"from": phone, "message": "checkout"})
+    reply = client.post("/webhook", json={"from": phone, "message": "Bola"}).json()["reply"]
+    assert "delivery" in reply.lower() and "pickup" in reply.lower()
+
+    # Picks pickup — no address question, order created straight away with
+    # zero delivery fee, but still sitting in the owner's action queue rather
+    # than auto-finalizing.
+    reply = client.post("/webhook", json={"from": phone, "message": "2"}).json()["reply"]
+    assert "confirming your order" in reply.lower()
+    assert "address" not in reply.lower()
+
+    db = main.SessionLocal()
+    order = db.query(main.Order).first()
+    assert order.fulfillment_type == "pickup"
+    assert order.delivery_fee == 0
+    assert order.status == "awaiting_delivery_fee"
+    order_id = order.id
+    db.close()
+
+    client.post("/login", data={"email": "admin@example.com", "password": "test-admin-password"}, follow_redirects=False)
+    assert client.get("/api/action-required").json()["count"] == 1
+
+    # Business accepts (delivery_fee=0, since there's nothing to price).
+    resp = client.post(f"/api/orders/{order_id}/action", json={
+        "action": "set_delivery_fee", "delivery_fee": 0, "accept_terms": True,
+    })
+    assert resp.status_code == 200
+    db = main.SessionLocal()
+    assert db.query(main.Order).first().status == "awaiting_payment"
+    db.close()
+
+
+def test_delivery_still_default_when_business_has_not_opted_into_pickup(tmp_path, monkeypatch):
+    db_path = tmp_path / "test_bot.db"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
+
+    import app.main as main
+    importlib.reload(main)
+    client = TestClient(main.app)
+
+    # offers_pickup defaults to 0 — existing businesses see no behavior change.
+    phone = "2348033333333"
+    client.post("/webhook", json={"from": phone, "message": "hi"})
+    client.post("/webhook", json={"from": phone, "message": "1"})
+    client.post("/webhook", json={"from": phone, "message": "1"})
+    client.post("/webhook", json={"from": phone, "message": "checkout"})
+    reply = client.post("/webhook", json={"from": phone, "message": "Chidi"}).json()["reply"]
+    assert "delivery address" in reply.lower()
+    assert "pickup" not in reply.lower()
