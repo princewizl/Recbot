@@ -302,6 +302,7 @@ def test_auto_delivery_fee_and_paystack_flow(tmp_path, monkeypatch):
 
     # ~2.2 km away; no real network calls in tests.
     monkeypatch.setattr(main, "geocode_address", lambda address: (6.47, 3.40))
+    monkeypatch.setattr(main, "osrm_route_km", lambda *a: None)  # force the haversine fallback path
 
     def fake_link(db, business, order):
         order.payment_reference = f"RBORD-{order.id}-test"
@@ -1308,3 +1309,39 @@ def test_resolve_account_requires_staff_auth(tmp_path, monkeypatch):
 
     resp = client.get("/api/resolve-account?account_number=0123456789&bank_code=058")
     assert resp.status_code == 401
+
+
+def test_delivery_fee_prefers_osrm_road_distance_over_haversine(tmp_path, monkeypatch):
+    db_path = tmp_path / "test_bot.db"
+    monkeypatch.setenv("DATABASE_URL", f"sqlite:///{db_path}")
+
+    import app.main as main
+    importlib.reload(main)
+
+    db = main.SessionLocal()
+    business = main.Business(
+        name="Osrm Test Shop", whatsapp_number="+2348055555555",
+        delivery_autocalc=1, delivery_base_fee=1000, delivery_per_km=200,
+        geo_lat=6.45, geo_lng=3.40,
+    )
+    db.add(business)
+    db.commit()
+    db.refresh(business)
+
+    monkeypatch.setattr(main, "geocode_address", lambda address: (6.47, 3.40))
+
+    # OSRM's road distance (5.0 km) is meaningfully longer than the straight-line
+    # haversine distance between these two points (~2.2 km) — if the auto-fee
+    # reflects 5.0 km, we know OSRM's result won the fallback, not haversine's.
+    monkeypatch.setattr(main, "osrm_route_km", lambda *a: 5.0)
+    result = main.compute_auto_delivery_fee(business, "12 Marina Road, Lagos")
+    assert result["km"] == 5.0
+    assert result["fee"] == 1000 + 5 * 200  # 2000
+
+    # When OSRM is unavailable (demo server down, timeout, rate-limited, etc.),
+    # it must fall back to haversine rather than fail the whole auto-fee.
+    monkeypatch.setattr(main, "osrm_route_km", lambda *a: None)
+    result_fallback = main.compute_auto_delivery_fee(business, "12 Marina Road, Lagos")
+    assert result_fallback is not None
+    assert result_fallback["km"] < 3.0  # haversine's straight-line ~2.2 km
+    db.close()

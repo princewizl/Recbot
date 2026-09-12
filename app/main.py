@@ -1825,7 +1825,8 @@ def payment_thanks() -> HTMLResponse:
     return render_page("Payment Complete", body, nav_html=make_nav(None))
 
 
-# --- Delivery fee auto-calculation (OpenStreetMap geocoding + haversine) ---
+# --- Delivery fee auto-calculation (OpenStreetMap geocoding + OSRM road
+# distance, falling back to haversine straight-line distance) ---
 
 MAX_AUTO_DELIVERY_KM = float(os.getenv("MAX_AUTO_DELIVERY_KM", "30"))
 GEOCODER_USER_AGENT = os.getenv("GEOCODER_USER_AGENT", "RecbotCRM/1.0 (recbot@collxct.com.ng)")
@@ -1857,6 +1858,26 @@ def haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
     return 2 * 6371.0 * math.asin(math.sqrt(a))
 
 
+def osrm_route_km(lat1: float, lng1: float, lat2: float, lng2: float) -> Optional[float]:
+    """Actual road-network distance via OSRM's public demo server (free, no
+    key) — closer to a real dispatch rider's route than straight-line
+    distance. Best-effort only: the demo server gives no uptime guarantee
+    and can be withdrawn at any time, so a short timeout and any failure
+    just return None and the caller falls back to haversine. Per OSRM's
+    usage policy for commercial use, attribute it (see /privacy)."""
+    try:
+        response = httpx.get(
+            f"http://router.project-osrm.org/route/v1/driving/{lng1},{lat1};{lng2},{lat2}",
+            params={"overview": "false"}, timeout=4.0,
+        )
+        data = response.json()
+        if data.get("code") == "Ok" and data.get("routes"):
+            return data["routes"][0]["distance"] / 1000.0
+    except Exception as exc:
+        logger.info("OSRM route lookup failed, falling back to haversine: %s", exc)
+    return None
+
+
 def compute_auto_delivery_fee(business: Business, address: str) -> Optional[Dict[str, object]]:
     """Base fee + per-km rate, like Nigerian dispatch pricing. Returns
     {'fee': int, 'km': float} or None when auto-pricing isn't possible —
@@ -1868,7 +1889,9 @@ def compute_auto_delivery_fee(business: Business, address: str) -> Optional[Dict
     coords = geocode_address(address)
     if not coords:
         return None
-    km = haversine_km(business.geo_lat, business.geo_lng, coords[0], coords[1])
+    km = osrm_route_km(business.geo_lat, business.geo_lng, coords[0], coords[1])
+    if km is None:
+        km = haversine_km(business.geo_lat, business.geo_lng, coords[0], coords[1])
     if km > MAX_AUTO_DELIVERY_KM:
         # Probably a bad geocoder match (or genuinely out of range) — let a human price it.
         return None
@@ -3923,7 +3946,8 @@ def privacy_page(request: Request) -> HTMLResponse:
       <h3>6. Sharing &amp; processors</h3>
       <p>We share data only as needed with service providers who process it on our behalf, including: Twilio
       (WhatsApp messaging), Paystack (payments), Google Firebase (push notifications), OpenStreetMap/Nominatim
-      (address geocoding), our email provider, and our hosting provider. We do not sell personal data.</p>
+      (address geocoding), OSRM/OpenStreetMap contributors (road-distance routing for delivery-fee estimates),
+      our email provider, and our hosting provider. We do not sell personal data.</p>
 
       <h3>7. International transfers</h3>
       <p>Some processors are outside Nigeria. Where data is transferred abroad, we rely on appropriate safeguards
