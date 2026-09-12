@@ -1832,21 +1832,68 @@ MAX_AUTO_DELIVERY_KM = float(os.getenv("MAX_AUTO_DELIVERY_KM", "30"))
 GEOCODER_USER_AGENT = os.getenv("GEOCODER_USER_AGENT", "RecbotCRM/1.0 (recbot@collxct.com.ng)")
 
 
-def geocode_address(address: str):
-    """Best-effort geocode via Nominatim (free, no key). Returns (lat, lng) or None."""
-    if not address or not address.strip():
-        return None
+def _geocode_nominatim(address: str) -> Optional["tuple[float, float]"]:
     try:
         response = httpx.get(
             "https://nominatim.openstreetmap.org/search",
-            params={"q": address.strip(), "format": "json", "limit": 1, "countrycodes": "ng"},
+            params={"q": address, "format": "json", "limit": 1, "countrycodes": "ng"},
             headers={"User-Agent": GEOCODER_USER_AGENT}, timeout=6.0,
         )
         results = response.json()
         if isinstance(results, list) and results:
             return float(results[0]["lat"]), float(results[0]["lon"])
     except Exception as exc:
-        logger.warning("geocode failed for %r: %s", address, exc)
+        logger.warning("Nominatim geocode failed for %r: %s", address, exc)
+    return None
+
+
+def _geocode_photon(address: str) -> Optional["tuple[float, float]"]:
+    """Komoot's Photon — a second free, keyless OSM-based geocoder with its own
+    address index. Tried only when Nominatim comes up empty; in practice it
+    sometimes resolves Nigerian addresses Nominatim's parser rejects (e.g. a
+    leading "Plot 1239," prefix)."""
+    try:
+        response = httpx.get(
+            "https://photon.komoot.io/api/",
+            params={"q": address, "limit": 1},
+            timeout=6.0,
+        )
+        features = (response.json() or {}).get("features") or []
+        if features:
+            lon, lat = features[0]["geometry"]["coordinates"]
+            return float(lat), float(lon)
+    except Exception as exc:
+        logger.warning("Photon geocode failed for %r: %s", address, exc)
+    return None
+
+
+def geocode_address(address: str) -> Optional["tuple[float, float]"]:
+    """Best-effort geocode, free and keyless throughout — no Google Maps
+    billing account needed. Tries, in order: Nominatim on the full address;
+    Nominatim again with the leading segment dropped (Nigerian addresses
+    often lead with a "Plot NNNN,"/"No 3,"-style prefix that isn't in
+    Nominatim's indexed data even though the street/area behind it resolves
+    fine); then Photon (a differently-indexed free geocoder) on the full
+    address, then on the simplified one. Returns (lat, lng) or None once
+    every option is exhausted."""
+    if not address or not address.strip():
+        return None
+    address = address.strip()
+    parts = [p.strip() for p in address.split(",") if p.strip()]
+    simplified = ", ".join(parts[1:]) if len(parts) > 1 else None
+
+    for candidate in (address, simplified):
+        if not candidate:
+            continue
+        coords = _geocode_nominatim(candidate)
+        if coords:
+            return coords
+    for candidate in (address, simplified):
+        if not candidate:
+            continue
+        coords = _geocode_photon(candidate)
+        if coords:
+            return coords
     return None
 
 
@@ -3946,8 +3993,8 @@ def privacy_page(request: Request) -> HTMLResponse:
       <h3>6. Sharing &amp; processors</h3>
       <p>We share data only as needed with service providers who process it on our behalf, including: Twilio
       (WhatsApp messaging), Paystack (payments), Google Firebase (push notifications), OpenStreetMap/Nominatim
-      (address geocoding), OSRM/OpenStreetMap contributors (road-distance routing for delivery-fee estimates),
-      our email provider, and our hosting provider. We do not sell personal data.</p>
+      and Komoot/Photon (address geocoding), OSRM/OpenStreetMap contributors (road-distance routing for
+      delivery-fee estimates), our email provider, and our hosting provider. We do not sell personal data.</p>
 
       <h3>7. International transfers</h3>
       <p>Some processors are outside Nigeria. Where data is transferred abroad, we rely on appropriate safeguards
