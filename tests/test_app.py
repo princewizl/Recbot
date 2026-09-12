@@ -402,7 +402,7 @@ def test_landing_page_and_contact_form(tmp_path, monkeypatch):
 
     page = client.get("/")
     assert page.status_code == 200
-    for needle in ["ordering machine", "Pay only when you sell", "per order", "processed securely by Paystack", "What we need to onboard you", "Request my setup", "logo-white.svg"]:
+    for needle in ["ordering machine", "Pay only when you sell", "per order", "processed securely by Paystack", "What we need to onboard you", "Request my setup", "logo-mark.png"]:
         assert needle in page.text, f"missing: {needle}"
 
     # No APK on disk in tests → the button is hidden and the route shows "coming soon".

@@ -1086,7 +1086,9 @@ def render_page(title: str, body: str, nav_html: Optional[str] = None,
         <meta charset="utf-8" />
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <title>{escape(title)} · Collxct</title>
-        <link rel="icon" type="image/svg+xml" href="/static/img/logo-icon.svg" />
+        <link rel="icon" type="image/png" sizes="32x32" href="/static/img/favicon-32.png" />
+        <link rel="icon" type="image/png" sizes="16x16" href="/static/img/favicon-16.png" />
+        <link rel="apple-touch-icon" href="/static/img/apple-touch-icon.png" />
         <link rel="preconnect" href="https://fonts.googleapis.com" />
         <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
         <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
@@ -1133,7 +1135,8 @@ def render_page(title: str, body: str, nav_html: Optional[str] = None,
                     .shell {{ display:flex; min-height:100vh; }}
                     .sidebar {{ width:var(--sidebar-w); flex-shrink:0; background:linear-gradient(180deg,#0d1211,#0a0e0d); border-right:1px solid var(--border); display:flex; flex-direction:column; padding:16px 12px; position:sticky; top:0; height:100vh; overflow-y:auto; }}
                     .brand {{ display:flex; align-items:center; gap:10px; padding:6px 10px 16px; margin-bottom:12px; border-bottom:1px solid var(--border); text-decoration:none; }}
-                    .brand-logo {{ height:30px; width:auto; display:block; }}
+                    .brand-logo {{ height:30px; width:auto; display:block; border-radius:50%; }}
+                    .brand-text {{ font-weight:800; font-size:1.05rem; color:var(--text); letter-spacing:-.01em; }}
                     .nav-links {{ display:flex; flex-direction:column; gap:2px; }}
                     .nav-section {{ padding:16px 12px 6px; font-size:.66rem; text-transform:uppercase; letter-spacing:.13em; color:var(--muted-2); font-weight:700; }}
                     .nav-link {{ position:relative; display:flex; align-items:center; gap:11px; padding:9px 12px; border-radius:var(--radius-sm); color:var(--muted); font-weight:500; font-size:.885rem; text-decoration:none; transition:background .15s ease, color .15s ease; }}
@@ -1400,7 +1403,8 @@ def render_page(title: str, body: str, nav_html: Optional[str] = None,
         <div class="shell">
           <aside class="sidebar">
             <a class="brand" href="/">
-              <img class="brand-logo" src="/static/img/logo-white.svg" alt="Collxct" />
+              <img class="brand-logo" src="/static/img/logo-mark.png" alt="" />
+              <span class="brand-text">Collxct</span>
             </a>
             {nav_html}
           </aside>
@@ -3534,14 +3538,16 @@ def homepage(request: Request, sent: Optional[str] = None) -> HTMLResponse:
           "@type": "Organization",
           "name": "Collxct",
           "url": "{LANDING_URL}",
-          "logo": "{LANDING_URL}/static/img/logo-white.svg",
+          "logo": "{LANDING_URL}/static/img/logo-512.png",
           "sameAs": [
             "https://www.tiktok.com/@collxct.ng",
             "https://www.instagram.com/collxct.ng"
           ]
         }}
         </script>
-        <link rel="icon" type="image/svg+xml" href="/static/img/logo-icon.svg" />
+        <link rel="icon" type="image/png" sizes="32x32" href="/static/img/favicon-32.png" />
+        <link rel="icon" type="image/png" sizes="16x16" href="/static/img/favicon-16.png" />
+        <link rel="apple-touch-icon" href="/static/img/apple-touch-icon.png" />
         <link rel="preconnect" href="https://fonts.googleapis.com" />
         <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
         <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&display=swap" rel="stylesheet" />
@@ -3560,7 +3566,9 @@ def homepage(request: Request, sent: Optional[str] = None) -> HTMLResponse:
           .wrap {{ max-width:1100px; margin:0 auto; padding:0 22px; }}
           .lp-nav {{ position:sticky; top:0; z-index:50; backdrop-filter:blur(12px); background:rgba(9,12,11,.8); border-bottom:1px solid var(--border); }}
           .lp-nav .wrap {{ display:flex; align-items:center; gap:22px; height:64px; }}
-          .lp-nav img {{ height:30px; display:block; }}
+          .lp-brand {{ display:flex; align-items:center; gap:10px; text-decoration:none; }}
+          .lp-nav img {{ height:30px; display:block; border-radius:50%; }}
+          .lp-brand-text {{ color:var(--text); font-weight:800; font-size:1.15rem; letter-spacing:-.01em; }}
           .lp-nav a {{ color:var(--muted); text-decoration:none; font-size:.9rem; font-weight:600; }}
           .lp-nav a:hover {{ color:var(--text); }}
           .lp-nav .spacer {{ flex:1; }}
@@ -3655,7 +3663,9 @@ def homepage(request: Request, sent: Optional[str] = None) -> HTMLResponse:
           .app-qr span {{ color:var(--muted); font-size:.85rem; font-weight:600; }}
           footer {{ border-top:1px solid var(--border); padding:34px 0; }}
           footer .wrap {{ display:flex; align-items:center; gap:18px; flex-wrap:wrap; }}
-          footer img {{ height:26px; }}
+          .footer-brand {{ display:flex; align-items:center; gap:9px; }}
+          footer img {{ height:26px; border-radius:50%; }}
+          .footer-brand-text {{ color:var(--text); font-weight:800; font-size:.95rem; }}
           footer span {{ color:var(--muted); font-size:.84rem; }}
           footer .spacer {{ flex:1; }}
           @media (max-width:860px) {{
@@ -3671,7 +3681,7 @@ def homepage(request: Request, sent: Optional[str] = None) -> HTMLResponse:
       <body>
         <nav class="lp-nav">
           <div class="wrap">
-            <a href="/"><img src="/static/img/logo-white.svg" alt="Collxct" /></a>
+            <a class="lp-brand" href="/"><img src="/static/img/logo-mark.png" alt="" /><span class="lp-brand-text">Collxct</span></a>
             <span class="spacer"></span>
             <a class="hide-sm" href="#features">Features</a>
             <a class="hide-sm" href="#how">How it works</a>
@@ -3849,7 +3859,10 @@ def homepage(request: Request, sent: Optional[str] = None) -> HTMLResponse:
 
         <footer>
           <div class="wrap">
-            <img src="/static/img/logo-white.svg" alt="Collxct" />
+            <span class="footer-brand">
+              <img src="/static/img/logo-mark.png" alt="" />
+              <b class="footer-brand-text">Collxct</b>
+            </span>
             <span>WhatsApp ordering, done properly.</span>
             <span class="spacer"></span>
             <span><a href="mailto:{CONTACT_EMAIL}" style="color:var(--muted);">{CONTACT_EMAIL}</a> · <a href="https://www.tiktok.com/@collxct.ng" target="_blank" rel="noopener noreferrer" style="color:var(--muted);">TikTok</a> · <a href="https://www.instagram.com/collxct.ng" target="_blank" rel="noopener noreferrer" style="color:var(--muted);">Instagram</a> · <a href="/login" style="color:var(--muted);">Portal login</a> · <a href="/terms" style="color:var(--muted);">Terms</a> · <a href="/privacy" style="color:var(--muted);">Privacy</a> · <a href="/refunds" style="color:var(--muted);">Refunds</a></span>
