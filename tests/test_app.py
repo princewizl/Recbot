@@ -25,7 +25,7 @@ def test_category_selection_flow(tmp_path, monkeypatch):
 
     assert response.status_code == 200
     payload = response.json()
-    assert "category" in payload["reply"].lower()
+    assert "reply with a number" in payload["reply"].lower()
 
     response = client.post(
         "/webhook",
@@ -203,7 +203,7 @@ def test_bot_respects_business_hours(tmp_path, monkeypatch):
     db.commit()
     db.close()
     reply = client.post("/webhook", json={"from": phone, "message": "hi"}).json()["reply"]
-    assert "category" in reply.lower()
+    assert "reply with a number" in reply.lower()
 
 
 def test_single_branch_plan_limit_for_owners(tmp_path, monkeypatch):
@@ -863,7 +863,7 @@ def test_commission_model_no_gating_and_bank_code(tmp_path, monkeypatch):
     assert main.ensure_paystack_subaccount(business) is None
     db.close()
 
-    assert "category" in client.post("/webhook", json={"from": "2348012345678", "message": "hi"}).json()["reply"].lower()
+    assert "reply with a number" in client.post("/webhook", json={"from": "2348012345678", "message": "hi"}).json()["reply"].lower()
 
     # Admin saves the payout bank code used for the Paystack subaccount split.
     client.post("/login", data={"email": "admin@example.com", "password": "test-admin-password"}, follow_redirects=False)
@@ -889,7 +889,7 @@ def test_paused_business_blocks_new_orders(tmp_path, monkeypatch):
     client = TestClient(main.app)
 
     # Open by default: greeting shows the menu.
-    assert "category" in client.post("/webhook", json={"from": "2348012345678", "message": "hi"}).json()["reply"].lower()
+    assert "reply with a number" in client.post("/webhook", json={"from": "2348012345678", "message": "hi"}).json()["reply"].lower()
 
     # Pause the business.
     db = main.SessionLocal()
@@ -908,7 +908,7 @@ def test_paused_business_blocks_new_orders(tmp_path, monkeypatch):
         b.accepting_orders = 1
     db.commit()
     db.close()
-    assert "category" in client.post("/webhook", json={"from": "2348017776666", "message": "hi"}).json()["reply"].lower()
+    assert "reply with a number" in client.post("/webhook", json={"from": "2348017776666", "message": "hi"}).json()["reply"].lower()
 
 
 def test_open_close_toggle_web_and_mobile(tmp_path, monkeypatch):

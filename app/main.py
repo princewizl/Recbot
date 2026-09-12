@@ -1512,18 +1512,18 @@ def business_is_open(business: Business) -> bool:
 def format_closed_reply(business: Business) -> str:
     return (
         f"⏰ *{business.name}* is closed right now.\n\n"
-        f"Opening hours: *{business.open_time}–{business.close_time}* daily. "
-        f"Please message us again then — we'd love to serve you!\n\n"
-        f"(You can still reply 'status' to check an existing order.)" + COLLXCT_FOOTER
+        f"Open *{business.open_time} – {business.close_time}* daily. Please message us then — "
+        f"we'd love to serve you!\n\n"
+        f"Reply 'status' to check an existing order." + COLLXCT_FOOTER
     )
 
 
 def format_paused_reply(business: Business) -> str:
     """Shown when the owner has manually paused orders (accepting_orders = 0)."""
     return (
-        f"🔕 *{business.name}* has paused new orders for the moment. "
+        f"🔕 *{business.name}* has paused new orders for now.\n\n"
         f"Please check back a little later — we'd love to serve you!\n\n"
-        f"(You can still reply 'status' to check an existing order.)" + COLLXCT_FOOTER
+        f"Reply 'status' to check an existing order." + COLLXCT_FOOTER
     )
 
 
@@ -2634,7 +2634,7 @@ COLLXCT_FOOTER = "\n\n_Powered by Collxct_"
 
 def format_category_menu(categories: List[Category]) -> str:
     lines = [f"*{i}.* {category.name}" for i, category in enumerate(categories, start=1)]
-    return "Please choose a category by replying with a number:\n\n" + "\n".join(lines)
+    return "What would you like today? Reply with a number:\n\n" + "\n".join(lines)
 
 
 def format_item_menu(items: List[MenuItem], category_name: str) -> str:
@@ -2645,8 +2645,8 @@ def format_item_menu(items: List[MenuItem], category_name: str) -> str:
             lines.append(f"_{item.description}_")
     return (
         f"*{category_name}*\n\n" + "\n".join(lines) + "\n\n"
-        "Reply *see 1* to view a photo of item 1, a *number* to add that item to your cart, "
-        "'cart' to view your cart, 'back' for other categories, or 'checkout' when you're ready."
+        "Reply a *number* to add it to your cart. Or *see 1* for a photo, 'cart' to view your cart, "
+        "'back' for other categories, or 'checkout' when you're ready."
     )
 
 
@@ -2761,19 +2761,30 @@ def order_refund_breakdown(business: Optional[Business], order: Order) -> Dict[s
 
 
 def format_payment_request(order: Order, business: Optional[Business]) -> str:
+    """One consolidated breakdown — item lines, delivery (or pickup), service
+    fee, then a single total — instead of restating the total twice under two
+    different labels. order.items_json means this is self-contained: callers
+    don't need to pass their own cart listing alongside it."""
     fee = order_customer_fee(business, order)
     grand = order.total + fee
+    item_lines = format_cart_lines(load_cart(order.items_json))
+    is_pickup = order.fulfillment_type == "pickup"
+    delivery_line = "Pickup — no delivery fee" if is_pickup else f"Delivery — N{order.delivery_fee}"
+    fee_line = f"\nService fee — N{fee}" if fee else ""
+    deliver_to_line = "" if is_pickup else f"\n📍 Deliver to: {order.address}"
     if business and business.payment_method == "paystack" and order.payment_link:
-        fee_line = f"\n*Service fee:* N{fee}" if fee else ""
         return (
-            f"Your order *#{order.id}*:\n"
-            f"*Items + delivery:* N{order.total} (incl. N{order.delivery_fee} delivery){fee_line}\n"
-            f"*Total to pay:* N{grand}\n\n"
-            f"*Pay securely here:* {order.payment_link}\n\n"
-            f"Cards, bank transfer, and USSD all work. Reply *paid* once you're done and we'll confirm instantly. ⚡"
+            f"Here's your order 👇\n\n"
+            f"{item_lines}\n{delivery_line}{fee_line}\n\n"
+            f"*Total to pay:* N{grand}{deliver_to_line}\n\n"
+            f"Pay securely here:\n{order.payment_link}\n"
+            f"Card, bank transfer and USSD all work.\n\n"
+            f"Reply *paid* once done — we'll confirm instantly ⚡"
         )
     return (
-        f"Your order *#{order.id}* total is *N{order.total}* (including N{order.delivery_fee} delivery).\n\n"
+        f"Here's your order 👇\n\n"
+        f"{item_lines}\n{delivery_line}\n\n"
+        f"*Total:* N{order.total}{deliver_to_line}\n\n"
         f"*Please pay to:*\n{format_bank_info(business)}\n\n"
         f"Once you've paid, reply here with confirmation or a photo of your receipt."
     )
@@ -2794,7 +2805,7 @@ def format_order_status_reply(order: Optional[Order], business: Business) -> str
     if order.status == "paid":
         return f"Payment confirmed! Order *#{order.id}* is being prepared. 🧑‍🍳"
     if order.status == "out_for_delivery":
-        return f"Order *#{order.id}* is on its way to you! 🚴"
+        return f"🚴 Order *#{order.id}* is on the way to you!"
     if order.status == "delivered":
         return f"Order *#{order.id}* was delivered. Reply 'menu' to order again!"
     return f"Order *#{order.id}* status: {order.status}."
@@ -2802,21 +2813,21 @@ def format_order_status_reply(order: Optional[Order], business: Business) -> str
 
 def build_help_reply(conversation: Conversation) -> str:
     step_lines = {
-        CONV_CATEGORY: "Right now: reply with a category number to browse items.",
-        CONV_ITEM: "Right now: reply with an item number to add it to your cart.",
-        CONV_NAME: "Right now: reply with the name to put on your order.",
-        CONV_FULFILLMENT: "Right now: reply 1 for delivery or 2 for pickup.",
-        CONV_ADDRESS: "Right now: reply with your delivery address.",
-        CONV_AWAITING_PAYMENT: "Right now: reply with payment confirmation or a photo of your receipt.",
+        CONV_CATEGORY: "Right now, reply a category number to browse. 👍",
+        CONV_ITEM: "Right now, reply an item number to add it to your cart.",
+        CONV_NAME: "Right now, reply with the name for your order.",
+        CONV_FULFILLMENT: "Right now, reply 1 for delivery or 2 for pickup.",
+        CONV_ADDRESS: "Right now, reply with your delivery address.",
+        CONV_AWAITING_PAYMENT: "Right now, reply with payment confirmation or a photo of your receipt.",
     }
     step = step_lines.get(conversation.stage, "Reply 'menu' to see what's available.")
     return (
-        "🤖 *Quick guide*\n"
-        "• 'menu' — browse / start a fresh order\n"
-        "• 'cart' — view your cart\n"
-        "• 'checkout' — place your order\n"
-        "• 'status' — check your latest order\n"
-        "• 'cancel' — cancel what you're doing\n\n"
+        "🤖 Quick guide\n\n"
+        "menu — start a new order\n"
+        "cart — view your cart\n"
+        "checkout — place your order\n"
+        "status — track your order\n"
+        "cancel — stop what you're doing\n\n"
         f"{step}"
     )
 
@@ -2846,7 +2857,7 @@ def record_payment_claim(db, business: Business, conversation: Conversation, ord
                     f"{order.customer_name or order.customer_phone}) automatically — it's ready to prepare.{link_line}",
                     from_number=business.whatsapp_number,
                 )
-            return f"🎉 Payment confirmed for order *#{order.id}*! *{business.name}* is preparing your order now."
+            return f"🎉 Payment confirmed for order *#{order.id}*!\n\n*{business.name}* is preparing your order now."
         if verified is False:
             db.commit()
             return (
@@ -2868,8 +2879,8 @@ def record_payment_claim(db, business: Business, conversation: Conversation, ord
     notify_owner_action(
         business,
         order.id,
-        f"🚨 *ACTION NEEDED — confirm payment*\n\nOrder *#{order.id}*: {order.customer_name or order.customer_phone} says they've paid *N{order.total}*. "
-        f"Check your bank alert for this exact amount, then mark the order paid so it can move forward.",
+        f"🚨 *ACTION NEEDED — confirm payment*\n\nOrder *#{order.id}*: {order.customer_name or order.customer_phone} says they paid *N{order.total}*.\n\n"
+        f"Check your bank alert for this exact amount, then mark the order paid to move it forward.",
     )
     return f"Thanks! We've let *{business.name}* know — they'll confirm your payment shortly. ✅"
 
@@ -2926,7 +2937,7 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
         conversation.category_id = None
         conversation.stage = CONV_NEW
         db.commit()
-        return "No problem — cancelled. Reply 'hi' whenever you'd like to start a new order. 👋"
+        return "No problem — cancelled. 👋\nReply 'hi' whenever you'd like to start again."
 
     # Business-hours / subscription gate: status, help, cancel, and payment for
     # an existing order still work above — but shopping is paused while the
@@ -2949,21 +2960,21 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
         db.commit()
         return (
             "👋 Welcome back!\n\n" + format_order_status_reply(active_order, business)
-            + "\n\nReply 'menu' to start a new order."
+            + "\n\nReply 'menu' to start a new order instead."
         )
 
     if normalized in GREETING_WORDS and cart and conversation.stage in {CONV_CATEGORY, CONV_ITEM, CONV_NAME, CONV_FULFILLMENT, CONV_ADDRESS}:
         resume_prompts = {
-            CONV_CATEGORY: "Reply with a category number to keep shopping, or 'checkout' to place your order.",
-            CONV_ITEM: "Reply with an item number to add more, or 'checkout' to place your order.",
+            CONV_CATEGORY: "Reply a category number to keep shopping, or 'checkout' to finish.",
+            CONV_ITEM: "Reply an item number to add more, or 'checkout' to finish.",
             CONV_NAME: "What name should we put on this order?",
             CONV_FULFILLMENT: "Reply 1 for delivery or 2 for pickup.",
             CONV_ADDRESS: "Please reply with your delivery address. 📍",
         }
         db.commit()
         return (
-            f"👋 Welcome back! You have an order in progress:\n{format_cart_lines(cart)}\n\n"
-            f"{resume_prompts[conversation.stage]}\n\n(Reply 'restart' to start over, or 'cancel' to cancel.)"
+            f"👋 Welcome back! Your order so far:\n{format_cart_lines(cart)}\n\n"
+            f"{resume_prompts[conversation.stage]}\n\nOr 'restart' to start over, 'cancel' to cancel."
         )
 
     if normalized in GREETING_WORDS or normalized in HARD_RESET_WORDS or not conversation.stage:
@@ -2989,7 +3000,7 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
             if not cart:
                 return "Your cart is empty. " + format_category_menu(categories)
             return (
-                f"*Your cart:*\n{format_cart_lines(cart)}\n\n*Total:* N{cart_total(cart)}\n\n"
+                f"🛒 *Your cart*\n{format_cart_lines(cart)}\n\n*Total:* N{cart_total(cart)}\n\n"
                 "Reply 'checkout' to place your order, or pick a category to keep shopping:\n\n"
                 + format_category_menu(categories)
             )
@@ -2998,11 +3009,11 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
                 return "Your cart is empty. " + format_category_menu(categories)
             conversation.stage = CONV_NAME
             db.commit()
-            return "Great! What name should we put on this order?"
+            return "Great! 👍 What name should we put on the order?"
         index = resolve_choice(message, [category.name for category in categories])
         if index is None or index < 1 or index > len(categories):
             if not message.strip() and media_url:
-                return "I can only read text here 🙂 — please reply with a number.\n\n" + format_category_menu(categories)
+                return "I can only read text here 🙂\nPlease reply with a number:\n\n" + format_category_menu(categories)
             db.commit()
             return "Sorry, I didn't understand that. " + format_category_menu(categories)
         category = categories[index - 1]
@@ -3030,7 +3041,7 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
         if normalized in CART_WORDS:
             if not cart:
                 return "Your cart is empty. Reply with a number to add an item."
-            return f"*Your cart:*\n{format_cart_numbered(cart)}\n\n*Total:* N{cart_total(cart)}\n\nReply 'checkout' to place your order, 'remove 1' to remove item 1, or add another item number."
+            return f"🛒 *Your cart*\n{format_cart_numbered(cart)}\n\n*Total:* N{cart_total(cart)}\n\nReply 'checkout' to place your order, 'remove 1' to remove item 1, or add another item number."
         if normalized in CLEAR_CART_WORDS:
             conversation.cart_json = "[]"
             db.commit()
@@ -3040,7 +3051,7 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
                 return "Your cart is empty. Please add at least one item before checking out."
             conversation.stage = CONV_NAME
             db.commit()
-            return "Great! What name should we put on this order?"
+            return "Great! 👍 What name should we put on the order?"
         if normalized in BACK_WORDS:
             reply = build_greeting_reply(db, business, conversation)
             db.commit()
@@ -3050,7 +3061,7 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
         if see_match:
             n = int(see_match.group(1))
             if n < 1 or n > len(items):
-                return f"There's no item {n} here. Reply 'see 1' to view item 1."
+                return f"There's no item {n} here 🙂\nReply 'see 1' to view item 1."
             target = items[n - 1]
             caption = f"*{n}. {target.name}* — N{target.price}" + (f"\n{target.description}" if target.description else "")
             url = public_media_url(getattr(target, "image_url", None))
@@ -3073,13 +3084,13 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
             conversation.cart_json = json.dumps(cart)
             db.commit()
             if cart:
-                return f"🗑️ Removed *{removed.get('name', 'item')}*.\n\n*Your cart:*\n{format_cart_numbered(cart)}\n\n*Total:* N{cart_total(cart)}\n\nReply 'checkout' to order, or add another number."
+                return f"🗑️ Removed *{removed.get('name', 'item')}*.\n\n🛒 *Your cart*\n{format_cart_numbered(cart)}\n\n*Total:* N{cart_total(cart)}\n\nReply 'checkout' to order, or add another number."
             return f"🗑️ Removed *{removed.get('name', 'item')}*. Your cart is now empty — reply with a number to add an item."
         index = resolve_choice(message, [item.name for item in items])
         if index is None or index < 1 or index > len(items):
             category = db.query(Category).filter(Category.id == conversation.category_id).one_or_none()
             if not message.strip() and media_url:
-                return "I can only read text here 🙂 — please reply with a number.\n\n" + format_item_menu(items, category.name if category else "Menu")
+                return "I can only read text here 🙂\nPlease reply with a number:\n\n" + format_item_menu(items, category.name if category else "Menu")
             return "Sorry, I didn't understand that. " + format_item_menu(items, category.name if category else "Menu")
         item = items[index - 1]
         for entry in cart:
@@ -3105,7 +3116,7 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
             db.commit()
             return reply
         if normalized in CART_WORDS:
-            return f"*Your cart:*\n{format_cart_lines(cart)}\n\n*Total:* N{cart_total(cart)}\n\nWhat name should we put on this order?"
+            return f"🛒 *Your cart*\n{format_cart_lines(cart)}\n\n*Total:* N{cart_total(cart)}\n\nWhat name should we put on this order?"
         if normalized in CHECKOUT_WORDS:
             return "Almost there! What name should we put on this order?"
         if not name:
@@ -3113,7 +3124,7 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
                 return "I can't read a name from an image 🙂 — please type it. What name should we put on this order?"
             return "Please share your name so the business knows who's ordering."
         if name.isdigit():
-            return "That looks like a number 🙂 — please reply with the name to put on this order."
+            return "That looks like a phone number 🙂\nPlease reply with the name for this order."
         conversation.customer_name = name[:255]
         if business.offers_pickup:
             conversation.stage = CONV_FULFILLMENT
@@ -3121,7 +3132,7 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
             return f"Thanks, {conversation.customer_name}! Would you like *delivery* or *pickup*?\n\n*1.* Delivery\n*2.* Pickup"
         conversation.stage = CONV_ADDRESS
         db.commit()
-        return f"Thanks, {conversation.customer_name}! Please reply with your delivery address. 📍"
+        return f"Thanks, {conversation.customer_name}! 📍 What's your delivery address?"
 
     if conversation.stage == CONV_FULFILLMENT:
         if normalized in BACK_WORDS:
@@ -3129,7 +3140,7 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
             db.commit()
             return "Sure — what name should we put on this order?"
         if normalized in CART_WORDS:
-            return f"*Your cart:*\n{format_cart_lines(cart)}\n\n*Total:* N{cart_total(cart)}\n\nWould you like *delivery* or *pickup*?\n\n*1.* Delivery\n*2.* Pickup"
+            return f"🛒 *Your cart*\n{format_cart_lines(cart)}\n\n*Total:* N{cart_total(cart)}\n\nWould you like *delivery* or *pickup*?\n\n*1.* Delivery\n*2.* Pickup"
         choice = normalized
         wants_pickup = choice in {"2", "pickup", "pick up", "collect", "collection"}
         wants_delivery = choice in {"1", "delivery", "deliver"}
@@ -3182,7 +3193,7 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
             db.commit()
             return "Sure — what name should we put on this order?"
         if normalized in CART_WORDS:
-            return f"*Your cart:*\n{format_cart_lines(cart)}\n\n*Total:* N{cart_total(cart)}\n\nPlease reply with your delivery address. 📍"
+            return f"🛒 *Your cart*\n{format_cart_lines(cart)}\n\n*Total:* N{cart_total(cart)}\n\nPlease reply with your delivery address. 📍"
         if normalized in CHECKOUT_WORDS:
             return "Almost done! Please reply with your delivery address. 📍"
         if not address:
@@ -3190,7 +3201,7 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
                 return "I can't read an address from an image 🙂 — please type it. Where should we deliver to?"
             return "Please share a delivery address so we can complete your order."
         if len(address) < 5 or not any(ch.isalpha() for ch in address):
-            return "That doesn't look like a full address 🙂 — please include your street and area so the rider can find you. 📍"
+            return "Hmm, that's not a full address 🙂\nPlease include your street and area so the rider can find you. 📍"
         subtotal = cart_total(cart)
         auto = compute_auto_delivery_fee(business, address)
         # Even when the fee auto-calculates, the business still gets a chance to
@@ -3257,7 +3268,7 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
                 conversation.stage = CONV_NEW
                 conversation.address = None
                 db.commit()
-                return "Your order has been cancelled. Reply 'hi' anytime to start a new order."
+                return "Your order has been cancelled.\nReply 'hi' anytime to start a new one."
             return "We're still confirming your delivery fee — hang tight, we'll send your total and payment details shortly. Reply 'status' anytime, or 'cancel' to cancel this order."
         if order.status == "awaiting_payment":
             if normalized in CANCEL_WORDS:
@@ -3265,7 +3276,7 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
                 conversation.stage = CONV_NEW
                 conversation.address = None
                 db.commit()
-                return "Your order has been cancelled. Reply 'hi' anytime to start a new order."
+                return "Your order has been cancelled.\nReply 'hi' anytime to start a new one."
             if not media_url and not message.strip():
                 return "Please reply with confirmation that you've made the transfer — a text message or a photo of your receipt works."
             # Questions ("how much?", "which account?") re-send the payment details
@@ -6011,7 +6022,7 @@ def apply_order_action(db, order: Order, business: Optional[Business], action: s
         db.commit()
         send_whatsapp_message(
             order.customer_phone,
-            f"🎉 Payment confirmed for order *#{order.id}*! *{business.name if business else 'The business'}* is preparing your order now.{COLLXCT_FOOTER}",
+            f"🎉 Payment confirmed for order *#{order.id}*!\n\n*{business.name if business else 'The business'}* is preparing your order now.{COLLXCT_FOOTER}",
             from_number=business.whatsapp_number if business else None,
         )
         return True, ""
@@ -6020,7 +6031,7 @@ def apply_order_action(db, order: Order, business: Optional[Business], action: s
         db.commit()
         send_whatsapp_message(
             order.customer_phone,
-            f"🚴 Your order *#{order.id}* is on its way!",
+            f"🚴 Your order *#{order.id}* is on the way!",
             from_number=business.whatsapp_number if business else None,
         )
         return True, ""
@@ -6029,7 +6040,7 @@ def apply_order_action(db, order: Order, business: Optional[Business], action: s
         db.commit()
         send_whatsapp_message(
             order.customer_phone,
-            f"✅ Order *#{order.id}* delivered. Thanks for ordering from *{business.name if business else 'us'}*!{COLLXCT_FOOTER}",
+            f"✅ Order *#{order.id}* delivered.\nThanks for ordering from *{business.name if business else 'us'}*! 🙏{COLLXCT_FOOTER}",
             from_number=business.whatsapp_number if business else None,
         )
         return True, ""
@@ -6042,7 +6053,7 @@ def apply_order_action(db, order: Order, business: Optional[Business], action: s
         if notify_customer:
             send_whatsapp_message(
                 order.customer_phone,
-                f"Your order *#{order.id}* has been cancelled. Reply 'hi' anytime to start a new order.",
+                f"Your order *#{order.id}* has been cancelled.\nReply 'hi' anytime to start a new one.",
                 from_number=business.whatsapp_number if business else None,
             )
         return True, ""
@@ -6062,15 +6073,15 @@ def apply_order_action(db, order: Order, business: Optional[Business], action: s
         # directly. Say so plainly rather than implying we hold the money.
         retained = breakdown["retained_service_fee"]
         fee_line = (
-            f"\n\nThe N{retained} service fee covers messaging already sent and is not refunded."
+            f"\n\nThe N{retained} service fee covers messaging already sent, so it isn't refunded."
             if retained else ""
         )
         send_whatsapp_message(
             order.customer_phone,
             f"Order *#{order.id}* has been refunded by *{business.name if business else 'the business'}*.\n\n"
-            f"*Refund amount:* N{breakdown['refundable']} (items + delivery){fee_line}\n\n"
-            f"The refund is sent by the business to the account you paid from, and usually lands within "
-            f"3–5 working days. Any questions about it go to the business directly.",
+            f"Refund: N{breakdown['refundable']} (items + delivery){fee_line}\n\n"
+            f"Your money goes back to the account you paid from — usually within 3–5 working days.\n\n"
+            f"Any questions? Please message {business.name if business else 'the business'} directly.",
             from_number=business.whatsapp_number if business else None,
         )
         return True, ""
@@ -6218,7 +6229,7 @@ def verify_order_payment(request: Request, order_id: int) -> RedirectResponse:
             db.commit()
             send_whatsapp_message(
                 order.customer_phone,
-                f"🎉 Payment confirmed for order *#{order.id}*! *{business.name}* is preparing your order now.{COLLXCT_FOOTER}",
+                f"🎉 Payment confirmed for order *#{order.id}*!\n\n*{business.name}* is preparing your order now.{COLLXCT_FOOTER}",
                 from_number=business.whatsapp_number,
             )
     finally:
