@@ -2158,7 +2158,7 @@ def send_item_catalogue_images(business: Business, to_number: str, items: List[M
         if not url:
             continue
         stock = " (out of stock)" if item.is_out_of_stock else ""
-        caption = f"*{i}. {item.name}* — N{item.price}{stock}"
+        caption = f"*{i}. {item.name}* — ₦{item.price}{stock}"
         if item.description:
             caption += f"\n{item.description}"
         send_whatsapp_message(to_number, caption, from_number=business.whatsapp_number, media_url=url)
@@ -2416,7 +2416,7 @@ def run_action_reminders() -> None:
             sent = send_whatsapp_message(
                 business.owner_notify_number,
                 f"⏰ *REMINDER {order.action_reminder_count + 1}/{ACTION_REMINDER_MAX}* — order *#{order.id}* "
-                f"(N{order.total}, {order.customer_name or order.customer_phone}) has been waiting *{minutes} min* "
+                f"(₦{order.total}, {order.customer_name or order.customer_phone}) has been waiting *{minutes} min* "
                 f"for you to {action.lower()}. The customer is on hold until you do.{link_line}",
                 from_number=business.whatsapp_number,
             )
@@ -2640,7 +2640,7 @@ def format_category_menu(categories: List[Category]) -> str:
 def format_item_menu(items: List[MenuItem], category_name: str) -> str:
     lines = []
     for i, item in enumerate(items, start=1):
-        lines.append(f"*{i}.* {item.name} — N{item.price}")
+        lines.append(f"*{i}.* {item.name} — ₦{item.price}")
         if item.description:
             lines.append(f"_{item.description}_")
     return (
@@ -2675,7 +2675,7 @@ def format_cart_lines(cart: List[Dict[str, object]]) -> str:
     for entry in cart:
         qty = entry.get("qty", 1)
         price = entry.get("price", 0)
-        lines.append(f"{qty} x {entry.get('name', 'Item')} — N{int(price) * int(qty)}")
+        lines.append(f"{qty} x {entry.get('name', 'Item')} — ₦{int(price) * int(qty)}")
     return "\n".join(lines)
 
 
@@ -2685,7 +2685,7 @@ def format_cart_numbered(cart: List[Dict[str, object]]) -> str:
     for i, entry in enumerate(cart, start=1):
         qty = entry.get("qty", 1)
         price = entry.get("price", 0)
-        lines.append(f"*{i}.* {qty} x {entry.get('name', 'Item')} — N{int(price) * int(qty)}")
+        lines.append(f"*{i}.* {qty} x {entry.get('name', 'Item')} — ₦{int(price) * int(qty)}")
     return "\n".join(lines)
 
 
@@ -2769,14 +2769,14 @@ def format_payment_request(order: Order, business: Optional[Business]) -> str:
     grand = order.total + fee
     item_lines = format_cart_lines(load_cart(order.items_json))
     is_pickup = order.fulfillment_type == "pickup"
-    delivery_line = "Pickup — no delivery fee" if is_pickup else f"Delivery — N{order.delivery_fee}"
-    fee_line = f"\nService fee — N{fee}" if fee else ""
+    delivery_line = "Pickup — no delivery fee" if is_pickup else f"Delivery — ₦{order.delivery_fee}"
+    fee_line = f"\nService fee — ₦{fee}" if fee else ""
     deliver_to_line = "" if is_pickup else f"\n📍 Deliver to: {order.address}"
     if business and business.payment_method == "paystack" and order.payment_link:
         return (
             f"Here's your order 👇\n\n"
             f"{item_lines}\n{delivery_line}{fee_line}\n\n"
-            f"*Total to pay:* N{grand}{deliver_to_line}\n\n"
+            f"*Total to pay:* ₦{grand}{deliver_to_line}\n\n"
             f"Pay securely here:\n{order.payment_link}\n"
             f"Card, bank transfer and USSD all work.\n\n"
             f"Reply *paid* once done — we'll confirm instantly ⚡"
@@ -2784,7 +2784,7 @@ def format_payment_request(order: Order, business: Optional[Business]) -> str:
     return (
         f"Here's your order 👇\n\n"
         f"{item_lines}\n{delivery_line}\n\n"
-        f"*Total:* N{order.total}{deliver_to_line}\n\n"
+        f"*Total:* ₦{order.total}{deliver_to_line}\n\n"
         f"*Please pay to:*\n{format_bank_info(business)}\n\n"
         f"Once you've paid, reply here with confirmation or a photo of your receipt."
     )
@@ -2853,7 +2853,7 @@ def record_payment_claim(db, business: Business, conversation: Conversation, ord
                 link_line = f"\nOpen: {link}" if link else ""
                 send_whatsapp_message(
                     business.owner_notify_number,
-                    f"✅ Paystack confirmed payment for order *#{order.id}* (N{order.total}, "
+                    f"✅ Paystack confirmed payment for order *#{order.id}* (₦{order.total}, "
                     f"{order.customer_name or order.customer_phone}) automatically — it's ready to prepare.{link_line}",
                     from_number=business.whatsapp_number,
                 )
@@ -2879,7 +2879,7 @@ def record_payment_claim(db, business: Business, conversation: Conversation, ord
     notify_owner_action(
         business,
         order.id,
-        f"🚨 *ACTION NEEDED — confirm payment*\n\nOrder *#{order.id}*: {order.customer_name or order.customer_phone} says they paid *N{order.total}*.\n\n"
+        f"🚨 *ACTION NEEDED — confirm payment*\n\nOrder *#{order.id}*: {order.customer_name or order.customer_phone} says they paid *₦{order.total}*.\n\n"
         f"Check your bank alert for this exact amount, then mark the order paid to move it forward.",
     )
     return f"Thanks! We've let *{business.name}* know — they'll confirm your payment shortly. ✅"
@@ -3000,7 +3000,7 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
             if not cart:
                 return "Your cart is empty. " + format_category_menu(categories)
             return (
-                f"🛒 *Your cart*\n{format_cart_lines(cart)}\n\n*Total:* N{cart_total(cart)}\n\n"
+                f"🛒 *Your cart*\n{format_cart_lines(cart)}\n\n*Total:* ₦{cart_total(cart)}\n\n"
                 "Reply 'checkout' to place your order, or pick a category to keep shopping:\n\n"
                 + format_category_menu(categories)
             )
@@ -3041,7 +3041,7 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
         if normalized in CART_WORDS:
             if not cart:
                 return "Your cart is empty. Reply with a number to add an item."
-            return f"🛒 *Your cart*\n{format_cart_numbered(cart)}\n\n*Total:* N{cart_total(cart)}\n\nReply 'checkout' to place your order, 'remove 1' to remove item 1, or add another item number."
+            return f"🛒 *Your cart*\n{format_cart_numbered(cart)}\n\n*Total:* ₦{cart_total(cart)}\n\nReply 'checkout' to place your order, 'remove 1' to remove item 1, or add another item number."
         if normalized in CLEAR_CART_WORDS:
             conversation.cart_json = "[]"
             db.commit()
@@ -3063,7 +3063,7 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
             if n < 1 or n > len(items):
                 return f"There's no item {n} here 🙂\nReply 'see 1' to view item 1."
             target = items[n - 1]
-            caption = f"*{n}. {target.name}* — N{target.price}" + (f"\n{target.description}" if target.description else "")
+            caption = f"*{n}. {target.name}* — ₦{target.price}" + (f"\n{target.description}" if target.description else "")
             url = public_media_url(getattr(target, "image_url", None))
             if url:
                 send_whatsapp_message(conversation.phone_number, caption, from_number=business.whatsapp_number, media_url=url)
@@ -3084,7 +3084,7 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
             conversation.cart_json = json.dumps(cart)
             db.commit()
             if cart:
-                return f"🗑️ Removed *{removed.get('name', 'item')}*.\n\n🛒 *Your cart*\n{format_cart_numbered(cart)}\n\n*Total:* N{cart_total(cart)}\n\nReply 'checkout' to order, or add another number."
+                return f"🗑️ Removed *{removed.get('name', 'item')}*.\n\n🛒 *Your cart*\n{format_cart_numbered(cart)}\n\n*Total:* ₦{cart_total(cart)}\n\nReply 'checkout' to order, or add another number."
             return f"🗑️ Removed *{removed.get('name', 'item')}*. Your cart is now empty — reply with a number to add an item."
         index = resolve_choice(message, [item.name for item in items])
         if index is None or index < 1 or index > len(items):
@@ -3116,7 +3116,7 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
             db.commit()
             return reply
         if normalized in CART_WORDS:
-            return f"🛒 *Your cart*\n{format_cart_lines(cart)}\n\n*Total:* N{cart_total(cart)}\n\nWhat name should we put on this order?"
+            return f"🛒 *Your cart*\n{format_cart_lines(cart)}\n\n*Total:* ₦{cart_total(cart)}\n\nWhat name should we put on this order?"
         if normalized in CHECKOUT_WORDS:
             return "Almost there! What name should we put on this order?"
         if not name:
@@ -3140,7 +3140,7 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
             db.commit()
             return "Sure — what name should we put on this order?"
         if normalized in CART_WORDS:
-            return f"🛒 *Your cart*\n{format_cart_lines(cart)}\n\n*Total:* N{cart_total(cart)}\n\nWould you like *delivery* or *pickup*?\n\n*1.* Delivery\n*2.* Pickup"
+            return f"🛒 *Your cart*\n{format_cart_lines(cart)}\n\n*Total:* ₦{cart_total(cart)}\n\nWould you like *delivery* or *pickup*?\n\n*1.* Delivery\n*2.* Pickup"
         choice = normalized
         wants_pickup = choice in {"2", "pickup", "pick up", "collect", "collection"}
         wants_delivery = choice in {"1", "delivery", "deliver"}
@@ -3173,11 +3173,11 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
                 order.id,
                 f"🚨 *ACTION NEEDED — new pickup order #{order.id}*\n\n"
                 f"From: {conversation.customer_name or conversation.phone_number} ({conversation.phone_number})\n"
-                f"{format_cart_lines(cart)}\n*Subtotal:* N{subtotal}\n*Pickup order — no delivery.*\n\n"
+                f"{format_cart_lines(cart)}\n*Subtotal:* ₦{subtotal}\n*Pickup order — no delivery.*\n\n"
                 f"Accept to send the customer their total, or cancel to reject.",
             )
             return (
-                f"{name_prefix}Here's your order:\n{format_cart_lines(cart)}\n\n*Subtotal:* N{subtotal}\n*Pickup order* — no delivery fee.\n\n"
+                f"{name_prefix}Here's your order:\n{format_cart_lines(cart)}\n\n*Subtotal:* ₦{subtotal}\n*Pickup order* — no delivery fee.\n\n"
                 f"We're confirming your order now and will send your total and payment details shortly.{COLLXCT_FOOTER}"
             )
         if wants_delivery:
@@ -3193,7 +3193,7 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
             db.commit()
             return "Sure — what name should we put on this order?"
         if normalized in CART_WORDS:
-            return f"🛒 *Your cart*\n{format_cart_lines(cart)}\n\n*Total:* N{cart_total(cart)}\n\nPlease reply with your delivery address. 📍"
+            return f"🛒 *Your cart*\n{format_cart_lines(cart)}\n\n*Total:* ₦{cart_total(cart)}\n\nPlease reply with your delivery address. 📍"
         if normalized in CHECKOUT_WORDS:
             return "Almost done! Please reply with your delivery address. 📍"
         if not address:
@@ -3236,7 +3236,7 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
         notify_order_cap_usage(db, business)
         if auto:
             suggestion_line = (
-                f"Suggested delivery fee: N{auto['fee']} ({auto['km']} km, auto-calculated). "
+                f"Suggested delivery fee: ₦{auto['fee']} ({auto['km']} km, auto-calculated). "
                 f"Accept it as-is or adjust it, then send — the customer can't pay until you do."
             )
         else:
@@ -3248,11 +3248,11 @@ def handle_webhook_message(db, business: Business, conversation: Conversation, m
             order.id,
             f"🚨 *ACTION NEEDED — new order #{order.id}*\n\n"
             f"From: {conversation.customer_name or conversation.phone_number} ({conversation.phone_number})\n"
-            f"{format_cart_lines(cart)}\n*Subtotal:* N{subtotal}\n*Deliver to:* {address}\n\n"
+            f"{format_cart_lines(cart)}\n*Subtotal:* ₦{subtotal}\n*Deliver to:* {address}\n\n"
             f"{suggestion_line}",
         )
         return (
-            f"{name_prefix}Here's your order:\n{format_cart_lines(cart)}\n\n*Subtotal:* N{subtotal}\n*Delivery to:* {address}\n\n"
+            f"{name_prefix}Here's your order:\n{format_cart_lines(cart)}\n\n*Subtotal:* ₦{subtotal}\n*Delivery to:* {address}\n\n"
             f"We're confirming your order now and will send your total and payment details shortly.{COLLXCT_FOOTER}"
         )
 
@@ -6073,13 +6073,13 @@ def apply_order_action(db, order: Order, business: Optional[Business], action: s
         # directly. Say so plainly rather than implying we hold the money.
         retained = breakdown["retained_service_fee"]
         fee_line = (
-            f"\n\nThe N{retained} service fee covers messaging already sent, so it isn't refunded."
+            f"\n\nThe ₦{retained} service fee covers messaging already sent, so it isn't refunded."
             if retained else ""
         )
         send_whatsapp_message(
             order.customer_phone,
             f"Order *#{order.id}* has been refunded by *{business.name if business else 'the business'}*.\n\n"
-            f"Refund: N{breakdown['refundable']} (items + delivery){fee_line}\n\n"
+            f"Refund: ₦{breakdown['refundable']} (items + delivery){fee_line}\n\n"
             f"Your money goes back to the account you paid from — usually within 3–5 working days.\n\n"
             f"Any questions? Please message {business.name if business else 'the business'} directly.",
             from_number=business.whatsapp_number if business else None,
@@ -6997,7 +6997,7 @@ def order_detail(request: Request, order_id: int) -> HTMLResponse:
     items = load_cart(order.items_json)
     items_rows = "".join(
         f"<tr><td>{escape(str(entry.get('name', 'Item')))}</td><td>{entry.get('qty', 1)}</td>"
-        f"<td>N{entry.get('price', 0)}</td><td>N{int(entry.get('price', 0)) * int(entry.get('qty', 1))}</td></tr>"
+        f"<td>₦{entry.get('price', 0)}</td><td>₦{int(entry.get('price', 0)) * int(entry.get('qty', 1))}</td></tr>"
         for entry in items
     )
     subtotal = cart_total(items)
@@ -7036,7 +7036,7 @@ def order_detail(request: Request, order_id: int) -> HTMLResponse:
         <dialog id="delivery-fee-modal" class="modal">
           <div class="modal-body">
             <h3>Set delivery fee</h3>
-            <p class="form-hint">Subtotal is N{subtotal}. Enter the delivery fee to send the customer their full total and your bank details.</p>
+            <p class="form-hint">Subtotal is ₦{subtotal}. Enter the delivery fee to send the customer their full total and your bank details.</p>
             {auto_suggestion_note}
             <form method="post" action="/orders/{order.id}/delivery-fee">
               <input name="delivery_fee" type="number" min="0" value="{order.delivery_fee or ''}" placeholder="Delivery fee" required autofocus />
@@ -7066,7 +7066,7 @@ def order_detail(request: Request, order_id: int) -> HTMLResponse:
         <dialog id="mark-paid-modal" class="modal">
           <div class="modal-body">
             <h3>Mark order #{order.id} as paid?</h3>
-            <p class="form-hint">Total: N{order.total}. Only confirm after checking your own bank alert for this exact amount.</p>
+            <p class="form-hint">Total: ₦{order.total}. Only confirm after checking your own bank alert for this exact amount.</p>
             <form method="post" action="/orders/{order.id}/mark-paid">
               <div class="modal-actions">
                 <button type="submit" class="btn primary">Yes, mark as paid</button>
@@ -7126,7 +7126,7 @@ def order_detail(request: Request, order_id: int) -> HTMLResponse:
         breakdown = order_refund_breakdown(business, order)
         retained = breakdown["retained_service_fee"]
         retained_line = (
-            f"<p class='form-hint'>The N{retained} service fee is not refunded &mdash; it covers "
+            f"<p class='form-hint'>The ₦{retained} service fee is not refunded &mdash; it covers "
             f"WhatsApp messages already sent. Our commission is reversed automatically.</p>"
             if retained else
             "<p class='form-hint'>Our commission is reversed automatically.</p>"
@@ -7144,8 +7144,8 @@ def order_detail(request: Request, order_id: int) -> HTMLResponse:
         <dialog id="refund-modal" class="modal">
           <div class="modal-body">
             <h3>Refund order #{order.id}?</h3>
-            <p class="form-hint">This refunds <strong>N{breakdown['refundable']}</strong> (items + delivery)
-            of the N{breakdown['customer_paid']} the customer paid.</p>
+            <p class="form-hint">This refunds <strong>₦{breakdown['refundable']}</strong> (items + delivery)
+            of the ₦{breakdown['customer_paid']} the customer paid.</p>
             {retained_line}
             {rider_line}
             <p class="form-hint"><strong>You send the money.</strong> The customer's payment settled to your
@@ -7176,7 +7176,7 @@ def order_detail(request: Request, order_id: int) -> HTMLResponse:
         reason = f" &middot; {escape(order.refund_reason)}" if order.refund_reason else ""
         refunded_row = (
             "<div class='kv-row'><span class='kv-label'>Refunded</span>"
-            f"<span class='kv-value'>N{order.refund_amount or 0}{reason}</span></div>"
+            f"<span class='kv-value'>₦{order.refund_amount or 0}{reason}</span></div>"
         )
 
     body = f"""
@@ -7204,9 +7204,9 @@ def order_detail(request: Request, order_id: int) -> HTMLResponse:
         <div class="kv-list">
           <div class="kv-row"><span class="kv-label">Business</span><span class="kv-value">{escape(business.name) if business else 'Unknown'}</span></div>
           <div class="kv-row"><span class="kv-label">Customer</span><span class="kv-value">{escape(order.customer_name) if order.customer_name else '—'}</span></div>
-          <div class="kv-row"><span class="kv-label">Subtotal</span><span class="kv-value">N{subtotal}</span></div>
-          <div class="kv-row"><span class="kv-label">Delivery fee</span><span class="kv-value">N{order.delivery_fee}</span></div>
-          <div class="kv-row"><span class="kv-label">Total</span><span class="kv-value">N{order.total}</span></div>
+          <div class="kv-row"><span class="kv-label">Subtotal</span><span class="kv-value">₦{subtotal}</span></div>
+          <div class="kv-row"><span class="kv-label">Delivery fee</span><span class="kv-value">₦{order.delivery_fee}</span></div>
+          <div class="kv-row"><span class="kv-label">Total</span><span class="kv-value">₦{order.total}</span></div>
           {accepted_row}
           {refunded_row}
           <div class="kv-row"><span class="kv-label">Delivery address</span><span class="kv-value">{escape(order.address)}{" ⚠️ <em>not found on map</em>" if order.address_unverified else ""}</span></div>
