@@ -2267,19 +2267,14 @@ def order_link(order_id: int) -> str:
 def notify_owner_action(business: Business, order_id: int, headline: str) -> None:
     if not business:
         return
-    # Push to the mobile app first — it reaches the owner even with the phone
-    # locked and the app closed, and doesn't depend on a WhatsApp notify number.
+    # Owners are alerted by app push only. A WhatsApp alert would be a
+    # business-initiated message and use one of Meta's daily recipient slots.
     push_to_business(
         business.id,
         "🚨 Order needs action",
         _push_body_from_headline(headline),
         {"type": "action_required", "order_id": str(order_id), "business_id": str(business.id)},
     )
-    if not business.owner_notify_number:
-        return
-    link = order_link(order_id)
-    link_line = f"\n\nOpen: {link}" if link else "\n\nOpen your Recbot dashboard to respond."
-    send_whatsapp_message(business.owner_notify_number, headline + link_line, from_number=business.whatsapp_number)
 
 
 # --- Push notifications (Firebase Cloud Messaging, HTTP v1 via firebase-admin) ---
@@ -2374,25 +2369,25 @@ def monthly_order_usage(db, business: Business):
 def notify_order_cap_usage(db, business: Business) -> None:
     """Soft cap: never blocks orders, just nudges the owner exactly once at 80%
     and once when crossing the cap."""
-    if not business.owner_notify_number:
-        return
     used, cap, plan = monthly_order_usage(db, business)
     if not cap:
         return
     threshold_80 = max(1, int(cap * 0.8))
     if used == threshold_80 and used < cap:
-        send_whatsapp_message(
-            business.owner_notify_number,
-            f"📈 Heads up: you've used *{used}* of the *{cap}* orders included in your {plan.name} plan this month. "
-            f"Orders won't be blocked — but consider upgrading if you're trending past it.",
-            from_number=business.whatsapp_number,
+        push_to_business(
+            business.id,
+            "📈 Order cap at 80%",
+            f"You've used {used} of the {cap} orders in your {plan.name} plan this month. "
+            f"Orders won't be blocked, but consider upgrading.",
+            {"type": "order_cap", "business_id": str(business.id)},
         )
     elif used == cap + 1:
-        send_whatsapp_message(
-            business.owner_notify_number,
-            f"🔔 You've passed the *{cap}* orders/month included in your {plan.name} plan. Orders keep flowing as normal — "
-            f"please upgrade your plan to match your volume.",
-            from_number=business.whatsapp_number,
+        push_to_business(
+            business.id,
+            "🔔 Order cap passed",
+            f"You've passed the {cap} orders/month in your {plan.name} plan. Orders keep flowing; "
+            f"please upgrade to match your volume.",
+            {"type": "order_cap", "business_id": str(business.id)},
         )
 
 
@@ -2404,7 +2399,7 @@ def action_needed_orders(db, business_id: Optional[int] = None) -> List[Order]:
 
 
 def run_action_reminders() -> None:
-    """Re-ping the business owner on WhatsApp while an order sits waiting on them."""
+    """Re-ping the business owner by app push while an order sits waiting on them."""
     db = SessionLocal()
     try:
         now = datetime.utcnow()
@@ -2418,7 +2413,7 @@ def run_action_reminders() -> None:
         businesses = {b.id: b for b in db.query(Business).filter(Business.id.in_({o.business_id for o in orders})).all()}
         for order in orders:
             business = businesses.get(order.business_id)
-            if not business or not business.owner_notify_number:
+            if not business:
                 continue
             waiting_since = order.status_changed_at or order.created_at or now
             last_ping = order.action_reminded_at or waiting_since
@@ -2426,14 +2421,12 @@ def run_action_reminders() -> None:
                 continue
             action = ACTION_LABELS.get(order.status, "review")
             minutes = int((now - waiting_since).total_seconds() // 60)
-            link = order_link(order.id)
-            link_line = f"\n\nOpen: {link}" if link else "\n\nOpen your Recbot dashboard to respond."
-            sent = send_whatsapp_message(
-                business.owner_notify_number,
-                f"⏰ *REMINDER {order.action_reminder_count + 1}/{ACTION_REMINDER_MAX}* — order *#{order.id}* "
-                f"(₦{order.total}, {order.customer_name or order.customer_phone}) has been waiting *{minutes} min* "
-                f"for you to {action.lower()}. The customer is on hold until you do.{link_line}",
-                from_number=business.whatsapp_number,
+            sent = push_to_business(
+                business.id,
+                f"⏰ Reminder {order.action_reminder_count + 1}/{ACTION_REMINDER_MAX}: order #{order.id}",
+                f"₦{order.total}, {order.customer_name or order.customer_phone}: waiting {minutes} min "
+                f"for you to {action.lower()}. The customer is on hold.",
+                {"type": "action_required", "order_id": str(order.id), "business_id": str(business.id)},
             )
             if sent:
                 order.action_reminder_count += 1
@@ -2444,7 +2437,7 @@ def run_action_reminders() -> None:
 
 
 def run_plan_reminders() -> None:
-    """Daily WhatsApp nudges when a paid plan is about to expire or has lapsed.
+    """Daily app push nudges when a paid plan is about to expire or has lapsed.
     Stops 7 days past expiry."""
     db = SessionLocal()
     try:
@@ -2454,7 +2447,7 @@ def run_plan_reminders() -> None:
         base = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
         for business in businesses:
             expiry = business.plan_expiry
-            if not business.owner_notify_number or expiry > soon or now - expiry > timedelta(days=7):
+            if expiry > soon or now - expiry > timedelta(days=7):
                 continue
             if business.plan_reminder_sent_at and now - business.plan_reminder_sent_at < timedelta(hours=23):
                 continue
@@ -2479,7 +2472,8 @@ def run_plan_reminders() -> None:
                     f"🚫 WhatsApp ordering for *{business.name}* is paused — your plan expired on "
                     f"{expiry.strftime('%b %d')}. Renew to switch it back on.{renew_line}"
                 )
-            if send_whatsapp_message(business.owner_notify_number, message, from_number=business.whatsapp_number):
+            if push_to_business(business.id, "Recbot plan", message.replace("*", ""),
+                                {"type": "plan", "business_id": str(business.id)}):
                 business.plan_reminder_sent_at = now
         db.commit()
     finally:
@@ -2865,15 +2859,6 @@ def record_payment_claim(db, business: Business, conversation: Conversation, ord
                 f"Order #{order.id} — {order.customer_name or order.customer_phone} paid ₦{order.total}. Ready to dispatch.",
                 {"type": "paid", "order_id": str(order.id), "business_id": str(business.id)},
             )
-            if business.owner_notify_number:
-                link = order_link(order.id)
-                link_line = f"\nOpen: {link}" if link else ""
-                send_whatsapp_message(
-                    business.owner_notify_number,
-                    f"✅ Paystack confirmed payment for order *#{order.id}* (₦{order.total}, "
-                    f"{order.customer_name or order.customer_phone}) automatically — it's ready to prepare.{link_line}",
-                    from_number=business.whatsapp_number,
-                )
             return f"🎉 Payment confirmed for order *#{order.id}*!\n\n*{business.name}* is preparing your order now."
         if verified is False:
             db.commit()
